@@ -44,7 +44,7 @@ fn status_ok_is_zero() {
 
 #[test]
 fn kernel_probe_produces_geometry() {
-    // Proves the truck kernel links and runs on the native target.
+    // Proves the monstertruck kernel links and runs on the native target.
     let desc = vim_design_lib::kernel::probe();
-    assert!(desc.contains("truck vertex created"), "got: {desc}");
+    assert!(desc.contains("monstertruck vertex created"), "got: {desc}");
 }

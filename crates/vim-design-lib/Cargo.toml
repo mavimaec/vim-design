@@ -7,10 +7,10 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-truck-modeling = { workspace = true }
-truck-geometry = { workspace = true }
-truck-shapeops = { workspace = true }
-truck-meshalgo = { workspace = true }
+monstertruck-modeling = { workspace = true }
+monstertruck-geometry = { workspace = true }
+monstertruck-solid = { workspace = true }
+monstertruck-meshing = { workspace = true }
 
 [lints.clippy]
 # "Never crash" contract — docs/ARCHITECTURE.md §8.

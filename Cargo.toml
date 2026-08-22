@@ -16,11 +16,11 @@ rust-version = "1.85"
 [workspace.dependencies]
 vim-design-lib = { path = "crates/vim-design-lib" }
 
-# Geometry kernel (truck family) — see docs/ARCHITECTURE.md §5.
-truck-modeling = "0.6.0"
-truck-geometry = "0.5.0"
-truck-shapeops = "0.4.0"
-truck-meshalgo = "0.4.0"
+# Geometry kernel (monstertruck family) — see docs/ARCHITECTURE.md §5.
+monstertruck-modeling = "=0.4.0"
+monstertruck-geometry = "=0.4.0"
+monstertruck-solid = "=0.4.0"
+monstertruck-meshing = "=0.4.0"
 
 # WASM / web.
 # wasm-bindgen is pinned exactly so it always matches the wasm-bindgen-cli

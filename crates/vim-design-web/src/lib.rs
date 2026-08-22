@@ -39,7 +39,7 @@ pub fn lib_version() -> String {
     vim_design_lib::version().to_string()
 }
 
-/// Exercises the truck kernel inside the browser (compile/link probe).
+/// Exercises the monstertruck kernel inside the browser (compile/link probe).
 #[wasm_bindgen]
 pub fn kernel_probe() -> String {
     vim_design_lib::kernel::probe()
