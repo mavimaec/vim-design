@@ -94,14 +94,14 @@ async function main() {
 
   // -- Sliders ---------------------------------------------------------
   const sliders = [
-    ["cube-size",       "cube size",       (v) => app.set_cube_size(v)],
-    ["plate-thickness", "plate height",    (v) => app.set_plate_thickness(v)],
-    ["cyl-radius",      "cylinder radius", (v) => app.set_cylinder_radius(v)],
-    ["cyl-height",      "cylinder height", (v) => app.set_cylinder_height(v)],
-    ["cone-radius",     "cone radius",     (v) => app.set_cone_radius(v)],
-    ["cone-height",     "cone height",     (v) => app.set_cone_height(v)],
+    ["cube-size",       "cube size",       "cubeSize",       (v) => app.set_cube_size(v)],
+    ["plate-thickness", "plate height",    "plateThickness", (v) => app.set_plate_thickness(v)],
+    ["cyl-radius",      "cylinder radius", "cylRadius",      (v) => app.set_cylinder_radius(v)],
+    ["cyl-height",      "cylinder height", "cylHeight",      (v) => app.set_cylinder_height(v)],
+    ["cone-radius",     "cone radius",     "coneRadius",     (v) => app.set_cone_radius(v)],
+    ["cone-height",     "cone height",     "coneHeight",     (v) => app.set_cone_height(v)],
   ];
-  for (const [id, op, apply] of sliders) {
+  for (const [id, op, , apply] of sliders) {
     const input = $(id);
     const label = $(`${id}-val`);
     input.addEventListener("input", () => {
@@ -112,6 +112,18 @@ async function main() {
     });
   }
 
+  // Resynchronize every slider position + label from the document (the
+  // single source of truth) — at startup and after undo/redo, when the
+  // model changes without the sliders being touched.
+  const syncSlidersFromDocument = () => {
+    const params = JSON.parse(app.params_json());
+    for (const [id, , key] of sliders) {
+      const v = params[key];
+      $(id).value = String(v);
+      $(`${id}-val`).textContent = `${v.toFixed(2)} m`;
+    }
+  };
+
   // -- Display options ---------------------------------------------------
   $("wireframe").addEventListener("change", (e) => {
     app.set_wireframe(e.target.checked);
@@ -120,10 +132,16 @@ async function main() {
 
   // -- Undo / redo -------------------------------------------------------
   $("undo").addEventListener("click", () => {
-    if (app.undo()) refresh(app, "undo");
+    if (app.undo()) {
+      refresh(app, "undo");
+      syncSlidersFromDocument();
+    }
   });
   $("redo").addEventListener("click", () => {
-    if (app.redo()) refresh(app, "redo");
+    if (app.redo()) {
+      refresh(app, "redo");
+      syncSlidersFromDocument();
+    }
   });
 
   // -- Frame loop --------------------------------------------------------
@@ -145,6 +163,7 @@ async function main() {
   };
 
   refresh(app, "initial scene");
+  syncSlidersFromDocument();
   requestAnimationFrame(frame);
 }
 

@@ -4,11 +4,15 @@
 #   vactions.ps1 -VimDesignWeb   serve VimDesignWeb and open it in a browser
 #   vactions.ps1 -Test           sequentially run all tests:
 #                                cargo tests, C++ gtest, Playwright web tests
+#   vactions.ps1 -TestWebGpu     opt-in HEADED browser run of the demo on the
+#                                real WebGPU backend (needs a desktop session;
+#                                headless chromium never composites WebGPU)
 
 [CmdletBinding()]
 param(
     [switch]$VimDesignWeb,
-    [switch]$Test
+    [switch]$Test,
+    [switch]$TestWebGpu
 )
 
 Set-StrictMode -Version Latest
@@ -31,9 +35,21 @@ function Ensure-WasmBuilt {
     }
 }
 
-if (-not ($VimDesignWeb -or $Test)) {
-    Write-Host 'Usage: vactions.ps1 [-VimDesignWeb] [-Test]'
+if (-not ($VimDesignWeb -or $Test -or $TestWebGpu)) {
+    Write-Host 'Usage: vactions.ps1 [-VimDesignWeb] [-Test] [-TestWebGpu]'
     exit 1
+}
+
+if ($TestWebGpu) {
+    Write-Section 'Headed WebGPU verification (opt-in, needs a desktop session)'
+    Ensure-WasmBuilt
+    Ensure-WebTestDeps
+    Invoke-Exec -File 'npx' `
+        -Arguments @('playwright', 'test', 'tests/demo-webgpu.spec.js') `
+        -WorkingDirectory (Join-Path $root 'web-test') `
+        -Environment @{ VIM_WEBGPU_HEADED = '1' }
+    Write-Ok 'headed WebGPU run passed (screenshots/demo-scene-webgpu.png)'
+    exit 0
 }
 
 if ($VimDesignWeb) {

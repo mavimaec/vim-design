@@ -32,11 +32,22 @@ const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth24Plus;
 const MODEL_STRIDE: u64 = 256;
 
 const SHADER: &str = r#"
+// light_dir.w doubles as the "gamma encode in shader" flag: 1.0 when the
+// surface format is not sRGB (observed on the browser WebGPU path, where
+// the preferred canvas format is non-sRGB), 0.0 when the hardware
+// encodes. Keeps WebGPU and WebGL2 output visually identical.
 struct Globals {
     view_proj: mat4x4<f32>,
     light_dir: vec4<f32>,
     wire_color: vec4<f32>,
 };
+
+fn encode(c: vec3<f32>) -> vec3<f32> {
+    if (globals.light_dir.w > 0.5) {
+        return pow(max(c, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.2));
+    }
+    return c;
+}
 @group(0) @binding(0) var<uniform> globals: Globals;
 
 struct Model { m: mat4x4<f32> };
@@ -87,12 +98,12 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let fill_dir = normalize(vec3<f32>(-l.x, -l.y, 0.35));
     let fill = 0.25 * max(dot(n, fill_dir), 0.0);
     let shade = 0.24 + 0.72 * key + fill;
-    return vec4<f32>(in.color * min(shade, 1.15), 1.0);
+    return vec4<f32>(encode(in.color * min(shade, 1.15)), 1.0);
 }
 
 @fragment
 fn fs_wire(in: VsOut) -> @location(0) vec4<f32> {
-    return globals.wire_color;
+    return vec4<f32>(encode(globals.wire_color.rgb), globals.wire_color.a);
 }
 "#;
 
@@ -540,10 +551,12 @@ impl Renderer {
             self.model_bind = bind;
         }
 
-        // Globals: view-proj, key light direction (world space), wire color.
+        // Globals: view-proj, key light direction (world space) with the
+        // gamma flag in .w (see the shader comment), wire color.
+        let gamma_encode = !self.config.format.is_srgb();
         let mut globals = [0f32; 24];
         globals[..16].copy_from_slice(&view_proj.to_cols_array());
-        globals[16..20].copy_from_slice(&[0.45, -0.55, 0.72, 0.0]);
+        globals[16..20].copy_from_slice(&[0.45, -0.55, 0.72, f32::from(gamma_encode)]);
         globals[20..24].copy_from_slice(&[0.04, 0.05, 0.07, 0.42]);
         self.queue
             .write_buffer(&self.globals_buf, 0, &f32s_to_bytes(&globals));
@@ -579,12 +592,9 @@ impl Renderer {
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.090,
-                            g: 0.106,
-                            b: 0.133,
-                            a: 1.0,
-                        }),
+                        // Clear values bypass the shader, so pre-encode
+                        // them on non-sRGB surfaces to match.
+                        load: wgpu::LoadOp::Clear(clear_color(gamma_encode)),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -623,6 +633,20 @@ impl Renderer {
         self.queue.submit([encoder.finish()]);
         frame.present();
         Ok(())
+    }
+}
+
+/// Background clear color (linear ~[0.090, 0.106, 0.133]); pre-encoded
+/// to sRGB when the surface format will not encode it in hardware.
+fn clear_color(gamma_encode: bool) -> wgpu::Color {
+    let encode = |v: f64| {
+        if gamma_encode { v.powf(1.0 / 2.2) } else { v }
+    };
+    wgpu::Color {
+        r: encode(0.090),
+        g: encode(0.106),
+        b: encode(0.133),
+        a: 1.0,
     }
 }
 

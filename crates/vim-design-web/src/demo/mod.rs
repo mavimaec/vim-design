@@ -278,6 +278,22 @@ impl DemoApp {
         self.gestures.can_redo()
     }
 
+    /// The six slider parameters as currently stored in the document —
+    /// the single source of truth the page resynchronizes its sliders
+    /// from (at startup and after undo/redo).
+    pub fn params_json(&self) -> String {
+        let p = scene::current_params(&self.doc, &self.ids);
+        serde_json::json!({
+            "cubeSize": p.cube_size,
+            "plateThickness": p.plate_thickness,
+            "cylRadius": p.cyl_radius,
+            "cylHeight": p.cyl_height,
+            "coneRadius": p.cone_radius,
+            "coneHeight": p.cone_height,
+        })
+        .to_string()
+    }
+
     // -- Status -----------------------------------------------------------
 
     /// JSON status blob for the page's status line and the Playwright

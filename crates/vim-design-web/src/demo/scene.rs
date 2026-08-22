@@ -5,7 +5,7 @@
 //! element/instance path of the mesh facade). The returned [`SceneIds`]
 //! registry holds exactly the entity ids the sliders need to update.
 
-use vim_design_lib::{Command, Document, EntityId, EntityKind};
+use vim_design_lib::{Command, Document, EntityId, EntityKind, Params};
 
 /// Default parameter values (meters) — must match the sliders' initial
 /// values in `www/index.html`.
@@ -35,6 +35,10 @@ pub struct SceneIds {
     pub plate_bottom_cp: EntityId,
     /// The cylinder composite's extrusion (addressed by `UpdateCylinder`).
     pub cyl_extrusion: EntityId,
+    /// The composite's circle (its params carry the current radius).
+    pub cyl_circle: EntityId,
+    /// Top control point of the composite's path line (z = height).
+    pub cyl_top_cp: EntityId,
     /// Cone profile rim control point ((radius, 0, 0)).
     pub cone_rim_cp: EntityId,
     /// Cone profile apex control point ((0, 0, height)).
@@ -234,11 +238,23 @@ pub fn build_scene(doc: &mut Document) -> Result<SceneIds, String> {
     let cyl_extrusion = *cyl_ids
         .last()
         .ok_or_else(|| "CreateCylinder created no entities".to_owned())?;
-    let cyl_face = cyl_ids
-        .iter()
-        .copied()
-        .find(|id| doc.entity(*id).is_some_and(|e| e.kind() == EntityKind::Face))
-        .ok_or_else(|| "CreateCylinder produced no face".to_owned())?;
+    let find_kind = |doc: &Document, kind: EntityKind, what: &str| -> Result<EntityId, String> {
+        cyl_ids
+            .iter()
+            .copied()
+            .find(|id| doc.entity(*id).is_some_and(|e| e.kind() == kind))
+            .ok_or_else(|| format!("CreateCylinder produced no {what}"))
+    };
+    let cyl_face = find_kind(doc, EntityKind::Face, "face")?;
+    let cyl_circle = find_kind(doc, EntityKind::Circle, "circle")?;
+    // The path line runs from the (shared) center control point to the
+    // top control point; read the top cp off the line's `end` slot.
+    let cyl_line = find_kind(doc, EntityKind::Line, "path line")?;
+    let cyl_top_cp = doc
+        .entity(cyl_line)
+        .and_then(|line| line.inputs.get(1))
+        .and_then(|slot| slot.referenced().next())
+        .ok_or_else(|| "cylinder path line has no end control point".to_owned())?;
     assign_material(doc, cyl_face, "steel blue", [0.22, 0.42, 0.72], 0.4)?;
     place(doc, "cylinder", cyl_extrusion, [1.9, -1.0, 0.0])?;
 
@@ -299,9 +315,47 @@ pub fn build_scene(doc: &mut Document) -> Result<SceneIds, String> {
         cube_top_cp,
         plate_bottom_cp,
         cyl_extrusion,
+        cyl_circle,
+        cyl_top_cp,
         cone_rim_cp,
         cone_apex_cp,
     })
+}
+
+/// The six slider parameters as currently stored in the document — the
+/// single source of truth the UI resynchronizes from (startup and after
+/// undo/redo).
+pub struct CurrentParams {
+    pub cube_size: f64,
+    pub plate_thickness: f64,
+    pub cyl_radius: f64,
+    pub cyl_height: f64,
+    pub cone_radius: f64,
+    pub cone_height: f64,
+}
+
+/// Read the current parameter values back out of the document.
+pub fn current_params(doc: &Document, ids: &SceneIds) -> CurrentParams {
+    let cp_position = |id: EntityId| -> [f64; 3] {
+        match doc.entity(id).map(|e| &e.params) {
+            Some(Params::ControlPoint { position }) => *position,
+            _ => [0.0; 3],
+        }
+    };
+    let circle_radius = |id: EntityId| -> f64 {
+        match doc.entity(id).map(|e| &e.params) {
+            Some(Params::Circle { radius }) => *radius,
+            _ => 0.0,
+        }
+    };
+    CurrentParams {
+        cube_size: cp_position(ids.cube_top_cp)[2],
+        plate_thickness: -cp_position(ids.plate_bottom_cp)[2],
+        cyl_radius: circle_radius(ids.cyl_circle),
+        cyl_height: cp_position(ids.cyl_top_cp)[2],
+        cone_radius: cp_position(ids.cone_rim_cp)[0],
+        cone_height: cp_position(ids.cone_apex_cp)[2],
+    }
 }
 
 /// The commands one slider event submits (all `coalesce: true`).

@@ -119,11 +119,18 @@ test("demo scene renders and all six sliders re-mesh the scene", async ({ page }
   prevHash = wireBackHash;
 
   // --- Undo: revert the last slider gesture (cone height) --------------
+  // The sliders were driven by the test, so the DOM must show the last
+  // set value before undo, and resynchronize from the document after.
+  await expect(page.locator("#cone-height")).toHaveValue("0.4");
   await expect(page.locator("#undo")).toBeEnabled();
+  await expect(page.locator("#redo")).toBeDisabled();
   await page.locator("#undo").click();
   await waitSettled(page);
   const afterUndo = await canvasHash(page);
   expect(afterUndo, "undo should change the scene back").not.toBe(prevHash);
+  // Slider DOM position + value label resynchronized from the document.
+  await expect(page.locator("#cone-height")).toHaveValue("1.4");
+  await expect(page.locator("#cone-height-val")).toHaveText("1.40 m");
   stats = await page.evaluate(() => window.__vimStats);
   expect(stats.errors).toEqual([]);
   console.log(`undo: commit→mesh ${stats.lastLatencyMs.toFixed(1)} ms, ${stats.triangles} triangles`);
@@ -132,6 +139,11 @@ test("demo scene renders and all six sliders re-mesh the scene", async ({ page }
   await expect(page.locator("#redo")).toBeEnabled();
   await page.locator("#redo").click();
   await waitSettled(page);
+  const afterRedo = await canvasHash(page);
+  expect(afterRedo, "redo should restore the flattened cone").not.toBe(afterUndo);
+  await expect(page.locator("#cone-height")).toHaveValue("0.4");
+  await expect(page.locator("#cone-height-val")).toHaveText("0.40 m");
+  await expect(page.locator("#redo")).toBeDisabled();
   await page.screenshot({
     path: path.join(screenshotDir, "demo-scene-after-sliders.png"),
   });
