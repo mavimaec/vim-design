@@ -506,8 +506,9 @@ Ordered roughly by risk:
    or whether coordinates need internal scaling.
 4. **Chamfer scope** — **RESOLVED (2026-08-22): `monstertruck-fillet` adopted** —
    straight-edge/planar chamfers work exactly, curved-edge attempts fail with typed
-   errors (see §5.2 for the full verdict); the in-house split/stitch plan stays
-   shelved unless curved-edge chamfers become a requirement.
+   errors (see §5.2 for the full verdict). Cap-rim chamfers with corners + optional
+   curvature (`BlendProfile`) are **parked with a proven offset-band prototype** and a
+   1–2-week productionization plan: [parking-lot/chamfer.md](parking-lot/chamfer.md).
 5. **WASM threading** — **RESOLVED (2026-08-22):** true parallelism verified in headless
    Chromium (8 rayon workers, ~4.3× speedup); truck compiles and runs in both threaded
    (nightly + explicit RUSTFLAGS, §6.2) and single-threaded fallback builds. Remaining
