@@ -1,0 +1,35 @@
+[package]
+name = "vim-design-web"
+description = "VimDesignWeb: WASM browser test app. Currently the wasm threading probe."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+vim-design-lib = { workspace = true }
+wasm-bindgen = { workspace = true }
+js-sys = { workspace = true }
+web-sys = { workspace = true, features = [
+    "Window",
+    "Document",
+    "Element",
+    "HtmlCanvasElement",
+    "CanvasRenderingContext2d",
+] }
+
+# Threaded configuration only (requires nightly + atomics; see README.md).
+rayon = { workspace = true, optional = true }
+wasm-bindgen-rayon = { workspace = true, features = ["no-bundler"], optional = true }
+
+[features]
+default = []
+# Enable rayon-on-wasm. Build contract (enforced by devops/vbuild.ps1):
+#   rustup toolchain: nightly (with rust-src)
+#   RUSTFLAGS="-C target-feature=+atomics,+bulk-memory,+mutable-globals"
+#   cargo build -Z build-std=std,panic_abort --target wasm32-unknown-unknown
+threads = ["dep:rayon", "dep:wasm-bindgen-rayon"]

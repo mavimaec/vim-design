@@ -22,7 +22,7 @@ The API lets the caller submit undoable commands similar to the following set:
 - "DeleteSpline"
 - "CreateEdge"
 - "UpdateEdge"
-- "DeleteEdge
+- "DeleteEdge"
 - "CreateFace" (from edges)
 - "UpdateFace"
 - "DeleteFace"
@@ -36,17 +36,23 @@ The API lets the caller submit undoable commands similar to the following set:
 - "UpdateExtrusion"
 - "DeleteExtrusion"
 - "CreateChamfer" (from faces and edges)
-- "UpdateChamefer"
+- "UpdateChamfer"
 - "DeleteChamfer"
 - "CreateSectionBox" ("cuts" the solids based on the planes of the section box)
 - "UpdateSectionBox"
 - "DeleteSectionBox"
+- "CreateElement" (groups a construction graph of entities producing solid(s) — the reusable definition)
+- "UpdateElement"
+- "DeleteElement"
+- "CreateInstance" (places an Element in the scene at a transform; many instances share one element's evaluated geometry)
+- "UpdateInstance"
+- "DeleteInstance"
 
 A "VimDesign" object accumulates the state of the entities as commands are submitted. Multiple "VimDesign" objects may be created. A "VimDesign" object contains:
 - The command stack allowing the caller to "UndoCommand" or "RedoCommand".
 - A facade allowing the caller to evaluate the triangular mesh geometry to present to a graphics API
 
-Entities like control points, planes, splines, edges, faces, solids, materials, etc are connected via a "DependencyGraph" (a directed acyclic grah) so that modifying one entity upstream affects all related entities downstream
+Entities like control points, planes, splines, edges, faces, solids, materials, etc are connected via a "DependencyGraph" (a directed acyclic graph) so that modifying one entity upstream affects all related entities downstream
 
 Shorthand "composite" commands are available in the API like "CreateCylinder", "UpdateCylinder", and "DeleteCylinder" which groups a bunch of commands to generate a cylinder.
 

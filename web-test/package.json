@@ -1,0 +1,13 @@
+{
+  "name": "vim-design-web-test",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "VimDesignWebTest: Playwright tests for VimDesignWeb.",
+  "scripts": {
+    "test": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.55.0"
+  }
+}

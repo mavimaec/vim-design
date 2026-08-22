@@ -1,0 +1,32 @@
+# Rust
+/target/
+/target-*/
+
+# Generated FFI header (produced by crates/vim-design-ffi/build.rs)
+/crates/vim-design-ffi/include/
+
+# Generated wasm-bindgen output
+/crates/vim-design-web/www/pkg/
+/crates/vim-design-web/www/pkg-st/
+
+# C++ build directories
+/cpp/**/build/
+/cpp/**/cmake-build-*/
+
+# Node
+node_modules/
+
+# Playwright artifacts
+/web-test/test-results/
+/web-test/playwright-report/
+/web-test/screenshots/
+/web-test/.last-run.json
+
+# Misc build output
+dist/
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store

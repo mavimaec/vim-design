@@ -1,0 +1,20 @@
+[package]
+name = "vim-design-lib"
+description = "VIM Design core library (parametric BREP building geometry). Skeleton."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+truck-modeling = { workspace = true }
+truck-geometry = { workspace = true }
+truck-shapeops = { workspace = true }
+truck-meshalgo = { workspace = true }
+
+[lints.clippy]
+# "Never crash" contract — docs/ARCHITECTURE.md §8.
+unwrap_used = "deny"
+expect_used = "deny"
+indexing_slicing = "deny"
+panic = "deny"
