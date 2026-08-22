@@ -23,7 +23,10 @@ The API lets the caller submit undoable commands similar to the following set:
 - "CreateEdge"
 - "UpdateEdge"
 - "DeleteEdge"
-- "CreateFace" (from edges)
+- "CreateWire" (an ordered, closed loop of edges — the boundary of a face)
+- "UpdateWire"
+- "DeleteWire"
+- "CreateFace" (from one outer wire plus optional inner hole wires and an optional plane; a planar surface is inferred from the wire when no plane is specified)
 - "UpdateFace"
 - "DeleteFace"
 - "CreateSolid" (from face(s))

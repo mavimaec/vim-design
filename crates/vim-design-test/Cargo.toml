@@ -8,4 +8,12 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
-vim-design-lib = { workspace = true }
+vim-design-lib = { workspace = true, features = ["json-debug"] }
+
+[dev-dependencies]
+# Property tests only (docs/ARCHITECTURE.md §12). Dev-dependency of this
+# native-only test crate: it never appears in wasm builds of the library.
+proptest = "1"
+serde = { workspace = true }
+postcard = { workspace = true }
+serde_json = { workspace = true }

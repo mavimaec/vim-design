@@ -58,8 +58,14 @@ Cargo workspace (Rust 2024 edition):
 ### 3.1 Entities and identity
 
 Entity kinds (from the requirements): `ControlPoint`, `Plane`, `Circle`, `Line`, `Spline`,
-`Edge`, `Face`, `Solid`, `Material`, `Extrusion`, `Chamfer`, `SectionBox` — plus two kinds
-implied by the instancing requirement:
+`Edge` (a curve trimmed to a parameter interval, oriented), `Wire` (an ordered, closed
+loop of edges), `Face` (one outer wire + optional hole wires + an optional `Plane`
+surface — when absent, the evaluator infers a plane by least-squares fit of the wire, and
+a wire non-planar beyond tolerance becomes a per-entity evaluation error, §6.4; curved
+faces are never authored — they are *generated* by operations and addressed via `SubRef`,
+§3.4), `Solid`, `Material`,
+`Extrusion`, `Chamfer`, `SectionBox` — plus two kinds implied by the instancing
+requirement:
 
 - **`Element`** — a named group of entities (a construction subgraph) whose evaluation
   produces one or more solids. The reusable "definition."
@@ -308,7 +314,11 @@ The caller-facing output contract:
   poll on that handle (double-buffered internally); the caller copies or uploads to GPU
   within the frame.
 - Tessellation quality: chordal deviation tolerance, default **1 mm** (0.001 m), and
-  angular tolerance default ~20°; both configurable per document.
+  angular tolerance default ~20°; both configurable per document. Quality is a
+  *presentation policy*, never a modeling parameter: it lives in document settings (a
+  per-element LOD override is a possible future knob), and **never** on individual
+  faces — per-face sampling would conflate model with view and invite cracks along
+  shared edges (tessellation runs per shell with each shared edge discretized once).
 
 ### 6.4 Per-entity evaluation errors
 
@@ -492,3 +502,11 @@ Ordered roughly by risk:
     the cost of global-scope selections at 100k+ entities (per-kind index granularity,
     debouncing during drags), and validation of the downstream-candidate exclusion rule
     against real modeling scenarios.
+13. **Command-candidate parking lot** — the command set is *demand-driven by building
+    modeling scenarios, never supply-driven by kernel capability*, and command names use
+    industry CAD/AEC vocabulary, never kernel-specific terminology (the kernel's own
+    names change: truck's `tsweep` became monstertruck's `extrude`). Candidates awaiting
+    a driving scenario: `CreateRevolve` (domes, columns — kernel: `revolve`),
+    `CreateLoft` (ramps, transitions — kernel: `try_skin_wires`). Kernel capabilities
+    that are deliberately NOT commands: healing, shell stitching, `plane_cut` (evaluator
+    internals); STEP I/O (document-level action); meshing tolerances (document settings).

@@ -22,8 +22,10 @@ fn main() {
         }
         Err(e) => {
             // Fail the build: a stale/missing header would silently break
-            // the C++ consumers.
-            panic!("cbindgen failed to generate {}: {e}", out_path.display());
+            // the C++ consumers. (exit(1) rather than panic! — the crate's
+            // clippy::panic denial applies to the build script too.)
+            eprintln!("cbindgen failed to generate {}: {e}", out_path.display());
+            std::process::exit(1);
         }
     }
 }

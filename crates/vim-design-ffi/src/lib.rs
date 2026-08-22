@@ -25,6 +25,19 @@ pub enum VimStatus {
     WouldCreateCycle = 5,
     UnsupportedVersion = 6,
     InternalPanic = 7,
+    MalformedData = 8,
+    SlotKindMismatch = 9,
+    SlotIndexOutOfRange = 10,
+    SlotShapeMismatch = 11,
+    MissingRequiredSlot = 12,
+    ParamsKindMismatch = 13,
+    DeltaMismatch = 14,
+    DuplicateEntityId = 15,
+    WrongEntityKind = 16,
+    NothingToUndo = 17,
+    NothingToRedo = 18,
+    InvalidCommand = 19,
+    SerializationFailed = 20,
 }
 
 /// Opaque VIM Design document handle. Create with `vim_create`, release
@@ -46,6 +59,9 @@ fn ffi_guard(body: impl FnOnce() -> VimStatus) -> VimStatus {
 ///
 /// On success writes a non-null handle to `out_handle` and returns
 /// `VimStatus::Ok`. The handle must be released with `vim_destroy`.
+// C ABI entry points cannot be `unsafe fn` for the generated header's
+// consumers; pointers are null-checked before any dereference.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 #[unsafe(no_mangle)]
 pub extern "C" fn vim_create(out_handle: *mut *mut VimDesign) -> VimStatus {
     ffi_guard(|| {
@@ -68,6 +84,8 @@ pub extern "C" fn vim_create(out_handle: *mut *mut VimDesign) -> VimStatus {
 ///
 /// Passing NULL returns `VimStatus::NullArgument`. After this call the
 /// handle is invalid and must not be used again.
+// See vim_create for why the lint is allowed here.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 #[unsafe(no_mangle)]
 pub extern "C" fn vim_destroy(handle: *mut VimDesign) -> VimStatus {
     ffi_guard(|| {

@@ -11,6 +11,18 @@ monstertruck-modeling = { workspace = true }
 monstertruck-geometry = { workspace = true }
 monstertruck-solid = { workspace = true }
 monstertruck-meshing = { workspace = true }
+serde = { workspace = true }
+postcard = { workspace = true }
+# Dev/debug JSON export (docs/ARCHITECTURE.md §10); not part of wasm builds.
+serde_json = { workspace = true, optional = true }
+
+[features]
+default = []
+# Enables `Document::save_json` for diffing documents in tests.
+json-debug = ["dep:serde_json"]
+
+[dev-dependencies]
+serde_json = { workspace = true }
 
 [lints.clippy]
 # "Never crash" contract — docs/ARCHITECTURE.md §8.
