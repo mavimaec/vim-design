@@ -65,6 +65,9 @@ implied by the instancing requirement:
   produces one or more solids. The reusable "definition."
 - **`Instance`** — a placement of an `Element` at a transform (rigid + optional mirror).
   Hundreds of thousands of instances share one element's evaluated geometry.
+- **`Selection`** — a query entity whose evaluation produces an ordered set of references
+  to entities and/or subelements matching a predicate, wireable into other entities'
+  slots (§3.5).
 
 > Note: `Element`/`Instance` commands (`CreateElement`, `CreateInstance`, …) extend the
 > command list in the requirements; they fall out of the performance requirement (§8 of
@@ -104,6 +107,66 @@ Each entity kind has an evaluator: `fn evaluate(&self, inputs: &[Evaluated]) -> 
 Evaluation failures (e.g., a boolean that fails, a degenerate extrusion) do not fail the
 command that *caused* them retroactively — see §6.4 for how stale-but-valid geometry is
 retained and errors are reported per-entity.
+
+### 3.4 Subelement references — provenance naming (mandatory evaluator rule)
+
+Commands like `CreateChamfer` and `UpdateFaceMaterial` must reference faces/edges that
+are *generated* by upstream operations (an extrusion's lateral faces, a boolean's cut
+faces) — topology that has no `EntityId`. Referencing generated topology by kernel
+output index recreates FreeCAD's decade-long **topological naming problem**: indices
+shuffle when upstream parameters change, and downstream references silently attach to
+the wrong face. The rule here, mandatory from the first evaluator onward:
+
+- Evaluators emit **provenance-named topology**:
+  `SubRef { owner: EntityId, path: ProvenancePath }`, where the path is derived from the
+  *stable ids of the inputs that gave rise to the subelement* — e.g. for extrusion `E12`:
+  `Side(profile_edge: E7)`, `Cap(Start)`, `Cap(End)`; for a boolean: names derived from
+  the provenance of the input faces that produced each output face.
+- Operations **propagate** provenance through their outputs (a chamfer's blend face is
+  named by the edge it blends; a cut face by the cutting plane).
+- Commands and slots reference subelements **only via `SubRef`, never by index**.
+
+Deterministic evaluation (tenet 5) plus stable input ids make these names stable across
+parameter edits: "the face swept from profile edge E7" survives adding a fifth control
+point, because `E7` is still `E7`. A `SubRef` whose path no longer resolves after an
+upstream change (e.g. the source edge was deleted) is a *per-entity evaluation error* on
+the referencing entity (§6.4), never a crash or a silent re-bind.
+
+### 3.5 Selections — declarative targeting of entities and subelements
+
+A `Selection` is an entity kind whose evaluation produces an ordered reference set:
+
+```rust
+enum Ref { Entity(EntityId), Sub(SubRef) }
+// Evaluated::RefSet(Vec<Ref>)  — sorted by (id, path) for determinism
+```
+
+Selections let commands target entities *by criteria* and wire the result into other
+entities' inputs — e.g. "all edges whose start and end points lie on plane z = 3 m" fed
+into a chamfer's edges slot. Consuming slots that accept multiple refs (chamfer edges,
+face-material assignments) accept either an explicit ref list or a `Selection` input.
+
+- **Predicate = closed, serializable AST** — kind filters, geometric tests (endpoint
+  position, length, direction, bounding volume, on-plane-within-tolerance), provenance
+  tests (owner entity, path role), combinators (`and`/`or`/`not`), and set operations
+  between selections. No user-provided code: every predicate is total, panic-free,
+  serde-serializable, and expressible over the C ABI.
+- **Scope is an explicit input**: a set of entities, an `Element` subtree, or —
+  explicitly opted into — document-global filtered by kind. Scoped selections are
+  preferred; a global selection is the one sanctioned form of implicit dependency and
+  carries its cost visibly (see dirtiness below).
+- **Live by default**: a selection is a graph node, so its membership re-evaluates when
+  the model changes — create a new edge on the z = 3 m plane and the chamfer grows to
+  include it. The substrate maintains per-kind indexes so `Insert`/`Remove`/`SetParams`
+  deltas dirty exactly the selections whose scope could contain the touched entity;
+  global selections re-evaluate on any change to a matching kind (the documented price).
+- **Frozen when desired**: a command may *bake* a selection — resolve it once and store
+  the explicit `Vec<Ref>` in the consumer's params (snapshot semantics, no tracking).
+  Both workflows are first-class; live is the default.
+- **Cycle safety**: scope wiring participates in the normal structural cycle check;
+  additionally, candidates downstream of the selection node itself are excluded at
+  evaluation time (deterministically, with a per-entity warning), so dynamic membership
+  can never create an evaluation cycle.
 
 ## 4. Command system
 
@@ -150,29 +213,42 @@ enum Delta {
 
 ## 5. Geometry kernel
 
-### 5.1 truck, behind a seam
+### 5.1 monstertruck, behind a seam
 
-We start with the [`truck`](https://github.com/ricosjp/truck) crate family:
-`truck-modeling` (BREP construction, sweeps/extrusions), `truck-geometry` (NURBS curves/
-surfaces), `truck-shapeops` (booleans), `truck-meshalgo` (tessellation), `truck-stepio`
-(optional STEP interchange later).
+The kernel is the [`monstertruck`](https://github.com/virtualritz/monstertruck) crate
+family — **adopted 2026-08-22**, replacing upstream `truck` after a hands-on head-to-head
+evaluation; pinned `=0.4.0` while pre-1.0. Crates: `monstertruck-modeling` (BREP
+construction: extrude/revolve/loft), `monstertruck-geometry` (NURBS),
+`monstertruck-solid` (booleans with typed `ShapeOpsError`, `plane_cut`),
+`monstertruck-meshing` (tessellation), `monstertruck-fillet` (fillets),
+`monstertruck-io` (STEP, later). Why it won over upstream truck:
+
+- **Typed, recoverable errors** where truck *panics inside library code* on boolean edge
+  cases — fatal in the browser (wasm panic=abort) and a direct violation of tenet 1.
+- **5.5× faster booleans, ~10× faster tessellation** in our building-scale probes.
+- Compiles on wasm32 stable and wasm32+atomics; no future-incompat transitive deps
+  (upstream drags `nom 3.2.1`/`quick-xml 0.22`).
+- Actively maintained (2026); upstream truck has published no release since 2024-09.
+- Same Apache-2.0 license. Known risks: single maintainer (fork rights are the
+  mitigation) and 0.x API churn (hence the exact version pin).
 
 The kernel is wrapped in a thin internal module (`vim_design_lib::kernel`) so that kernel
 types do not leak into the entity/command/FFI layers. This is *not* a full abstraction
 layer over "any kernel" — that would be speculative — but it keeps the blast radius small
-if truck's booleans or fillets force a change of kernel (candidates to evaluate then:
-the `monstertruck` fork of truck, `BrepRs`, or an OpenCascade binding, at the cost of the
-pure-Rust/WASM story).
+if the kernel must change again (fallbacks: upstream `truck`, `BrepRs`, or an OpenCascade
+binding, at the cost of the pure-Rust/WASM story).
 
 ### 5.2 Known kernel gaps and plans
 
-- **Chamfer:** truck does not provide fillet/chamfer. Initial scope is deliberately
-  building-shaped: chamfers on **straight edges between planar faces** (the dominant case
-  in AEC), implemented in-house as: split adjacent faces along offset lines, insert the
-  ruled chamfer face, re-stitch the shell. True fillets (rolling-ball blends on curved
-  faces) are out of scope for v1.
-- **Section box (modeling boolean):** implemented as `solid ∖ section-volume` via
-  `truck-shapeops`. At scale this cannot mean "boolean every solid":
+- **Chamfer/fillet:** evaluate `monstertruck-fillet` (per-edge radii) first; if it falls
+  short, fall back to the in-house plan scoped to building-shaped cases — chamfers on
+  **straight edges between planar faces** (the dominant case in AEC): split adjacent
+  faces along offset lines, insert the ruled chamfer face, re-stitch the shell. True
+  rolling-ball blends on curved faces are out of scope for v1 either way.
+- **Section box (modeling boolean):** implemented via `monstertruck-solid` —
+  `plane_cut` (which returns the clipped solid *plus* its cross-section cap faces) per
+  box plane where applicable, general `difference()` otherwise. At scale this cannot
+  mean "boolean every solid":
   - Maintain a spatial index (AABB tree) over instance bounds.
   - Instances fully outside the box: dropped from output. Fully inside: untouched, stay
     instanced. Only *straddling* instances get a boolean, and a cut instance becomes a
@@ -249,8 +325,8 @@ undo is the escape hatch.
 - **Coordinate system:** right-handed, **Z-up**. +X east, +Y north by convention.
 - **Kernel tolerance:** point-coincidence / topology tolerance **1e-6 m** (1 µm).
   Building-scale coordinates (spans up to ~1e3–1e4 m) keep f64 comfortably accurate at
-  this tolerance. Needs empirical validation against truck's internal `TOLERANCE`
-  constants (truck uses its own fixed tolerances — see Open Questions).
+  this tolerance. Needs empirical validation against the kernel's internal `TOLERANCE`
+  constants (the truck lineage uses fixed tolerances — see Open Questions).
 - **Display/merge tolerance** (e.g. snapping, mesh dedup): 1e-5 m, separate from kernel
   tolerance.
 
@@ -262,10 +338,11 @@ undo is the escape hatch.
   message retrievable via `vim_last_error`). A panic that reaches this backstop is a bug
   and gets a regression test; the document is thereafter treated as suspect but the
   process lives.
-- truck calls are treated as hostile: all `Result`s handled, and kernel entry points that
-  are known to be panic-prone are additionally wrapped in `catch_unwind` *inside* the
-  kernel seam (documented case-by-case), because a third-party panic must not poison the
-  whole document.
+- Kernel calls are treated as hostile: all `Result`s handled, and kernel entry points
+  that are known to be panic-prone are additionally wrapped in `catch_unwind` *inside*
+  the kernel seam (documented case-by-case), because a third-party panic must not poison
+  the whole document. (monstertruck returned typed errors, not panics, in every probe —
+  the policy stands anyway.)
 - Allocation failure and stack overflow are explicitly out of scope of the guarantee.
 
 ## 9. C ABI (`vim-design-ffi`)
@@ -342,29 +419,59 @@ scripts must stay cross-platform (no Windows-only cmdlets). `vbuild.ps1` bootstr
 rustup toolchain + `wasm32-unknown-unknown` target, `wasm-bindgen-cli`, `cbindgen`,
 CMake + a C++ toolchain check, and Node/Playwright for web tests.
 
-## 14. Open questions & things to explore
+## 14. Lessons from parametric CAD history
+
+The dependency-graph shape here is closest to FreeCAD's document model (explicit DAG of
+objects with typed links) and deliberately unlike SolidWorks' ordered feature tree.
+Decades of pain in those systems inform specific rules in this design:
+
+| Historical mistake | Their cost | Our mitigation |
+|---|---|---|
+| **Topological naming** — referencing generated topology by index | FreeCAD broken ~a decade until the v1.0 toponaming overhaul; SolidWorks mitigates via Parasolid persistent naming | Provenance-named `SubRef`s, mandatory from the first evaluator (§3.4) |
+| **Implicit ordering** — features depend on "the model above me in the tree" | SolidWorks reorder/rollback surprises | Explicit typed slots; dirtiness flows only through real edges |
+| **Failure cascades** — one failed feature reddens the whole tree | Both | Per-entity eval errors + retained stale geometry (§6.4) |
+| **Full-model rebuilds**, single-threaded | SolidWorks rebuild stalls | Dirty-subgraph-only, parallel topological waves (§6.2) |
+| **Hidden circular references** — in-context assembly edits | SolidWorks update loops | Cycle check at commit; selections exclude downstream candidates (§3.5) |
+| **Fragile undo** | Both, in places | Delta kernel with mechanically derived inverses (§4.1) |
+| **Id reuse / dangling refs** on delete | Document corruption bugs | Monotonic never-reused ids; reject-if-dependents |
+
+Two standing guards derived from the same history:
+
+- **Constraint solvers don't fit a DAG.** Sketch constraints are non-directional; if a
+  constraint solver is ever added, it lives *inside* a single evaluator node (a "sketch"
+  entity that solves internally and exposes resolved geometry), never as graph edges.
+- **Section box is the one sanctioned implicit-global dependency** (it conceptually
+  touches all solids). It stays *out* of the graph — handled at the instance/mesh
+  integration layer via spatial indexing (§5.2), never as edges-to-everything. Global
+  `Selection` scopes are the second, explicitly opted-into case (§3.5); no other feature
+  may introduce implicit global dependencies.
+
+## 15. Open questions & things to explore
 
 Ordered roughly by risk:
 
-1. **truck boolean robustness & performance** — the load-bearing unknown. Prototype
-   early: extrude building-like footprints, run `truck-shapeops` difference ops against
-   section volumes, measure failure rate and timing at realistic complexity. This
-   go/no-go gates the section-box feature as specified.
-2. **truck vs. its `monstertruck` fork vs. alternatives** — truck was forked and heavily
-   reworked as `monstertruck-*` (renamed crates, API changes, active in 2026); `BrepRs`
-   advertises booleans *and* fillet/chamfer. When we hit truck's limits, evaluate these
-   before considering OpenCascade bindings (which would sacrifice pure-Rust WASM).
-   *(`monstertruck` evaluation in progress, 2026-08-22.)*
-3. **truck's tolerance model** — truck historically uses fixed internal tolerance
-   constants. Verify they're compatible with meter-unit building geometry (1 µm target)
+1. **Boolean robustness & performance at building scale** — still the load-bearing
+   unknown. 2026-08-22 probes: box∖cylinder passes (37 ms); coplanar-face and
+   holed-cap cases *fail* — safely, with typed errors, but they fail. Prototype against
+   real building footprints, measure failure rate at realistic complexity; this gates
+   the section-box feature as specified.
+2. **Kernel choice** — **RESOLVED (2026-08-22): adopted `monstertruck =0.4.0`** after a
+   hands-on head-to-head (typed errors vs. library panics, 5.5×/10× faster booleans/
+   tessellation, wasm-clean, dep-hygiene-clean, actively maintained — see §5.1).
+   Fallbacks if it disappoints: upstream `truck`, `BrepRs`, OpenCascade bindings.
+3. **The kernel's tolerance model** — the truck lineage (including monstertruck) uses
+   fixed internal tolerance constants. Verify they're compatible with meter-unit building geometry (1 µm target)
    or whether coordinates need internal scaling.
-4. **Chamfer scope** — is planar-face/straight-edge chamfering sufficient for v1?
-   In-house implementation effort is non-trivial even for that case.
+4. **Chamfer scope** — first evaluate `monstertruck-fillet` (per-edge radii; gained with
+   the kernel swap) before committing to the in-house plan. If in-house is still needed:
+   is planar-face/straight-edge chamfering sufficient for v1? Effort is non-trivial even
+   for that case.
 5. **WASM threading** — **RESOLVED (2026-08-22):** true parallelism verified in headless
    Chromium (8 rayon workers, ~4.3× speedup); truck compiles and runs in both threaded
    (nightly + explicit RUSTFLAGS, §6.2) and single-threaded fallback builds. Remaining
    follow-up: measure how gracefully the fallback degrades at target scale.
-6. **Section box × instancing interaction** — straddling instances de-instance while cut;
+6. **Section box × instancing interaction** — `plane_cut` returning cap faces (§5.2)
+   likely covers the per-plane cut + cap-material case; still open: straddling instances de-instance while cut;
    with a box crossing a large building, how many uniques is that in practice, and is
    incremental re-cut on box drag feasible, or does box-drag need a cheaper preview mode
    (display-clip) with the boolean applied on release?
@@ -378,3 +485,10 @@ Ordered roughly by risk:
    memory per 100k instances) before we commit to targets.
 10. **Element/Instance command surface** — **RESOLVED (2026-08-22):** approved; commands
     added to PROJECT_REQUIREMENTS.md.
+11. **Topological naming / subelement references** — **RESOLVED (2026-08-22):** approved
+    and promoted to a mandatory evaluator rule; see §3.4.
+12. **Selection details** — the concept is approved (§3.5); still to pin down during
+    implementation: the exact predicate AST surface (and its C-ABI representation),
+    the cost of global-scope selections at 100k+ entities (per-kind index granularity,
+    debouncing during drags), and validation of the downstream-candidate exclusion rule
+    against real modeling scenarios.
