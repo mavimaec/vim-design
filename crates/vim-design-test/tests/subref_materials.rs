@@ -7,7 +7,7 @@
 
 use vim_design_lib::eval::{Engine, EvalErrorKind, SubRefResolution};
 use vim_design_lib::{
-    Command, Document, EntityId, Mesh, ProvenancePath, SubRef,
+    Command, Document, EntityId, FaceTarget, Mesh, ProvenancePath, SubRef,
 };
 use vim_design_test::{build_cone, build_cube, build_plate, one, ok};
 
@@ -73,7 +73,7 @@ fn painting_a_generated_cap_splits_the_submeshes() {
         &mut doc,
         Command::UpdateSubFaceMaterial {
             owner: cube.extrusion,
-            path: ProvenancePath::CapEnd,
+            target: FaceTarget::One(ProvenancePath::CapEnd),
             material: Some(red),
         },
     );
@@ -98,7 +98,7 @@ fn painting_a_generated_cap_splits_the_submeshes() {
         &mut doc,
         Command::UpdateSubFaceMaterial {
             owner: cube.extrusion,
-            path: ProvenancePath::CapEnd,
+            target: FaceTarget::One(ProvenancePath::CapEnd),
             material: None,
         },
     );
@@ -122,7 +122,7 @@ fn anti_tnp_paint_survives_kernel_face_reordering() {
         &mut doc,
         Command::UpdateSubFaceMaterial {
             owner: plate.extrusion,
-            path: ProvenancePath::Side { source: east_edge },
+            target: FaceTarget::One(ProvenancePath::Side { source: east_edge }),
             material: Some(red),
         },
     );

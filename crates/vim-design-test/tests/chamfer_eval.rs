@@ -120,7 +120,7 @@ fn paint_survives_across_a_chamfer_and_undo_is_byte_exact() {
         &mut doc,
         Command::UpdateSubFaceMaterial {
             owner: cube.extrusion,
-            path: south.clone(),
+            target: vim_design_lib::FaceTarget::One(south.clone()),
             material: Some(red),
         },
     );

@@ -68,6 +68,26 @@
 //! (source edge deleted, cap gone on an angle change) is a typed
 //! [`EvalErrorKind::UnresolvedSubRef`] — never a silent re-bind.
 //!
+//! # Provenance queries — set-valued targeting and the liveness contract
+//!
+//! A `ProvenanceQuery` (`SubRefSet { owner, query }`) targets a *class*
+//! of generated topology — `RimEdges`, `SideFaces`, `Caps`,
+//! `VerticalEdges` (each filterable to the outer wire or the hole
+//! wires), and `Union`. **The liveness contract:** a query is expanded
+//! against the owner's *current* solid on every owner re-evaluation, and
+//! an **empty expansion is a valid result, not an error** — paint
+//! `SideFaces { HolesOnly }` or chamfer `RimEdges { HolesOnly }` on a
+//! hole-less profile and nothing happens *yet*; add a hole later and the
+//! new walls are painted / the new rim is blended automatically, because
+//! expansion re-runs. No extra dirtying machinery exists or is needed:
+//! the consumer already depends on the owner through an ordinary graph
+//! edge, so any topology-changing upstream edit re-evaluates it. A
+//! chamfer whose query targets all expand empty passes its target's
+//! solid through unchanged (a no-op, not an error).
+//! [`Engine::resolve_query`] reports a query's current face/edge counts;
+//! it errors only on structural mismatch (no evaluated geometry, or an
+//! owner without a sweep provenance model).
+//!
 //! # Materials
 //!
 //! [`Submesh::material`] carries a `Material` entity id (or `None` for
@@ -117,5 +137,5 @@ mod types;
 pub use engine::Engine;
 pub use types::{
     EvalDiag, EvalErrorKind, EvalState, Evaluated, InstanceUpdate, Mesh, MeshUpdate,
-    SubRefResolution, Submesh, Updates,
+    QueryResolution, SubRefResolution, Submesh, Updates,
 };

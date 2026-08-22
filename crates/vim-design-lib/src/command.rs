@@ -20,7 +20,7 @@ use crate::delta::Delta;
 use crate::id::EntityId;
 use crate::selection::{PredicateAst, SelectionScope};
 use crate::status::VimStatus;
-use crate::subref::{ProvenancePath, SubRef};
+use crate::subref::{EdgeTarget, FaceTarget, SubRef, SubRefSet};
 
 /// The closed set of user-level commands — the full requirements list
 /// (docs/PROJECT_REQUIREMENTS.md) plus the composite cylinder commands.
@@ -198,16 +198,18 @@ pub enum Command {
     DeleteExtrusion {
         id: EntityId,
     },
-    /// Assign (or clear, with `material: None`) a material on a
-    /// *generated* face of an `Extrusion` or `Revolve`, addressed by its
-    /// provenance path (docs/ARCHITECTURE.md §3.4) — e.g. paint an
-    /// extrusion's `CapEnd` differently from its sides. The counterpart
-    /// of `UpdateFaceMaterial` for topology that has no `EntityId`.
-    /// Whether the path *resolves* is evaluation-time semantics (§6.4);
-    /// structurally any path may be assigned.
+    /// Assign (or clear, with `material: None`) a material on
+    /// *generated* faces of an `Extrusion` or `Revolve`, addressed by a
+    /// provenance target (docs/ARCHITECTURE.md §§3.4–3.5): a concrete
+    /// path (`FaceTarget::One`, e.g. `CapEnd`) or a live query set
+    /// (`FaceTarget::Set`, e.g. `SideFaces { HolesOnly }` — membership
+    /// re-expands on every evaluation). The counterpart of
+    /// `UpdateFaceMaterial` for topology that has no `EntityId`.
+    /// Whether the target *resolves* is evaluation-time semantics
+    /// (§6.4); structurally any target may be assigned.
     UpdateSubFaceMaterial {
         owner: EntityId,
-        path: ProvenancePath,
+        target: FaceTarget,
         material: Option<EntityId>,
     },
     // -- Revolve ---------------------------------------------------------
@@ -230,11 +232,13 @@ pub enum Command {
     },
     // -- Chamfer ----------------------------------------------------
     /// Chamfer edges of `target` (an `Extrusion`/`Revolve`/`Solid`/
-    /// `Chamfer`). `sub_edges` addresses generated edges by provenance
-    /// (`SharedEdge` paths whose `SubRef::owner` is the target);
-    /// `edges` may mix authored `Edge` ids (matched to coincident solid
-    /// edges at evaluation time) and `Selection` ids
-    /// (docs/ARCHITECTURE.md §§3.4–3.5).
+    /// `Chamfer`). `sub_edges` addresses concrete generated edges by
+    /// provenance (`SharedEdge` SubRefs owned by the target); live query
+    /// sets (`SubRefSet`, e.g. `VerticalEdges{OuterOnly}`) are attached
+    /// via `UpdateChamferEdgeSets`; `edges` may mix authored `Edge` ids
+    /// (matched to coincident solid edges at evaluation time) and
+    /// `Selection` ids (docs/ARCHITECTURE.md §§3.4–3.5). Params store
+    /// both singles and sets as one canonical `Vec<EdgeTarget>`.
     CreateChamfer {
         target: EntityId,
         distance: f64,
@@ -246,7 +250,19 @@ pub enum Command {
         distance: Option<f64>,
         target: Option<EntityId>,
         edges: Option<Vec<EntityId>>,
+        /// `Some(v)` replaces the chamfer's concrete (`EdgeTarget::One`)
+        /// entries; query-set entries are managed independently by
+        /// `UpdateChamferEdgeSets` and are preserved.
         sub_edges: Option<Vec<SubRef>>,
+        coalesce: bool,
+    },
+    /// Replace a chamfer's live query-set edge targets
+    /// (`EdgeTarget::Set` entries; docs/ARCHITECTURE.md §3.5). Concrete
+    /// `sub_edges` entries are preserved — the two lists are managed
+    /// independently and merge into `Params::Chamfer::sub_edges`.
+    UpdateChamferEdgeSets {
+        id: EntityId,
+        edge_sets: Vec<SubRefSet>,
         coalesce: bool,
     },
     DeleteChamfer {
@@ -386,6 +402,7 @@ impl Command {
             Command::DeleteRevolve { .. } => "DeleteRevolve",
             Command::CreateChamfer { .. } => "CreateChamfer",
             Command::UpdateChamfer { .. } => "UpdateChamfer",
+            Command::UpdateChamferEdgeSets { .. } => "UpdateChamferEdgeSets",
             Command::DeleteChamfer { .. } => "DeleteChamfer",
             Command::CreateSectionBox { .. } => "CreateSectionBox",
             Command::UpdateSectionBox { .. } => "UpdateSectionBox",
@@ -423,6 +440,7 @@ impl Command {
             | Command::UpdateExtrusion { id, coalesce, .. }
             | Command::UpdateRevolve { id, coalesce, .. }
             | Command::UpdateChamfer { id, coalesce, .. }
+            | Command::UpdateChamferEdgeSets { id, coalesce, .. }
             | Command::UpdateSectionBox { id, coalesce, .. }
             | Command::UpdateElement { id, coalesce, .. }
             | Command::UpdateInstance { id, coalesce, .. }
@@ -854,9 +872,9 @@ fn run(ctx: &mut Ctx<'_>, command: &Command) -> Result<(), VimStatus> {
         Command::DeleteExtrusion { id } => ctx.delete(*id, EntityKind::Extrusion),
         Command::UpdateSubFaceMaterial {
             owner,
-            path,
+            target,
             material,
-        } => update_sub_face_material(ctx, *owner, path, *material),
+        } => update_sub_face_material(ctx, *owner, target, *material),
 
         // -- Revolve -----------------------------------------------------
         Command::CreateRevolve {
@@ -915,10 +933,12 @@ fn run(ctx: &mut Ctx<'_>, command: &Command) -> Result<(), VimStatus> {
             edges,
             sub_edges,
         } => {
+            let targets: Vec<EdgeTarget> =
+                sub_edges.iter().cloned().map(EdgeTarget::One).collect();
             ctx.create(
                 Params::Chamfer {
                     distance: *distance,
-                    sub_edges: canonical_sub_edges(sub_edges),
+                    sub_edges: canonical_sub_edges(&targets),
                 },
                 vec![
                     SlotValue::One(Some(*target)),
@@ -937,21 +957,32 @@ fn run(ctx: &mut Ctx<'_>, command: &Command) -> Result<(), VimStatus> {
         } => {
             let record = ctx.expect_kind(*id, EntityKind::Chamfer)?;
             if distance.is_some() || sub_edges.is_some() {
-                let (old_distance, old_sub_edges) = match record.params {
+                let (old_distance, old_targets) = match record.params {
                     Params::Chamfer {
                         distance,
                         sub_edges,
                     } => (distance, sub_edges),
                     _ => return Err(VimStatus::ParamsKindMismatch),
                 };
+                let merged = match sub_edges {
+                    // Replace the One entries; Set entries are managed by
+                    // UpdateChamferEdgeSets and preserved here.
+                    Some(singles) => {
+                        let mut merged: Vec<EdgeTarget> = old_targets
+                            .iter()
+                            .filter(|t| matches!(t, EdgeTarget::Set(_)))
+                            .cloned()
+                            .collect();
+                        merged.extend(singles.iter().cloned().map(EdgeTarget::One));
+                        canonical_sub_edges(&merged)
+                    }
+                    None => old_targets,
+                };
                 ctx.set_params(
                     *id,
                     Params::Chamfer {
                         distance: distance.unwrap_or(old_distance),
-                        sub_edges: sub_edges
-                            .as_ref()
-                            .map(|s| canonical_sub_edges(s))
-                            .unwrap_or(old_sub_edges),
+                        sub_edges: merged,
                     },
                 )?;
             }
@@ -962,6 +993,30 @@ fn run(ctx: &mut Ctx<'_>, command: &Command) -> Result<(), VimStatus> {
                 ctx.rewire(*id, slot::CHAMFER_EDGES, SlotValue::Many(edges.clone()))?;
             }
             Ok(())
+        }
+        Command::UpdateChamferEdgeSets { id, edge_sets, .. } => {
+            let record = ctx.expect_kind(*id, EntityKind::Chamfer)?;
+            let (distance, old_targets) = match record.params {
+                Params::Chamfer {
+                    distance,
+                    sub_edges,
+                } => (distance, sub_edges),
+                _ => return Err(VimStatus::ParamsKindMismatch),
+            };
+            // Replace the Set entries; One entries are preserved.
+            let mut merged: Vec<EdgeTarget> = old_targets
+                .iter()
+                .filter(|t| matches!(t, EdgeTarget::One(_)))
+                .cloned()
+                .collect();
+            merged.extend(edge_sets.iter().cloned().map(EdgeTarget::Set));
+            ctx.set_params(
+                *id,
+                Params::Chamfer {
+                    distance,
+                    sub_edges: canonical_sub_edges(&merged),
+                },
+            )
         }
         Command::DeleteChamfer { id } => ctx.delete(*id, EntityKind::Chamfer),
 
@@ -1119,37 +1174,32 @@ fn run(ctx: &mut Ctx<'_>, command: &Command) -> Result<(), VimStatus> {
     }
 }
 
-/// Canonicalize chamfer sub-edge refs (SharedEdge operand order is
-/// insensitive — docs/ARCHITECTURE.md §3.4) and sort for deterministic
-/// params equality/serialization.
-fn canonical_sub_edges(sub_edges: &[SubRef]) -> Vec<SubRef> {
-    let mut canon: Vec<SubRef> = sub_edges
-        .iter()
-        .map(|s| SubRef {
-            owner: s.owner,
-            path: s.path.canonical(),
-        })
-        .collect();
+/// Canonicalize chamfer edge targets (SharedEdge operand order and
+/// Union member order are insensitive — docs/ARCHITECTURE.md §§3.4–3.5)
+/// and sort for deterministic params equality/serialization.
+fn canonical_sub_edges(sub_edges: &[EdgeTarget]) -> Vec<EdgeTarget> {
+    let mut canon: Vec<EdgeTarget> =
+        sub_edges.iter().map(EdgeTarget::canonical).collect();
     canon.sort();
     canon.dedup();
     canon
 }
 
 /// Compile `UpdateSubFaceMaterial`: update the owner's params assignment
-/// list (sorted by path; one material per path) and mirror the material
-/// ids into the owner's `face_materials` slot so they are real graph
-/// edges (reject-if-dependents, dirty propagation).
+/// list (sorted by target; one material per target) and mirror the
+/// material ids into the owner's `face_materials` slot so they are real
+/// graph edges (reject-if-dependents, dirty propagation).
 fn update_sub_face_material(
     ctx: &mut Ctx<'_>,
     owner: EntityId,
-    path: &ProvenancePath,
+    target: &FaceTarget,
     material: Option<EntityId>,
 ) -> Result<(), VimStatus> {
     let record = ctx.record(owner)?;
-    let path = path.canonical();
+    let target = target.canonical();
     let (params, slot_idx) = match record.params {
         Params::Extrusion { face_materials } => {
-            let updated = upsert_assignment(face_materials, path, material);
+            let updated = upsert_assignment(face_materials, target, material);
             (
                 Params::Extrusion {
                     face_materials: updated,
@@ -1161,7 +1211,7 @@ fn update_sub_face_material(
             angle_radians,
             face_materials,
         } => {
-            let updated = upsert_assignment(face_materials, path, material);
+            let updated = upsert_assignment(face_materials, target, material);
             (
                 Params::Revolve {
                     angle_radians,
@@ -1187,16 +1237,16 @@ fn update_sub_face_material(
     ctx.set_params(owner, params)
 }
 
-/// Replace/insert/remove the assignment for `path`, keeping the list
-/// sorted by path (deterministic serialization).
+/// Replace/insert/remove the assignment for `target`, keeping the list
+/// sorted (One-before-Set precedence; deterministic serialization).
 fn upsert_assignment(
-    mut list: Vec<(ProvenancePath, EntityId)>,
-    path: ProvenancePath,
+    mut list: Vec<(FaceTarget, EntityId)>,
+    target: FaceTarget,
     material: Option<EntityId>,
-) -> Vec<(ProvenancePath, EntityId)> {
-    list.retain(|(p, _)| *p != path);
+) -> Vec<(FaceTarget, EntityId)> {
+    list.retain(|(t, _)| *t != target);
     if let Some(material) = material {
-        list.push((path, material));
+        list.push((target, material));
     }
     list.sort();
     list

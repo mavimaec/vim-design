@@ -541,40 +541,94 @@ pub(crate) fn evaluate_entity(
                         ));
                     }
                 };
+            let slot_edge_ids = multi_ids(record, slot::CHAMFER_EDGES);
+            if sub_edges.is_empty() && slot_edge_ids.is_empty() {
+                return Err(diag(
+                    EvalErrorKind::Degenerate,
+                    "chamfer has no edge targets",
+                ));
+            }
             let mut addresses: Vec<kernel::EdgeAddress> = Vec::new();
-            for sub in &sub_edges {
-                // A SubRef names topology of its owner; a chamfer can
-                // only blend edges of its own target (§3.4).
-                if sub.owner != target_id {
-                    return Err(diag(
-                        EvalErrorKind::UnresolvedSubRef,
-                        format!(
-                            "SubRef owner (entity {}) is not the chamfer's target \
-                             (entity {})",
-                            sub.owner.0, target_id.0
-                        ),
-                    ));
-                }
-                match sub.path.canonical() {
-                    crate::subref::ProvenancePath::SharedEdge { a, b } => {
-                        addresses.push(kernel::EdgeAddress::Shared { a: *a, b: *b });
+            for target_ref in &sub_edges {
+                match target_ref {
+                    crate::subref::EdgeTarget::One(sub) => {
+                        // A SubRef names topology of its owner; a chamfer
+                        // can only blend edges of its own target (§3.4).
+                        if sub.owner != target_id {
+                            return Err(diag(
+                                EvalErrorKind::UnresolvedSubRef,
+                                format!(
+                                    "SubRef owner (entity {}) is not the chamfer's \
+                                     target (entity {})",
+                                    sub.owner.0, target_id.0
+                                ),
+                            ));
+                        }
+                        match sub.path.canonical() {
+                            crate::subref::ProvenancePath::SharedEdge { a, b } => {
+                                addresses
+                                    .push(kernel::EdgeAddress::Shared { a: *a, b: *b });
+                            }
+                            other => {
+                                return Err(diag(
+                                    EvalErrorKind::UnresolvedSubRef,
+                                    format!(
+                                        "provenance path {other:?} addresses a face, \
+                                         not an edge (use a SharedEdge path)"
+                                    ),
+                                ));
+                            }
+                        }
                     }
-                    other => {
-                        return Err(diag(
-                            EvalErrorKind::UnresolvedSubRef,
-                            format!(
-                                "provenance path {other:?} addresses a face, not an \
-                                 edge (use a SharedEdge path)"
-                            ),
-                        ));
+                    crate::subref::EdgeTarget::Set(set) => {
+                        if set.owner != target_id {
+                            return Err(diag(
+                                EvalErrorKind::UnresolvedSubRef,
+                                format!(
+                                    "SubRefSet owner (entity {}) is not the chamfer's \
+                                     target (entity {})",
+                                    set.owner.0, target_id.0
+                                ),
+                            ));
+                        }
+                        // Live expansion against the target's CURRENT
+                        // topology; an empty expansion is a valid no-op
+                        // (the liveness contract, §3.5).
+                        let expansion = kernel::expand_query(solid, &set.query)
+                            .map_err(kernel_diag)?;
+                        if !expansion.face_paths.is_empty() {
+                            return Err(diag(
+                                EvalErrorKind::UnresolvedSubRef,
+                                "query expands to faces; chamfer edges need an \
+                                 edge-valued query (RimEdges/VerticalEdges)",
+                            ));
+                        }
+                        for path in expansion.edge_paths {
+                            if let crate::subref::ProvenancePath::SharedEdge { a, b } =
+                                path
+                            {
+                                addresses
+                                    .push(kernel::EdgeAddress::Shared { a: *a, b: *b });
+                            }
+                        }
                     }
                 }
             }
             // Authored Edge entities (and, later, Selections) from the
             // edges slot: matched to coincident solid edges.
-            for edge_id in multi_ids(record, slot::CHAMFER_EDGES) {
+            for edge_id in slot_edge_ids {
                 let curve = as_curve(require(lookup, Some(edge_id), "edge")?, "edge")?;
                 addresses.push(kernel::EdgeAddress::Coincident(curve.clone()));
+            }
+            if addresses.is_empty() {
+                // Targets were configured but every query set expanded to
+                // nothing (e.g. RimEdges{HolesOnly} on a hole-less
+                // profile): the chamfer is a pass-through no-op that
+                // starts blending as soon as matching topology appears.
+                return Ok(Evaluated::Solid {
+                    solid: solid.clone(),
+                    material,
+                });
             }
             let chamfered = kernel::chamfer_solid(solid, &addresses, distance, tol)
                 .map_err(kernel_diag)?;

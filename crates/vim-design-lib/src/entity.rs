@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::id::EntityId;
 use crate::selection::{PredicateAst, SelectionScope};
 use crate::status::VimStatus;
-use crate::subref::{ProvenancePath, SubRef};
+use crate::subref::{EdgeTarget, FaceTarget};
 
 /// The closed set of entity kinds (docs/ARCHITECTURE.md §3.1).
 #[derive(
@@ -80,13 +80,16 @@ pub enum Params {
     /// Sweep of the profile face input along the path input.
     ///
     /// `face_materials` assigns materials to *generated* faces by
-    /// provenance path (docs/ARCHITECTURE.md §3.4) — e.g. paint `CapEnd`
-    /// differently from `Side { source }`. Kept sorted by path; the
-    /// referenced material ids are mirrored in the entity's
-    /// `face_materials` slot so they are real graph edges
-    /// (reject-if-dependents, dirty propagation).
+    /// provenance target (docs/ARCHITECTURE.md §§3.4–3.5): a concrete
+    /// path (`FaceTarget::One` — e.g. paint `CapEnd`) or a live query
+    /// set (`FaceTarget::Set` — e.g. paint `SideFaces { HolesOnly }`,
+    /// which re-expands on every evaluation so later-added holes are
+    /// painted automatically). Kept sorted (One before Set = explicit
+    /// paints take precedence); the referenced material ids are mirrored
+    /// in the entity's `face_materials` slot so they are real graph
+    /// edges (reject-if-dependents, dirty propagation).
     Extrusion {
-        face_materials: Vec<(ProvenancePath, EntityId)>,
+        face_materials: Vec<(FaceTarget, EntityId)>,
     },
     /// Revolution of the profile face input about the axis line input by
     /// `angle_radians` (default 2π = closed solid of revolution; angles
@@ -94,16 +97,18 @@ pub enum Params {
     /// `Extrusion`.
     Revolve {
         angle_radians: f64,
-        face_materials: Vec<(ProvenancePath, EntityId)>,
+        face_materials: Vec<(FaceTarget, EntityId)>,
     },
     /// Chamfer of `distance` meters over edges of its target solid
-    /// producer. Edges are addressed by `sub_edges` (provenance-named
-    /// `SubRef`s whose owner is the target — docs/ARCHITECTURE.md §3.4)
-    /// and/or by the entity's edges slot (authored `Edge` entities
-    /// matched by curve coincidence, or a `Selection`).
+    /// producer. Edges are addressed by `sub_edges` — concrete
+    /// provenance-named `SubRef`s and/or live `SubRefSet` queries, both
+    /// owned by the target (docs/ARCHITECTURE.md §§3.4–3.5) — and/or by
+    /// the entity's edges slot (authored `Edge` entities matched by
+    /// curve coincidence, or a `Selection`). Query targets that expand
+    /// to nothing are pass-through no-ops, not errors.
     Chamfer {
         distance: f64,
-        sub_edges: Vec<SubRef>,
+        sub_edges: Vec<EdgeTarget>,
     },
     /// Axis-aligned section box (min/max corners in meters). Stays out of
     /// the dependency graph by design (docs/ARCHITECTURE.md §14).

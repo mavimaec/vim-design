@@ -91,6 +91,128 @@ pub enum Ref {
     Sub(SubRef),
 }
 
+// ---------------------------------------------------------------------
+// Provenance queries — tier-1 set-valued topological targeting
+// (docs/ARCHITECTURE.md §3.5). A query describes a *class* of generated
+// topology in provenance space ("all rim edges of the end cap", "the
+// hole walls"); it re-expands against the owner's current topology on
+// every evaluation, so membership is live by construction — no dirtying
+// machinery beyond the ordinary owner dependency edge.
+// ---------------------------------------------------------------------
+
+/// Which cap of a sweep a query refers to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum CapId {
+    Start,
+    End,
+}
+
+/// Restricts a query to profile edges of specific wires of the profile
+/// face (the sweep model records which wire each side face's source
+/// edge came from).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum WireFilter {
+    /// Outer wire and all hole wires.
+    All,
+    /// The outer boundary wire only.
+    OuterOnly,
+    /// Hole wires only (expands to NOTHING on a face without holes —
+    /// valid, not an error; holes added later join automatically).
+    HolesOnly,
+}
+
+/// A set-valued query over a sweep's generated topology. Closed serde
+/// enum (expressible over the C ABI). Face-valued: `SideFaces`, `Caps`;
+/// edge-valued: `RimEdges`, `VerticalEdges`; `Union` may mix.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum ProvenanceQuery {
+    /// The edges where a cap meets the side faces (`SharedEdge { Cap,
+    /// Side }` per matching profile edge).
+    RimEdges { cap: CapId, wires: WireFilter },
+    /// The lateral faces swept from the filtered wires' profile edges.
+    SideFaces { wires: WireFilter },
+    /// Every cap face the sweep currently has (a closed revolve has
+    /// none — empty expansion, not an error).
+    Caps,
+    /// The edges where two side faces meet (`SharedEdge { Side, Side }`
+    /// for adjacent profile edges of the filtered wires) — the vertical
+    /// edges of an upright extrusion.
+    VerticalEdges { wires: WireFilter },
+    /// Set union of sub-queries (expansion deduplicates).
+    Union(Vec<ProvenanceQuery>),
+}
+
+impl ProvenanceQuery {
+    /// Canonical form: `Union` members sorted and deduplicated,
+    /// recursively (deterministic params equality/serialization).
+    pub fn canonical(&self) -> ProvenanceQuery {
+        match self {
+            ProvenanceQuery::Union(members) => {
+                let mut canon: Vec<ProvenanceQuery> =
+                    members.iter().map(ProvenanceQuery::canonical).collect();
+                canon.sort();
+                canon.dedup();
+                ProvenanceQuery::Union(canon)
+            }
+            other => other.clone(),
+        }
+    }
+}
+
+/// A set-valued subelement reference: a provenance query against one
+/// owner's generated topology (the set sibling of [`SubRef`]).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct SubRefSet {
+    pub owner: EntityId,
+    pub query: ProvenanceQuery,
+}
+
+/// An edge-targeting operand for operations like chamfer: one concrete
+/// provenance-named edge, or a live query set. `Ord` puts `One` before
+/// `Set` (specific-before-general — also the precedence rule where both
+/// address the same topology).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum EdgeTarget {
+    One(SubRef),
+    Set(SubRefSet),
+}
+
+impl EdgeTarget {
+    /// Canonical form (paths/queries canonicalized).
+    pub fn canonical(&self) -> EdgeTarget {
+        match self {
+            EdgeTarget::One(sub) => EdgeTarget::One(SubRef {
+                owner: sub.owner,
+                path: sub.path.canonical(),
+            }),
+            EdgeTarget::Set(set) => EdgeTarget::Set(SubRefSet {
+                owner: set.owner,
+                query: set.query.canonical(),
+            }),
+        }
+    }
+}
+
+/// A face-targeting operand for per-face material assignment: one
+/// concrete provenance-named face, or a live query set. `Ord` puts
+/// `One` before `Set`: explicit single-face paints take precedence over
+/// set paints when both match a face.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum FaceTarget {
+    One(ProvenancePath),
+    Set(ProvenanceQuery),
+}
+
+impl FaceTarget {
+    /// Canonical form (paths/queries canonicalized).
+    pub fn canonical(&self) -> FaceTarget {
+        match self {
+            FaceTarget::One(path) => FaceTarget::One(path.canonical()),
+            FaceTarget::Set(query) => FaceTarget::Set(query.canonical()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

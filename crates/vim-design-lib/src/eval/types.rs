@@ -147,6 +147,18 @@ pub enum SubRefResolution {
     Edges(usize),
 }
 
+/// What a provenance *query* currently expands to on its owner
+/// ([`Engine::resolve_query`](super::Engine::resolve_query)): total
+/// matched faces and edges across the expansion. Unlike single
+/// `SubRef`s, `(0, 0)` is a **valid** result — an empty expansion (e.g.
+/// `HolesOnly` on a hole-less face) is the liveness contract at work,
+/// not an error (docs/ARCHITECTURE.md §3.5).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QueryResolution {
+    pub faces: usize,
+    pub edges: usize,
+}
+
 // ---------------------------------------------------------------------
 // Poll facade payloads (docs/ARCHITECTURE.md §6.3).
 // ---------------------------------------------------------------------

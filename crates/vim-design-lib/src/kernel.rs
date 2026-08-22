@@ -33,7 +33,7 @@ use monstertruck_modeling::{
 };
 
 use crate::id::EntityId;
-use crate::subref::ProvenancePath;
+use crate::subref::{CapId, ProvenancePath, ProvenanceQuery, WireFilter};
 
 // ---------------------------------------------------------------------
 // Plain-data specs (safe to construct anywhere; no kernel types inside).
@@ -1188,6 +1188,155 @@ pub fn match_counts(solid: &KernelSolid, path: &ProvenancePath) -> (usize, usize
             (0, shared_edges_between(&faces, &set_a, &set_b).len())
         }
         other => (faces_with_path(solid, &other).len(), 0),
+    }
+}
+
+// ---------------------------------------------------------------------
+// Provenance-query expansion (docs/ARCHITECTURE.md §3.5, tier 1).
+// ---------------------------------------------------------------------
+
+/// The concrete provenance paths a query expands to on one solid.
+/// Face-valued queries fill `face_paths`, edge-valued ones
+/// `edge_paths`; a `Union` may fill both. **Empty expansion is valid**
+/// (e.g. `HolesOnly` on a face without holes) — only paths that resolve
+/// on the *current* topology are emitted, which is what makes query
+/// membership live: it re-derives on every evaluation.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct QueryExpansion {
+    pub face_paths: Vec<ProvenancePath>,
+    pub edge_paths: Vec<ProvenancePath>,
+}
+
+impl QueryExpansion {
+    fn push_face(&mut self, path: ProvenancePath) {
+        if !self.face_paths.contains(&path) {
+            self.face_paths.push(path);
+        }
+    }
+
+    fn push_edge(&mut self, path: ProvenancePath) {
+        if !self.edge_paths.contains(&path) {
+            self.edge_paths.push(path);
+        }
+    }
+}
+
+/// Profile-edge sources of the sweep model selected by `filter`, in
+/// wire order (outer wire first, then hole wires). Grouped per wire so
+/// adjacency (`VerticalEdges`) stays within one wire.
+fn filtered_wire_sources(model: &SweepModel, filter: WireFilter) -> Vec<Vec<EntityId>> {
+    let (outer, holes) = match model {
+        SweepModel::Extrusion { outer, holes, .. }
+        | SweepModel::Revolve { outer, holes, .. } => (outer, holes),
+    };
+    let mut wires: Vec<&WireSpec> = Vec::new();
+    match filter {
+        WireFilter::All => {
+            wires.push(outer);
+            wires.extend(holes.iter());
+        }
+        WireFilter::OuterOnly => wires.push(outer),
+        WireFilter::HolesOnly => wires.extend(holes.iter()),
+    }
+    wires
+        .into_iter()
+        .map(|wire| {
+            wire.sources
+                .iter()
+                .copied()
+                .filter(|source| *source != EntityId::INVALID)
+                .collect()
+        })
+        .collect()
+}
+
+/// Expand a provenance query against a solid's current topology.
+/// Requires a sweep model (extrusion/revolve lineage);
+/// [`KernelError::Unresolved`] otherwise. Emits only paths that resolve
+/// right now; empty expansions are valid results.
+pub fn expand_query(
+    solid: &KernelSolid,
+    query: &ProvenanceQuery,
+) -> Result<QueryExpansion, KernelError> {
+    let Some(model) = &solid.model else {
+        return Err(KernelError::Unresolved(
+            "owner has no sweep provenance model (queries need an \
+             extrusion/revolve lineage)"
+                .to_owned(),
+        ));
+    };
+    let mut expansion = QueryExpansion::default();
+    expand_into(solid, model, query, &mut expansion);
+    Ok(expansion)
+}
+
+fn cap_path(cap: CapId) -> ProvenancePath {
+    match cap {
+        CapId::Start => ProvenancePath::CapStart,
+        CapId::End => ProvenancePath::CapEnd,
+    }
+}
+
+fn expand_into(
+    solid: &KernelSolid,
+    model: &SweepModel,
+    query: &ProvenanceQuery,
+    expansion: &mut QueryExpansion,
+) {
+    match query {
+        ProvenanceQuery::SideFaces { wires } => {
+            for wire in filtered_wire_sources(model, *wires) {
+                for source in wire {
+                    let path = ProvenancePath::Side { source };
+                    if match_counts(solid, &path).0 > 0 {
+                        expansion.push_face(path);
+                    }
+                }
+            }
+        }
+        ProvenanceQuery::Caps => {
+            for path in [ProvenancePath::CapStart, ProvenancePath::CapEnd] {
+                if match_counts(solid, &path).0 > 0 {
+                    expansion.push_face(path);
+                }
+            }
+        }
+        ProvenanceQuery::RimEdges { cap, wires } => {
+            let cap = cap_path(*cap);
+            for wire in filtered_wire_sources(model, *wires) {
+                for source in wire {
+                    let path = ProvenancePath::shared_edge(
+                        cap.clone(),
+                        ProvenancePath::Side { source },
+                    );
+                    if match_counts(solid, &path).1 > 0 {
+                        expansion.push_edge(path);
+                    }
+                }
+            }
+        }
+        ProvenanceQuery::VerticalEdges { wires } => {
+            // Side∩side edges between DISTINCT profile edges of the same
+            // wire (adjacent sides share the swept junction edge).
+            for wire in filtered_wire_sources(model, *wires) {
+                for (i, a) in wire.iter().enumerate() {
+                    for b in wire.iter().skip(i + 1) {
+                        let path = ProvenancePath::shared_edge(
+                            ProvenancePath::Side { source: *a },
+                            ProvenancePath::Side { source: *b },
+                        );
+                        if match_counts(solid, &path).1 > 0 {
+                            expansion.push_edge(path);
+                        }
+                    }
+                }
+            }
+        }
+        ProvenanceQuery::Union(members) => {
+            for member in members {
+                expand_into(solid, model, member, expansion);
+            }
+        }
     }
 }
 

@@ -16,7 +16,7 @@ use crate::kernel::{self, KernelSolid, RawMesh};
 use super::evaluate::{EntityEval, evaluate_waves};
 use super::types::{
     EvalDiag, EvalErrorKind, EvalState, Evaluated, InstanceUpdate, Mesh, MeshUpdate,
-    SubRefResolution, Submesh, Updates,
+    QueryResolution, SubRefResolution, Submesh, Updates,
 };
 
 #[cfg(feature = "parallel")]
@@ -147,6 +147,47 @@ impl Engine {
                 subref.path, subref.owner.0
             ),
         ))
+    }
+
+    /// Expand a provenance query against its owner's **current**
+    /// evaluated solid and report the matched face/edge counts
+    /// (docs/ARCHITECTURE.md §3.5). An empty expansion is a valid
+    /// `Ok(QueryResolution { faces: 0, edges: 0 })` — membership is
+    /// live, so re-resolving after upstream edits reflects topology
+    /// that appeared or vanished. Errors only for structural mismatch:
+    /// no evaluated geometry, a non-solid owner, or an owner without a
+    /// sweep provenance model.
+    pub fn resolve_query(
+        &self,
+        set: &crate::subref::SubRefSet,
+    ) -> Result<QueryResolution, EvalDiag> {
+        let value = self
+            .results
+            .get(&set.owner)
+            .and_then(|e| e.value.as_ref())
+            .ok_or_else(|| {
+                EvalDiag::new(
+                    EvalErrorKind::UnresolvedSubRef,
+                    format!("owner entity {} has no evaluated geometry", set.owner.0),
+                )
+            })?;
+        let Evaluated::Solid { solid, .. } = value else {
+            return Err(EvalDiag::new(
+                EvalErrorKind::UnresolvedSubRef,
+                format!("owner entity {} did not evaluate to a solid", set.owner.0),
+            ));
+        };
+        let expansion = kernel::expand_query(solid, &set.query).map_err(|err| {
+            EvalDiag::new(EvalErrorKind::UnresolvedSubRef, err.to_string())
+        })?;
+        let mut resolution = QueryResolution::default();
+        for path in &expansion.face_paths {
+            resolution.faces += kernel::match_counts(solid, path).0;
+        }
+        for path in &expansion.edge_paths {
+            resolution.edges += kernel::match_counts(solid, path).1;
+        }
+        Ok(resolution)
     }
 
     // -- evaluation ---------------------------------------------------------
@@ -462,7 +503,7 @@ fn collect_assignments(doc: &Document) -> BTreeMap<EntityId, Assignments> {
                     *id,
                     face_materials
                         .iter()
-                        .map(|(path, material)| (path.canonical(), *material))
+                        .map(|(target, material)| (target.canonical(), *material))
                         .collect(),
                 );
             }
@@ -494,7 +535,7 @@ fn collect_assignments(doc: &Document) -> BTreeMap<EntityId, Assignments> {
     resolved
 }
 
-type Assignments = Vec<(crate::subref::ProvenancePath, EntityId)>;
+type Assignments = Vec<(crate::subref::FaceTarget, EntityId)>;
 
 /// Build the mesh for one owner from its evaluated value.
 ///
@@ -558,8 +599,9 @@ fn range_diag(what: &str) -> EvalDiag {
 }
 
 /// Tessellate one solid per BREP face, group the faces by material
-/// (provenance-path assignments, falling back to the solid's inherited
-/// material), and append one submesh per non-empty group.
+/// (provenance-target assignments — concrete paths and live query sets,
+/// falling back to the solid's inherited material), and append one
+/// submesh per non-empty group.
 fn append_solid(
     mesh: &mut Mesh,
     solid: &KernelSolid,
@@ -571,6 +613,30 @@ fn append_solid(
         kernel::tessellate_faces(solid, chordal_tolerance).map_err(tessellation_diag)?;
     let paths = solid.face_paths();
 
+    // Pre-expand assignment targets against THIS solid's current
+    // topology: One(path) matches exactly; Set(query) matches whatever
+    // its live expansion covers right now (empty on a no-model solid or
+    // a non-matching filter — the liveness contract, §3.5). Assignments
+    // are sorted One-before-Set, so explicit paints take precedence.
+    let matchers: Vec<(Vec<crate::subref::ProvenancePath>, EntityId)> = assignments
+        .map(|assigns| {
+            assigns
+                .iter()
+                .map(|(target, material)| {
+                    let matched = match target {
+                        crate::subref::FaceTarget::One(path) => vec![path.canonical()],
+                        crate::subref::FaceTarget::Set(query) => {
+                            kernel::expand_query(solid, query)
+                                .map(|e| e.face_paths)
+                                .unwrap_or_default()
+                        }
+                    };
+                    (matched, *material)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     // Group face indices by their material, deterministically
     // (None-material group first, then ascending material id).
     let mut groups: BTreeMap<Option<EntityId>, Vec<usize>> = BTreeMap::new();
@@ -580,9 +646,9 @@ fn append_solid(
             .and_then(|p| p.as_ref())
             .and_then(|path| {
                 let canonical = path.canonical();
-                assignments?
+                matchers
                     .iter()
-                    .find(|(assigned, _)| *assigned == canonical)
+                    .find(|(matched, _)| matched.contains(&canonical))
                     .map(|(_, material)| *material)
             })
             .or(default_material);

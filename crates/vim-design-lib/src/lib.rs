@@ -29,13 +29,16 @@ pub use document::{CommandGroup, Document, DocumentSettings};
 pub use entity::{EntityKind, EntityRecord, Params, SlotDecl, SlotValue, slots};
 pub use eval::{
     EvalDiag, EvalErrorKind, EvalState, Evaluated, InstanceUpdate, Mesh, MeshUpdate,
-    SubRefResolution, Submesh, Updates,
+    QueryResolution, SubRefResolution, Submesh, Updates,
 };
 pub use graph::GraphState;
 pub use id::{EntityId, IdAllocator};
 pub use selection::{PredicateAst, SelectionScope};
 pub use status::VimStatus;
-pub use subref::{ProvenancePath, Ref, SubRef};
+pub use subref::{
+    CapId, EdgeTarget, FaceTarget, ProvenancePath, ProvenanceQuery, Ref, SubRef,
+    SubRefSet, WireFilter,
+};
 
 /// The library's semantic version (from Cargo.toml).
 pub fn version() -> &'static str {

@@ -130,7 +130,8 @@ the wrong face. The rule here, mandatory from the first evaluator onward:
   the provenance of the input faces that produced each output face.
 - Operations **propagate** provenance through their outputs (a chamfer's blend face is
   named by the edge it blends; a cut face by the cutting plane).
-- Commands and slots reference subelements **only via `SubRef`, never by index**.
+- Commands and slots reference subelements **only via `SubRef`** (or its set-valued
+  sibling `SubRefSet`, a provenance *query* — §3.5), **never by index**.
 
 Deterministic evaluation (tenet 5) plus stable input ids make these names stable across
 parameter edits: "the face swept from profile edge E7" survives adding a fifth control
@@ -138,41 +139,54 @@ point, because `E7` is still `E7`. A `SubRef` whose path no longer resolves afte
 upstream change (e.g. the source edge was deleted) is a *per-entity evaluation error* on
 the referencing entity (§6.4), never a crash or a silent re-bind.
 
-### 3.5 Selections — declarative targeting of entities and subelements
+### 3.5 Set-valued targeting — two tiers
 
-A `Selection` is an entity kind whose evaluation produces an ordered reference set:
+Targeting *classes* of topology ("all rim edges of the top cap", "the hole walls")
+is split into two tiers with very different cost/complexity profiles.
+
+**Tier 1 — Provenance queries (implemented 2026-08-22).** A `ProvenanceQuery` is a
+closed serde AST over one sweep's *generated* topology, in provenance space (§3.4):
 
 ```rust
-enum Ref { Entity(EntityId), Sub(SubRef) }
-// Evaluated::RefSet(Vec<Ref>)  — sorted by (id, path) for determinism
+enum WireFilter { All, OuterOnly, HolesOnly }
+enum ProvenanceQuery {
+    RimEdges { cap: Start|End, wires: WireFilter },  // cap∩side edges
+    SideFaces { wires: WireFilter },
+    Caps,
+    VerticalEdges { wires: WireFilter },             // side∩side edges
+    Union(Vec<ProvenanceQuery>),                     // deduplicating
+}
+struct SubRefSet { owner: EntityId, query: ProvenanceQuery }
 ```
 
-Selections let commands target entities *by criteria* and wire the result into other
-entities' inputs — e.g. "all edges whose start and end points lie on plane z = 3 m" fed
-into a chamfer's edges slot. Consuming slots that accept multiple refs (chamfer edges,
-face-material assignments) accept either an explicit ref list or a `Selection` input.
+Consumers take sets alongside singles: chamfer edges are `Vec<EdgeTarget>`
+(`One(SubRef) | Set(SubRefSet)`), face-material assignments `Vec<(FaceTarget, id)>`
+(`One(ProvenancePath) | Set(ProvenanceQuery)`; `One` sorts first = explicit paints
+take precedence). The sweep model records each side face's source *wire role*
+(outer vs which hole), which is what the filters discriminate on.
 
-- **Predicate = closed, serializable AST** — kind filters, geometric tests (endpoint
-  position, length, direction, bounding volume, on-plane-within-tolerance), provenance
-  tests (owner entity, path role), combinators (`and`/`or`/`not`), and set operations
-  between selections. No user-provided code: every predicate is total, panic-free,
-  serde-serializable, and expressible over the C ABI.
-- **Scope is an explicit input**: a set of entities, an `Element` subtree, or —
-  explicitly opted into — document-global filtered by kind. Scoped selections are
-  preferred; a global selection is the one sanctioned form of implicit dependency and
-  carries its cost visibly (see dirtiness below).
-- **Live by default**: a selection is a graph node, so its membership re-evaluates when
-  the model changes — create a new edge on the z = 3 m plane and the chamfer grows to
-  include it. The substrate maintains per-kind indexes so `Insert`/`Remove`/`SetParams`
-  deltas dirty exactly the selections whose scope could contain the touched entity;
-  global selections re-evaluate on any change to a matching kind (the documented price).
-- **Frozen when desired**: a command may *bake* a selection — resolve it once and store
-  the explicit `Vec<Ref>` in the consumer's params (snapshot semantics, no tracking).
-  Both workflows are first-class; live is the default.
-- **Cycle safety**: scope wiring participates in the normal structural cycle check;
-  additionally, candidates downstream of the selection node itself are excluded at
-  evaluation time (deterministically, with a per-entity warning), so dynamic membership
-  can never create an evaluation cycle.
+- **Live by construction, zero dirtying machinery.** A query re-expands against the
+  owner's current solid on every owner re-evaluation; the only dependence is the
+  ordinary owner edge already in the graph. Add a hole to a painted
+  `SideFaces{HolesOnly}` plate and the new walls come out painted; remove it and it
+  reverts — no index tracking, no per-kind indexes, no implicit dependencies.
+- **Empty expansion is valid, not an error.** `RimEdges{HolesOnly}` on a hole-less
+  face expands to nothing; a chamfer over it is a pass-through no-op that starts
+  blending the moment matching topology appears. Only structural mismatch (owner is
+  not a sweep) is a typed error.
+- Queries are scoped to one owner by definition — cycle-safe and cheap by nature.
+
+**Tier 2 — `Selection` predicates (parked, §15.12, priority reduced).** The general
+entity/geometric search — kind filters, geometric tests, cross-entity scopes,
+combinators, frozen baking, per-kind dirtying indexes, downstream-candidate
+exclusion — remains designed but unimplemented. Rationale for the demotion: tier 1
+covers the dominant driving scenarios (chamfer/paint classes of generated topology)
+with none of tier 2's costs — no new graph semantics, no implicit-global dirtiness,
+no predicate interpreter. Tier 2 is justified when a scenario genuinely needs
+*geometric* search ("all edges on plane z = 3 m across these 40 elements"), which no
+current milestone does. The `Selection` entity kind, predicate AST, and
+`Ref { Entity | Sub }` types stay in the substrate (structurally validated,
+serialized, `NotYetImplemented` at evaluation) so adopting tier 2 later is additive.
 
 ## 4. Command system
 
@@ -515,11 +529,14 @@ Ordered roughly by risk:
     added to PROJECT_REQUIREMENTS.md.
 11. **Topological naming / subelement references** — **RESOLVED (2026-08-22):** approved
     and promoted to a mandatory evaluator rule; see §3.4.
-12. **Selection details** — the concept is approved (§3.5); still to pin down during
-    implementation: the exact predicate AST surface (and its C-ABI representation),
-    the cost of global-scope selections at 100k+ entities (per-kind index granularity,
-    debouncing during drags), and validation of the downstream-candidate exclusion rule
-    against real modeling scenarios.
+12. **Selection details (tier 2)** — **priority reduced 2026-08-22**: tier-1
+    provenance queries (§3.5, implemented) cover the driving set-targeting scenarios
+    with no new graph semantics, so tier 2 waits for a scenario that needs genuine
+    *geometric* search. When picked up, still to pin down: the exact predicate AST
+    surface (and its C-ABI representation), the cost of global-scope selections at
+    100k+ entities (per-kind index granularity, debouncing during drags), and
+    validation of the downstream-candidate exclusion rule against real modeling
+    scenarios.
 13. **Command-candidate parking lot** — the command set is *demand-driven by building
     modeling scenarios, never supply-driven by kernel capability*, and command names use
     industry CAD/AEC vocabulary, never kernel-specific terminology (the kernel's own
