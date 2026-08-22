@@ -1,17 +1,25 @@
-//! VimDesignWeb — WASM threading probe + minimal canvas placeholder.
+//! VimDesignWeb — the interactive rendered demo (wgpu) plus the WASM
+//! threading probe.
 //!
-//! The point of this skeleton is to de-risk Rust multithreading in the
-//! browser (docs/ARCHITECTURE.md §6.2 and Open Question 5). Rendering is a
-//! deliberate placeholder: a 2D canvas fill driven from Rust. The wgpu
-//! renderer comes later.
+//! - `demo` (wasm only): the [`demo::DemoApp`] behind `www/index.html` —
+//!   wgpu renderer (WebGPU, WebGL2 fallback), the four-object acceptance
+//!   scene authored through the real command API, sliders, undo/redo.
+//! - The threading probe (`www/probe.html`) de-risks Rust multithreading
+//!   in the browser (docs/ARCHITECTURE.md §6.2 and Open Question 5).
 //!
 //! Two build configurations (see crate README.md and devops/vbuild.ps1):
 //! - `--features threads`: nightly + atomics + wasm-bindgen-rayon. JS must
 //!   call `initThreadPool(n)` after `init()`.
 //! - default: single-threaded fallback; `sum_parallel` degrades to the
 //!   sequential path.
+//!
+//! Geometry evaluation is sequential on wasm in both configurations in
+//! this milestone (the lib's `parallel` feature is not enabled here).
 
 use wasm_bindgen::prelude::*;
+
+#[cfg(target_arch = "wasm32")]
+pub mod demo;
 
 // Re-export so wasm-bindgen emits `initThreadPool` in the JS glue
 // (threaded builds only).

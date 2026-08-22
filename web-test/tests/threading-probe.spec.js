@@ -16,7 +16,7 @@ test("threading probe page loads and reports a verdict", async ({ page }) => {
   const consoleErrors = [];
   page.on("pageerror", (e) => consoleErrors.push(String(e)));
 
-  await page.goto("/index.html");
+  await page.goto("/probe.html");
   await expect(page).toHaveTitle(/VIM Design/);
 
   // The probe runs a multi-second wasm workload; wait for the verdict.

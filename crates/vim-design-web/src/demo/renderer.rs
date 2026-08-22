@@ -1,0 +1,672 @@
+//! wgpu renderer for the demo scene (wasm only).
+//!
+//! Right-handed, Z-up (docs/ARCHITECTURE.md §7). Prefers the browser's
+//! WebGPU backend and falls back to WebGL2 (wgpu `webgl` feature) when no
+//! WebGPU adapter is available — the chosen path is reported by
+//! [`Renderer::backend_name`].
+//!
+//! Bookkeeping follows the poll facade contract: two upsert maps,
+//! `mesh owner id -> GPU mesh` and `instance id -> (element id,
+//! transform)`. An owner with no instances is drawn once at identity;
+//! otherwise once per instance.
+//!
+//! Wireframe: wgpu's `PolygonMode::Line` needs `NON_FILL_POLYGON_MODE`,
+//! which browsers do not expose — instead each mesh carries a second,
+//! deduplicated line-list index buffer over the same vertex buffer, drawn
+//! by a dedicated pipeline whose vertex shader nudges clip-space depth
+//! toward the camera so the lines never z-fight the fill.
+
+use std::collections::{HashMap, HashSet};
+
+use glam::Mat4;
+use vim_design_lib::eval::Mesh;
+use vim_design_lib::EntityId;
+use wgpu::util::DeviceExt;
+
+/// Neutral default color for submeshes without a material.
+pub const DEFAULT_COLOR: [f32; 3] = [0.78, 0.78, 0.75];
+
+const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth24Plus;
+/// Dynamic-offset stride for per-draw model matrices (WebGL2 requires
+/// 256-byte alignment).
+const MODEL_STRIDE: u64 = 256;
+
+const SHADER: &str = r#"
+struct Globals {
+    view_proj: mat4x4<f32>,
+    light_dir: vec4<f32>,
+    wire_color: vec4<f32>,
+};
+@group(0) @binding(0) var<uniform> globals: Globals;
+
+struct Model { m: mat4x4<f32> };
+@group(1) @binding(0) var<uniform> model: Model;
+
+struct VsOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) normal: vec3<f32>,
+    @location(1) color: vec3<f32>,
+};
+
+fn transform(p: vec3<f32>, n: vec3<f32>, c: vec3<f32>) -> VsOut {
+    var out: VsOut;
+    let world = model.m * vec4<f32>(p, 1.0);
+    out.pos = globals.view_proj * world;
+    out.normal = (model.m * vec4<f32>(n, 0.0)).xyz;
+    out.color = c;
+    return out;
+}
+
+@vertex
+fn vs_main(
+    @location(0) p: vec3<f32>,
+    @location(1) n: vec3<f32>,
+    @location(2) c: vec3<f32>,
+) -> VsOut {
+    return transform(p, n, c);
+}
+
+@vertex
+fn vs_wire(
+    @location(0) p: vec3<f32>,
+    @location(1) n: vec3<f32>,
+    @location(2) c: vec3<f32>,
+) -> VsOut {
+    var out: VsOut = transform(p, n, c);
+    // Pull the wireframe slightly toward the camera so it wins the depth
+    // test against the triangles it outlines.
+    out.pos.z = out.pos.z - 8e-4 * out.pos.w;
+    return out;
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    let n = normalize(in.normal);
+    let l = normalize(globals.light_dir.xyz);
+    let key = max(dot(n, l), 0.0);
+    let fill_dir = normalize(vec3<f32>(-l.x, -l.y, 0.35));
+    let fill = 0.25 * max(dot(n, fill_dir), 0.0);
+    let shade = 0.24 + 0.72 * key + fill;
+    return vec4<f32>(in.color * min(shade, 1.15), 1.0);
+}
+
+@fragment
+fn fs_wire(in: VsOut) -> @location(0) vec4<f32> {
+    return globals.wire_color;
+}
+"#;
+
+struct GpuMesh {
+    vertices: wgpu::Buffer,
+    indices: wgpu::Buffer,
+    index_count: u32,
+    wire_indices: wgpu::Buffer,
+    wire_index_count: u32,
+    triangle_count: u32,
+}
+
+pub struct Renderer {
+    surface: wgpu::Surface<'static>,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    config: wgpu::SurfaceConfiguration,
+    depth_view: wgpu::TextureView,
+    fill_pipeline: wgpu::RenderPipeline,
+    wire_pipeline: wgpu::RenderPipeline,
+    globals_buf: wgpu::Buffer,
+    globals_bind: wgpu::BindGroup,
+    model_layout: wgpu::BindGroupLayout,
+    model_buf: wgpu::Buffer,
+    model_bind: wgpu::BindGroup,
+    model_capacity: u32,
+    meshes: HashMap<EntityId, GpuMesh>,
+    instances: HashMap<EntityId, (EntityId, Mat4)>,
+    backend: &'static str,
+    pub wireframe: bool,
+}
+
+fn f32s_to_bytes(data: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len() * 4);
+    for v in data {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    out
+}
+
+fn u32s_to_bytes(data: &[u32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len() * 4);
+    for v in data {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    out
+}
+
+/// Convert the document's rigid row-major 4x3 transform to a Mat4.
+pub fn mat4_from_row_major_4x3(t: &[f64; 12]) -> Mat4 {
+    Mat4::from_cols_array(&[
+        t[0] as f32,
+        t[4] as f32,
+        t[8] as f32,
+        0.0,
+        t[1] as f32,
+        t[5] as f32,
+        t[9] as f32,
+        0.0,
+        t[2] as f32,
+        t[6] as f32,
+        t[10] as f32,
+        0.0,
+        t[3] as f32,
+        t[7] as f32,
+        t[11] as f32,
+        1.0,
+    ])
+}
+
+impl Renderer {
+    pub async fn new(canvas: web_sys::HtmlCanvasElement) -> Result<Renderer, String> {
+        // Prefer WebGPU. Adapter probing happens *before* the canvas is
+        // touched: a canvas can hold only one context type, so we must
+        // not create a webgpu surface unless a WebGPU adapter exists. The
+        // WebGL2 fallback is the opposite — wgpu's GL-on-web backend only
+        // discovers an adapter *through* a surface (the WebGL2 context is
+        // created at surface creation), so there the surface comes first.
+        let width = canvas.width().max(1);
+        let height = canvas.height().max(1);
+        let webgpu = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::BROWSER_WEBGPU,
+            ..Default::default()
+        });
+        let probe = webgpu
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                force_fallback_adapter: false,
+                compatible_surface: None,
+            })
+            .await;
+        let (backend, surface, adapter) = match probe {
+            Ok(adapter) => {
+                let surface = webgpu
+                    .create_surface(wgpu::SurfaceTarget::Canvas(canvas))
+                    .map_err(|e| format!("webgpu create_surface failed: {e}"))?;
+                ("WebGPU", surface, adapter)
+            }
+            Err(_) => {
+                let gl = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+                    backends: wgpu::Backends::GL,
+                    ..Default::default()
+                });
+                let surface = gl
+                    .create_surface(wgpu::SurfaceTarget::Canvas(canvas))
+                    .map_err(|e| format!("webgl2 create_surface failed: {e}"))?;
+                let adapter = gl
+                    .request_adapter(&wgpu::RequestAdapterOptions {
+                        power_preference: wgpu::PowerPreference::HighPerformance,
+                        force_fallback_adapter: false,
+                        compatible_surface: Some(&surface),
+                    })
+                    .await
+                    .map_err(|e| format!("no WebGPU and no WebGL2 adapter: {e}"))?;
+                ("WebGL2", surface, adapter)
+            }
+        };
+
+        let limits = wgpu::Limits::downlevel_webgl2_defaults().using_resolution(adapter.limits());
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("vim-design demo device"),
+                required_features: wgpu::Features::empty(),
+                required_limits: limits,
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| format!("request_device failed: {e}"))?;
+
+        let caps = surface.get_capabilities(&adapter);
+        let format = caps
+            .formats
+            .iter()
+            .copied()
+            .find(|f| f.is_srgb())
+            .unwrap_or(caps.formats[0]);
+        let config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format,
+            width,
+            height,
+            present_mode: wgpu::PresentMode::Fifo,
+            alpha_mode: caps.alpha_modes[0],
+            view_formats: vec![],
+            desired_maximum_frame_latency: 2,
+        };
+        surface.configure(&device, &config);
+        let depth_view = create_depth(&device, width, height);
+
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("demo shader"),
+            source: wgpu::ShaderSource::Wgsl(SHADER.into()),
+        });
+
+        let globals_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("globals layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: wgpu::BufferSize::new(96),
+                },
+                count: None,
+            }],
+        });
+        let model_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("model layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: true,
+                    min_binding_size: wgpu::BufferSize::new(64),
+                },
+                count: None,
+            }],
+        });
+
+        let globals_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("globals"),
+            size: 96,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let globals_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("globals bind"),
+            layout: &globals_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: globals_buf.as_entire_binding(),
+            }],
+        });
+
+        let model_capacity = 16u32;
+        let (model_buf, model_bind) =
+            create_model_buffer(&device, &model_layout, model_capacity);
+
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("demo pipeline layout"),
+            bind_group_layouts: &[&globals_layout, &model_layout],
+            push_constant_ranges: &[],
+        });
+
+        let vertex_layout = wgpu::VertexBufferLayout {
+            array_stride: 9 * 4,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x3],
+        };
+
+        let make_pipeline = |label: &str,
+                             vs: &str,
+                             fs: &str,
+                             topology: wgpu::PrimitiveTopology,
+                             depth_write: bool,
+                             blend: Option<wgpu::BlendState>| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some(vs),
+                    compilation_options: Default::default(),
+                    buffers: std::slice::from_ref(&vertex_layout),
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    unclipped_depth: false,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    conservative: false,
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: depth_write,
+                    depth_compare: wgpu::CompareFunction::Less,
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some(fs),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview: None,
+                cache: None,
+            })
+        };
+
+        let fill_pipeline = make_pipeline(
+            "fill",
+            "vs_main",
+            "fs_main",
+            wgpu::PrimitiveTopology::TriangleList,
+            true,
+            None,
+        );
+        // The wireframe is alpha-blended: on densely tessellated curved
+        // surfaces (cylinder barrel, cone) opaque lines would cover
+        // nearly every pixel and blacken the shading.
+        let wire_pipeline = make_pipeline(
+            "wire",
+            "vs_wire",
+            "fs_wire",
+            wgpu::PrimitiveTopology::LineList,
+            false,
+            Some(wgpu::BlendState::ALPHA_BLENDING),
+        );
+
+        Ok(Renderer {
+            surface,
+            device,
+            queue,
+            config,
+            depth_view,
+            fill_pipeline,
+            wire_pipeline,
+            globals_buf,
+            globals_bind,
+            model_layout,
+            model_buf,
+            model_bind,
+            model_capacity,
+            meshes: HashMap::new(),
+            instances: HashMap::new(),
+            backend,
+            wireframe: true,
+        })
+    }
+
+    pub fn backend_name(&self) -> &'static str {
+        self.backend
+    }
+
+    pub fn resize(&mut self, width: u32, height: u32) {
+        let (width, height) = (width.max(1), height.max(1));
+        if width == self.config.width && height == self.config.height {
+            return;
+        }
+        self.config.width = width;
+        self.config.height = height;
+        self.surface.configure(&self.device, &self.config);
+        self.depth_view = create_depth(&self.device, width, height);
+    }
+
+    pub fn aspect(&self) -> f32 {
+        self.config.width as f32 / self.config.height as f32
+    }
+
+    pub fn remove_mesh(&mut self, id: EntityId) {
+        self.meshes.remove(&id);
+    }
+
+    pub fn remove_instance(&mut self, id: EntityId) {
+        self.instances.remove(&id);
+    }
+
+    pub fn upsert_instance(&mut self, id: EntityId, element: EntityId, transform: &[f64; 12]) {
+        self.instances
+            .insert(id, (element, mat4_from_row_major_4x3(transform)));
+    }
+
+    /// Upload one mesh. `submesh_colors` is parallel to `mesh.submeshes`
+    /// (material colors already resolved by the caller).
+    pub fn upsert_mesh(&mut self, id: EntityId, mesh: &Mesh, submesh_colors: &[[f32; 3]]) {
+        // Expand to an interleaved (pos, normal, color) vertex stream.
+        // Vertices are remapped per submesh so each vertex carries its
+        // submesh's color (a vertex referenced by two submeshes is
+        // duplicated).
+        let mut verts: Vec<f32> = Vec::with_capacity(mesh.positions.len() * 9);
+        let mut indices: Vec<u32> = Vec::with_capacity(mesh.indices.len());
+        for (si, sub) in mesh.submeshes.iter().enumerate() {
+            let color = submesh_colors.get(si).copied().unwrap_or(DEFAULT_COLOR);
+            let mut remap: HashMap<u32, u32> = HashMap::new();
+            let start = sub.index_start as usize;
+            let end = start + sub.index_count as usize;
+            for &old in &mesh.indices[start..end] {
+                let next = (verts.len() / 9) as u32;
+                let new = *remap.entry(old).or_insert_with(|| {
+                    let p = mesh.positions[old as usize];
+                    let n = mesh.normals[old as usize];
+                    verts.extend_from_slice(&[
+                        p[0], p[1], p[2], n[0], n[1], n[2], color[0], color[1], color[2],
+                    ]);
+                    next
+                });
+                indices.push(new);
+            }
+        }
+
+        // Deduplicated edge list for the wireframe overlay.
+        let mut edges: HashSet<(u32, u32)> = HashSet::new();
+        for tri in indices.chunks_exact(3) {
+            for (a, b) in [(tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])] {
+                edges.insert((a.min(b), a.max(b)));
+            }
+        }
+        let mut wire: Vec<u32> = Vec::with_capacity(edges.len() * 2);
+        for (a, b) in edges {
+            wire.push(a);
+            wire.push(b);
+        }
+
+        let vertices = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("mesh vertices"),
+                contents: &f32s_to_bytes(&verts),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+        let index_buf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("mesh indices"),
+                contents: &u32s_to_bytes(&indices),
+                usage: wgpu::BufferUsages::INDEX,
+            });
+        let wire_buf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("mesh wire indices"),
+                contents: &u32s_to_bytes(&wire),
+                usage: wgpu::BufferUsages::INDEX,
+            });
+        self.meshes.insert(
+            id,
+            GpuMesh {
+                vertices,
+                indices: index_buf,
+                index_count: indices.len() as u32,
+                wire_indices: wire_buf,
+                wire_index_count: wire.len() as u32,
+                triangle_count: (indices.len() / 3) as u32,
+            },
+        );
+    }
+
+    /// Draw list per the facade rule: one draw per instance of a mesh
+    /// owner; owners with no instances draw once at identity.
+    fn draw_list(&self) -> Vec<(EntityId, Mat4)> {
+        let mut draws: Vec<(EntityId, Mat4)> = Vec::new();
+        for id in self.meshes.keys() {
+            let mut any = false;
+            for (element, m) in self.instances.values() {
+                if element == id {
+                    draws.push((*id, *m));
+                    any = true;
+                }
+            }
+            if !any {
+                draws.push((*id, Mat4::IDENTITY));
+            }
+        }
+        draws
+    }
+
+    /// Total triangles that one frame draws (instanced meshes count once
+    /// per instance).
+    pub fn drawn_triangle_count(&self) -> u64 {
+        self.draw_list()
+            .iter()
+            .map(|(id, _)| u64::from(self.meshes[id].triangle_count))
+            .sum()
+    }
+
+    pub fn render(&mut self, view_proj: Mat4) -> Result<(), String> {
+        let draws = self.draw_list();
+
+        // Grow the per-draw model buffer if needed.
+        if draws.len() as u32 > self.model_capacity {
+            self.model_capacity = (draws.len() as u32).next_power_of_two();
+            let (buf, bind) =
+                create_model_buffer(&self.device, &self.model_layout, self.model_capacity);
+            self.model_buf = buf;
+            self.model_bind = bind;
+        }
+
+        // Globals: view-proj, key light direction (world space), wire color.
+        let mut globals = [0f32; 24];
+        globals[..16].copy_from_slice(&view_proj.to_cols_array());
+        globals[16..20].copy_from_slice(&[0.45, -0.55, 0.72, 0.0]);
+        globals[20..24].copy_from_slice(&[0.04, 0.05, 0.07, 0.42]);
+        self.queue
+            .write_buffer(&self.globals_buf, 0, &f32s_to_bytes(&globals));
+        for (i, (_, m)) in draws.iter().enumerate() {
+            self.queue.write_buffer(
+                &self.model_buf,
+                i as u64 * MODEL_STRIDE,
+                &f32s_to_bytes(&m.to_cols_array()),
+            );
+        }
+
+        let frame = match self.surface.get_current_texture() {
+            Ok(frame) => frame,
+            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+                self.surface.configure(&self.device, &self.config);
+                self.surface
+                    .get_current_texture()
+                    .map_err(|e| format!("surface unavailable after reconfigure: {e}"))?
+            }
+            Err(e) => return Err(format!("get_current_texture failed: {e}")),
+        };
+        let view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("scene"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.090,
+                            g: 0.106,
+                            b: 0.133,
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                ..Default::default()
+            });
+
+            pass.set_pipeline(&self.fill_pipeline);
+            pass.set_bind_group(0, &self.globals_bind, &[]);
+            for (i, (id, _)) in draws.iter().enumerate() {
+                let mesh = &self.meshes[id];
+                pass.set_bind_group(1, &self.model_bind, &[(i as u32) * MODEL_STRIDE as u32]);
+                pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+                pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+            }
+
+            if self.wireframe {
+                pass.set_pipeline(&self.wire_pipeline);
+                for (i, (id, _)) in draws.iter().enumerate() {
+                    let mesh = &self.meshes[id];
+                    pass.set_bind_group(1, &self.model_bind, &[(i as u32) * MODEL_STRIDE as u32]);
+                    pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+                    pass.set_index_buffer(mesh.wire_indices.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.draw_indexed(0..mesh.wire_index_count, 0, 0..1);
+                }
+            }
+        }
+        self.queue.submit([encoder.finish()]);
+        frame.present();
+        Ok(())
+    }
+}
+
+fn create_depth(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureView {
+    device
+        .create_texture(&wgpu::TextureDescriptor {
+            label: Some("depth"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: DEPTH_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        })
+        .create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+fn create_model_buffer(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    capacity: u32,
+) -> (wgpu::Buffer, wgpu::BindGroup) {
+    let buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("model matrices"),
+        size: u64::from(capacity) * MODEL_STRIDE,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("model bind"),
+        layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                buffer: &buf,
+                offset: 0,
+                size: wgpu::BufferSize::new(64),
+            }),
+        }],
+    });
+    (buf, bind)
+}

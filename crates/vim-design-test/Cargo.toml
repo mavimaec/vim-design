@@ -8,7 +8,9 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
-vim-design-lib = { workspace = true, features = ["json-debug"] }
+# `parallel`: the eval-layer tests exercise the same rayon wave path the
+# native library ships with (wasm builds stay sequential — lib features).
+vim-design-lib = { workspace = true, features = ["json-debug", "parallel"] }
 
 [dev-dependencies]
 # Property tests only (docs/ARCHITECTURE.md §12). Dev-dependency of this

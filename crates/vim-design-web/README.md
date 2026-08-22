@@ -1,9 +1,28 @@
 # vim-design-web
 
-WASM browser test app. Right now it is the **wasm threading probe**: a page
-that measures whether rayon-on-wasm achieves true parallelism in the browser.
-Rendering is a placeholder (Rust fills a 2D canvas); the wgpu renderer comes
-later.
+WASM browser test app. Two pages, served by
+`pwsh devops/vactions.ps1 -VimDesignWeb`:
+
+- **`www/index.html` — the interactive demo** (`src/demo/`): a wgpu
+  renderer (WebGPU with automatic WebGL2 fallback; right-handed Z-up,
+  orbit/zoom camera, lambert shading, per-submesh material colors, and an
+  alpha-blended tessellation-wireframe overlay toggled from the panel).
+  The scene — floor plate with a hole, cube, cylinder, cone — is authored
+  at startup through the real command API, each object wrapped in an
+  `Element` and placed with an `Instance`. Six sliders submit coalesced
+  `Update*` commands and drive the `eval::Engine` facade
+  (`evaluate_pending` → `poll_updates` → GPU upload); the status line
+  shows generations, commit→mesh latency, triangle count, and eval
+  errors. Undo/Redo buttons revert whole slider gestures.
+- **`www/probe.html` — the wasm threading probe**: measures whether
+  rayon-on-wasm achieves true parallelism in the browser.
+
+Note for headless CI (Playwright, `web-test/`): headless Chromium's
+WebGPU never reaches the compositor here (transparent canvas even though
+wgpu renders without errors), so tests run without WebGPU flags and
+exercise the WebGL2 fallback; real desktop browsers use WebGPU. Geometry
+evaluation is sequential on wasm in both build configurations in this
+milestone.
 
 ## Two build configurations
 

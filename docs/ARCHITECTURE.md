@@ -64,8 +64,8 @@ surface — when absent, the evaluator infers a plane by least-squares fit of th
 a wire non-planar beyond tolerance becomes a per-entity evaluation error, §6.4; curved
 faces are never authored — they are *generated* by operations and addressed via `SubRef`,
 §3.4), `Solid`, `Material`,
-`Extrusion`, `Chamfer`, `SectionBox` — plus two kinds implied by the instancing
-requirement:
+`Extrusion`, `Revolve` (profile face about an axis line), `Chamfer`, `SectionBox` — plus
+two kinds implied by the instancing requirement:
 
 - **`Element`** — a named group of entities (a construction subgraph) whose evaluation
   produces one or more solids. The reusable "definition."
@@ -294,6 +294,15 @@ The caller-facing output contract:
 - Meshes are delivered per **element**, instanced via per-instance transforms:
   `MeshUpdate { element_id, generation, vertices (pos+normal), indices, submeshes: [(material_id, index_range)] }`
   plus `InstanceUpdate { instance_id, element_id, transform_4x3 }` lists.
+- **Mesh ownership / standalone solids (implemented 2026-08-22, `eval::Engine`):**
+  a *mesh owner* is every `Element` (mesh = members' solids merged, one submesh per
+  member) **plus** every solid producer (`Extrusion`, `Revolve`, `Solid`) not wired
+  into any element's members slot — such producers surface as implicit standalone
+  meshes keyed by their own entity id. Wrapping a producer into an element
+  tombstones its standalone mesh and re-delivers the geometry under the element id.
+  Renderers draw one copy per instance; owners with no instances draw once at
+  identity. v1 materials are whole-solid (profile-face material for sweeps);
+  per-face materials arrive with `SubRef` resolution.
 - The caller polls: `vim_poll_updates(handle)` returns a **changed-set delta, coalesced,
   keyed by stable ids** — never a full-scene report. Each handle keeps a poll cursor; a
   poll returns only ids whose renderer-visible state changed since the previous poll, and
@@ -506,7 +515,8 @@ Ordered roughly by risk:
     modeling scenarios, never supply-driven by kernel capability*, and command names use
     industry CAD/AEC vocabulary, never kernel-specific terminology (the kernel's own
     names change: truck's `tsweep` became monstertruck's `extrude`). Candidates awaiting
-    a driving scenario: `CreateRevolve` (domes, columns — kernel: `revolve`),
-    `CreateLoft` (ramps, transitions — kernel: `try_skin_wires`). Kernel capabilities
+    a driving scenario: `CreateLoft` (ramps, transitions — kernel: `try_skin_wires`).
+    `CreateRevolve` was promoted 2026-08-22 (driving scenario: cone primitives in the
+    evaluation-layer demo; kernel: `revolve`). Kernel capabilities
     that are deliberately NOT commands: healing, shell stitching, `plane_cut` (evaluator
     internals); STEP I/O (document-level action); meshing tolerances (document settings).

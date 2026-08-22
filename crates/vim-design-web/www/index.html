@@ -2,27 +2,97 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>VIM Design — WASM Threading Probe</title>
+  <title>VIM Design — Demo Scene</title>
   <style>
-    body { font-family: system-ui, sans-serif; margin: 2rem; background: #0d1117; color: #e6edf3; }
-    h1 { font-size: 1.3rem; }
-    table { border-collapse: collapse; margin: 1rem 0; }
-    td, th { border: 1px solid #30363d; padding: 0.4rem 0.8rem; text-align: left; }
-    #verdict { font-size: 2rem; font-weight: bold; padding: 0.5rem 0; }
-    #verdict.pass { color: #3fb950; }
-    #verdict.fail { color: #f85149; }
-    canvas { border: 1px solid #30363d; display: block; margin-top: 1rem; }
-    #status { color: #8b949e; }
+    html, body { margin: 0; height: 100%; overflow: hidden; background: #0d1117; color: #e6edf3;
+                 font-family: system-ui, sans-serif; }
+    #view { position: absolute; inset: 0; width: 100%; height: 100%; display: block;
+            touch-action: none; }
+    #panel {
+      position: absolute; top: 12px; left: 12px; width: 280px;
+      background: rgba(13, 17, 23, 0.88); border: 1px solid #30363d; border-radius: 8px;
+      padding: 12px 16px 14px; backdrop-filter: blur(4px); user-select: none;
+    }
+    #panel h1 { font-size: 0.95rem; margin: 0 0 10px; color: #e6edf3; }
+    #panel h2 { font-size: 0.72rem; margin: 12px 0 4px; color: #8b949e;
+                text-transform: uppercase; letter-spacing: 0.06em; }
+    .slider-row { margin: 6px 0; }
+    .slider-row label { display: flex; justify-content: space-between; font-size: 0.8rem;
+                        color: #c9d1d9; margin-bottom: 2px; }
+    .slider-row .val { color: #79c0ff; font-variant-numeric: tabular-nums; }
+    .slider-row input[type=range] { width: 100%; margin: 0; accent-color: #3b82f6; }
+    .check-row { display: flex; align-items: center; gap: 8px; font-size: 0.8rem;
+                 color: #c9d1d9; margin: 4px 0; }
+    #history { display: flex; gap: 8px; margin-top: 10px; }
+    #history button {
+      flex: 1; background: #21262d; color: #c9d1d9; border: 1px solid #30363d;
+      border-radius: 6px; padding: 5px 0; font-size: 0.8rem; cursor: pointer;
+    }
+    #history button:enabled:hover { background: #30363d; }
+    #history button:disabled { opacity: 0.4; cursor: default; }
+    #statusbar {
+      position: absolute; left: 12px; bottom: 12px; right: 12px;
+      font-size: 0.75rem; color: #8b949e; background: rgba(13, 17, 23, 0.88);
+      border: 1px solid #30363d; border-radius: 6px; padding: 6px 10px;
+      font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    #statusbar .err { color: #f85149; }
+    a { color: #58a6ff; }
+    #probe-link { font-size: 0.7rem; margin-top: 10px; }
   </style>
 </head>
 <body>
-  <h1>VIM Design — WASM Threading Probe</h1>
-  <p id="status">loading…</p>
-  <div id="verdict"></div>
-  <table id="results-table">
-    <tbody id="results"></tbody>
-  </table>
-  <canvas id="view" width="640" height="240"></canvas>
-  <script type="module" src="./main.js"></script>
+  <canvas id="view" width="1280" height="800"></canvas>
+  <div id="panel">
+    <h1>VIM Design — parametric demo</h1>
+
+    <h2>Cube</h2>
+    <div class="slider-row">
+      <label>size <span class="val" id="cube-size-val">1.00 m</span></label>
+      <input type="range" id="cube-size" min="0.2" max="2.0" step="0.01" value="1.0" />
+    </div>
+
+    <h2>Floor plate</h2>
+    <div class="slider-row">
+      <label>height <span class="val" id="plate-thickness-val">0.30 m</span></label>
+      <input type="range" id="plate-thickness" min="0.05" max="1.0" step="0.01" value="0.3" />
+    </div>
+
+    <h2>Cylinder</h2>
+    <div class="slider-row">
+      <label>radius <span class="val" id="cyl-radius-val">0.40 m</span></label>
+      <input type="range" id="cyl-radius" min="0.05" max="0.9" step="0.01" value="0.4" />
+    </div>
+    <div class="slider-row">
+      <label>height <span class="val" id="cyl-height-val">1.20 m</span></label>
+      <input type="range" id="cyl-height" min="0.1" max="3.0" step="0.01" value="1.2" />
+    </div>
+
+    <h2>Cone</h2>
+    <div class="slider-row">
+      <label>radius <span class="val" id="cone-radius-val">0.50 m</span></label>
+      <input type="range" id="cone-radius" min="0.05" max="1.0" step="0.01" value="0.5" />
+    </div>
+    <div class="slider-row">
+      <label>height <span class="val" id="cone-height-val">1.40 m</span></label>
+      <input type="range" id="cone-height" min="0.1" max="3.0" step="0.01" value="1.4" />
+    </div>
+
+    <h2>Display options</h2>
+    <div class="check-row">
+      <input type="checkbox" id="wireframe" checked />
+      <label for="wireframe">wireframe</label>
+    </div>
+
+    <div id="history">
+      <button id="undo" disabled>Undo</button>
+      <button id="redo" disabled>Redo</button>
+    </div>
+
+    <div id="probe-link"><a href="./probe.html">wasm threading probe</a></div>
+  </div>
+  <div id="statusbar">loading wasm…</div>
+  <script type="module" src="./demo.js"></script>
 </body>
 </html>

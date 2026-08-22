@@ -28,6 +28,7 @@ pub enum EntityKind {
     Solid,
     Material,
     Extrusion,
+    Revolve,
     Chamfer,
     SectionBox,
     Element,
@@ -77,6 +78,10 @@ pub enum Params {
     },
     /// Sweep of the profile face input along the path input.
     Extrusion,
+    /// Revolution of the profile face input about the axis line input by
+    /// `angle_radians` (default 2π = closed solid of revolution; angles
+    /// are radians per docs/ARCHITECTURE.md §7).
+    Revolve { angle_radians: f64 },
     /// Chamfer of `distance` meters over its edges input (explicit edges
     /// and/or a `Selection`).
     Chamfer { distance: f64 },
@@ -112,6 +117,7 @@ impl Params {
             Params::Solid => EntityKind::Solid,
             Params::Material { .. } => EntityKind::Material,
             Params::Extrusion => EntityKind::Extrusion,
+            Params::Revolve { .. } => EntityKind::Revolve,
             Params::Chamfer { .. } => EntityKind::Chamfer,
             Params::SectionBox { .. } => EntityKind::SectionBox,
             Params::Element { .. } => EntityKind::Element,
@@ -189,6 +195,8 @@ pub mod slot {
     pub const SOLID_FACES: usize = 0;
     pub const EXTRUSION_PROFILE: usize = 0;
     pub const EXTRUSION_PATH: usize = 1;
+    pub const REVOLVE_PROFILE: usize = 0;
+    pub const REVOLVE_AXIS: usize = 1;
     pub const CHAMFER_EDGES: usize = 0;
     pub const ELEMENT_MEMBERS: usize = 0;
     pub const INSTANCE_ELEMENT: usize = 0;
@@ -299,6 +307,23 @@ const EXTRUSION_SLOTS: &[SlotDecl] = &[
     },
 ];
 
+const REVOLVE_SLOTS: &[SlotDecl] = &[
+    SlotDecl {
+        name: "profile",
+        accepted: &[EntityKind::Face],
+        required: true,
+        multi: false,
+    },
+    // The axis is a straight line by construction: origin = line start,
+    // direction = start -> end (docs/ARCHITECTURE.md §3.1).
+    SlotDecl {
+        name: "axis",
+        accepted: &[EntityKind::Line],
+        required: true,
+        multi: false,
+    },
+];
+
 // Chamfer edges accept explicit `Edge` entities OR a `Selection` whose
 // evaluation yields the edge set (docs/ARCHITECTURE.md §3.5).
 const CHAMFER_SLOTS: &[SlotDecl] = &[SlotDecl {
@@ -310,7 +335,12 @@ const CHAMFER_SLOTS: &[SlotDecl] = &[SlotDecl {
 
 const ELEMENT_SLOTS: &[SlotDecl] = &[SlotDecl {
     name: "members",
-    accepted: &[EntityKind::Solid, EntityKind::Extrusion, EntityKind::Chamfer],
+    accepted: &[
+        EntityKind::Solid,
+        EntityKind::Extrusion,
+        EntityKind::Revolve,
+        EntityKind::Chamfer,
+    ],
     required: true,
     multi: true,
 }];
@@ -339,6 +369,7 @@ pub fn slots(kind: EntityKind) -> &'static [SlotDecl] {
         EntityKind::Face => FACE_SLOTS,
         EntityKind::Solid => SOLID_SLOTS,
         EntityKind::Extrusion => EXTRUSION_SLOTS,
+        EntityKind::Revolve => REVOLVE_SLOTS,
         EntityKind::Chamfer => CHAMFER_SLOTS,
         EntityKind::Element => ELEMENT_SLOTS,
         EntityKind::Instance => INSTANCE_SLOTS,
@@ -424,6 +455,7 @@ mod tests {
         EntityKind::Solid,
         EntityKind::Material,
         EntityKind::Extrusion,
+        EntityKind::Revolve,
         EntityKind::Chamfer,
         EntityKind::SectionBox,
         EntityKind::Element,
@@ -465,6 +497,29 @@ mod tests {
         assert!(path.is_some_and(|d| {
             d.accepts(EntityKind::Line) && d.accepts(EntityKind::Spline) && !d.multi
         }));
+    }
+
+    #[test]
+    fn revolve_slots_match_architecture() {
+        let decls = slots(EntityKind::Revolve);
+        let profile = decls.get(slot::REVOLVE_PROFILE);
+        let axis = decls.get(slot::REVOLVE_AXIS);
+        assert!(profile.is_some_and(|d| {
+            d.accepts(EntityKind::Face) && d.required && !d.multi
+        }));
+        assert!(axis.is_some_and(|d| {
+            d.accepts(EntityKind::Line)
+                && !d.accepts(EntityKind::Spline)
+                && d.required
+                && !d.multi
+        }));
+        assert_eq!(
+            Params::Revolve {
+                angle_radians: std::f64::consts::TAU
+            }
+            .kind(),
+            EntityKind::Revolve
+        );
     }
 
     #[test]

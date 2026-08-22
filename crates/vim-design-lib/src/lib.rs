@@ -4,15 +4,17 @@
 //! system from docs/ARCHITECTURE.md: entities with typed slots (§3),
 //! the four-primitive delta kernel with mechanical inversion (§4.1),
 //! undo/redo with coalescing (§4.2), structural-only validation, dirty
-//! tracking for the (future) evaluation layer (§6.1), and deterministic
-//! serialization (§10). Geometry evaluation and the `monstertruck`
-//! kernel integration are the next milestone; the [`kernel`] module is
-//! still the compile/link probe.
+//! tracking (§6.1), and deterministic serialization (§10). The [`eval`]
+//! module is the geometry evaluation layer (§§3.3, 6): it turns the
+//! parametric graph into BREP solids and tessellated meshes via the
+//! `monstertruck` kernel behind the [`kernel`] seam (§5), exposed
+//! through the [`eval::Engine`] poll facade (§6.3).
 
 pub mod command;
 pub mod delta;
 pub mod document;
 pub mod entity;
+pub mod eval;
 pub mod graph;
 pub mod id;
 pub mod kernel;
@@ -25,6 +27,10 @@ pub use command::{Command, CommandOutput};
 pub use delta::{Delta, SlotIdx, apply_delta};
 pub use document::{CommandGroup, Document, DocumentSettings};
 pub use entity::{EntityKind, EntityRecord, Params, SlotDecl, SlotValue, slots};
+pub use eval::{
+    EvalDiag, EvalErrorKind, EvalState, Evaluated, InstanceUpdate, Mesh, MeshUpdate,
+    Submesh, Updates,
+};
 pub use graph::GraphState;
 pub use id::{EntityId, IdAllocator};
 pub use selection::{PredicateAst, SelectionScope};

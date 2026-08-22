@@ -197,6 +197,24 @@ pub enum Command {
     DeleteExtrusion {
         id: EntityId,
     },
+    // -- Revolve ---------------------------------------------------------
+    /// Revolve a profile face about an axis line. `angle_radians` defaults
+    /// to 2π (a closed solid of revolution) when `None`.
+    CreateRevolve {
+        profile: EntityId,
+        axis: EntityId,
+        angle_radians: Option<f64>,
+    },
+    UpdateRevolve {
+        id: EntityId,
+        profile: Option<EntityId>,
+        axis: Option<EntityId>,
+        angle_radians: Option<f64>,
+        coalesce: bool,
+    },
+    DeleteRevolve {
+        id: EntityId,
+    },
     // -- Chamfer ----------------------------------------------------
     /// `edges` may mix explicit `Edge` ids and `Selection` ids
     /// (docs/ARCHITECTURE.md §3.5).
@@ -341,6 +359,9 @@ impl Command {
             Command::CreateExtrusion { .. } => "CreateExtrusion",
             Command::UpdateExtrusion { .. } => "UpdateExtrusion",
             Command::DeleteExtrusion { .. } => "DeleteExtrusion",
+            Command::CreateRevolve { .. } => "CreateRevolve",
+            Command::UpdateRevolve { .. } => "UpdateRevolve",
+            Command::DeleteRevolve { .. } => "DeleteRevolve",
             Command::CreateChamfer { .. } => "CreateChamfer",
             Command::UpdateChamfer { .. } => "UpdateChamfer",
             Command::DeleteChamfer { .. } => "DeleteChamfer",
@@ -378,6 +399,7 @@ impl Command {
             | Command::UpdateSolid { id, coalesce, .. }
             | Command::UpdateMaterial { id, coalesce, .. }
             | Command::UpdateExtrusion { id, coalesce, .. }
+            | Command::UpdateRevolve { id, coalesce, .. }
             | Command::UpdateChamfer { id, coalesce, .. }
             | Command::UpdateSectionBox { id, coalesce, .. }
             | Command::UpdateElement { id, coalesce, .. }
@@ -802,6 +824,46 @@ fn run(ctx: &mut Ctx<'_>, command: &Command) -> Result<(), VimStatus> {
             Ok(())
         }
         Command::DeleteExtrusion { id } => ctx.delete(*id, EntityKind::Extrusion),
+
+        // -- Revolve -----------------------------------------------------
+        Command::CreateRevolve {
+            profile,
+            axis,
+            angle_radians,
+        } => {
+            ctx.create(
+                Params::Revolve {
+                    angle_radians: angle_radians.unwrap_or(std::f64::consts::TAU),
+                },
+                vec![SlotValue::One(Some(*profile)), SlotValue::One(Some(*axis))],
+            )?;
+            Ok(())
+        }
+        Command::UpdateRevolve {
+            id,
+            profile,
+            axis,
+            angle_radians,
+            ..
+        } => {
+            ctx.expect_kind(*id, EntityKind::Revolve)?;
+            if let Some(angle_radians) = angle_radians {
+                ctx.set_params(
+                    *id,
+                    Params::Revolve {
+                        angle_radians: *angle_radians,
+                    },
+                )?;
+            }
+            if let Some(profile) = profile {
+                ctx.rewire(*id, slot::REVOLVE_PROFILE, SlotValue::One(Some(*profile)))?;
+            }
+            if let Some(axis) = axis {
+                ctx.rewire(*id, slot::REVOLVE_AXIS, SlotValue::One(Some(*axis)))?;
+            }
+            Ok(())
+        }
+        Command::DeleteRevolve { id } => ctx.delete(*id, EntityKind::Revolve),
 
         // -- Chamfer -------------------------------------------------
         Command::CreateChamfer { distance, edges } => {

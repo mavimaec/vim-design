@@ -1,6 +1,6 @@
 [package]
 name = "vim-design-web"
-description = "VimDesignWeb: WASM browser test app. Currently the wasm threading probe."
+description = "VimDesignWeb: WASM browser test app — wgpu demo scene + threading probe."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -20,7 +20,21 @@ web-sys = { workspace = true, features = [
     "Element",
     "HtmlCanvasElement",
     "CanvasRenderingContext2d",
+    "Performance",
+    "console",
 ] }
+
+# Renderer (wasm only; native builds of this crate stay lightweight).
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wgpu = { version = "26", default-features = false, features = [
+    "std",
+    "webgpu", # browser WebGPU backend (preferred)
+    "webgl",  # WebGL2 fallback for environments without WebGPU
+    "wgsl",
+] }
+glam = "0.33"
+wasm-bindgen-futures = "0.4"
+serde_json = { workspace = true }
 
 # Threaded configuration only (requires nightly + atomics; see README.md).
 rayon = { workspace = true, optional = true }

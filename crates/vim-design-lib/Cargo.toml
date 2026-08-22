@@ -15,11 +15,17 @@ serde = { workspace = true }
 postcard = { workspace = true }
 # Dev/debug JSON export (docs/ARCHITECTURE.md §10); not part of wasm builds.
 serde_json = { workspace = true, optional = true }
+# Parallel wave evaluation + tessellation on native (docs/ARCHITECTURE.md
+# §6.2). Kept out of the wasm builds: the single-threaded wasm config must
+# not spawn threads, and the threaded config parallelizes at the app layer.
+rayon = { workspace = true, optional = true }
 
 [features]
 default = []
 # Enables `Document::save_json` for diffing documents in tests.
 json-debug = ["dep:serde_json"]
+# rayon-parallel evaluation waves and tessellation (native builds).
+parallel = ["dep:rayon"]
 
 [dev-dependencies]
 serde_json = { workspace = true }

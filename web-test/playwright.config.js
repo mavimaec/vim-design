@@ -18,6 +18,15 @@ export default defineConfig({
     // wasm threads need cross-origin isolation; the dev server provides
     // the COOP/COEP headers.
     browserName: "chromium",
+    // NOTE on WebGPU in headless chromium (investigated 2026-08-22): with
+    // "--enable-unsafe-webgpu" (+/- "--use-webgpu-adapter=swiftshader" /
+    // "--enable-features=Vulkan" / "--use-angle=vulkan") an adapter comes
+    // up and wgpu renders without validation errors, but the presented
+    // canvas never reaches the headless compositor — screenshots stay
+    // fully transparent (raw-JS WebGPU clears reproduce this too). CI
+    // therefore runs WITHOUT WebGPU flags: navigator.gpu is absent and
+    // the demo takes its WebGL2 (SwiftShader) fallback path, which
+    // composites correctly. Real desktop browsers get WebGPU.
   },
   webServer: {
     command: `node "${serverScript}" "${wwwDir}" 8787`,

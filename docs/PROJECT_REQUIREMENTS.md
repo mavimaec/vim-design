@@ -38,6 +38,9 @@ The API lets the caller submit undoable commands similar to the following set:
 - "CreateExtrusion" (from face and spline or line)
 - "UpdateExtrusion"
 - "DeleteExtrusion"
+- "CreateRevolve" (revolves a profile face about an axis line, e.g. cones, domes, columns)
+- "UpdateRevolve"
+- "DeleteRevolve"
 - "CreateChamfer" (from faces and edges)
 - "UpdateChamfer"
 - "DeleteChamfer"
