@@ -5,7 +5,8 @@
 //! element/instance path of the mesh facade). The returned [`SceneIds`]
 //! registry holds exactly the entity ids the sliders need to update.
 
-use vim_design_lib::{Command, Document, EntityId, EntityKind, Params};
+use vim_design_lib::entity::slot;
+use vim_design_lib::{Command, Document, EntityId, EntityKind, Params, ProvenancePath, SubRef};
 
 /// Default parameter values (meters) — must match the sliders' initial
 /// values in `www/index.html`.
@@ -28,8 +29,18 @@ const HOLE_HALF: f64 = 0.75;
 pub struct SceneIds {
     /// Cube base square corners, CCW starting at (-s/2, -s/2, 0).
     pub cube_base_cps: [EntityId; 4],
+    /// Cube base profile edges (same order as the corners); the chamfer
+    /// addresses the top rim as SharedEdge(CapEnd, Side{edge}).
+    pub cube_base_edges: [EntityId; 4],
     /// Top control point of the cube's extrusion path (z = size).
     pub cube_top_cp: EntityId,
+    /// The cube's extrusion — the chamfer's target.
+    pub cube_extrusion: EntityId,
+    /// The cube's element. Its members slot is swapped between the
+    /// extrusion (no chamfer) and the chamfer entity (which replaces its
+    /// target as the render shape) so the instance always draws the
+    /// current shape.
+    pub cube_element: EntityId,
     /// Bottom control point of the plate's downward extrusion path
     /// (z = -thickness).
     pub plate_bottom_cp: EntityId,
@@ -64,7 +75,13 @@ fn one(doc: &mut Document, cmd: Command) -> Result<EntityId, String> {
 }
 
 /// A closed polygon loop: control points -> lines -> edges -> wire.
-fn build_loop(doc: &mut Document, corners: &[[f64; 3]]) -> Result<(Vec<EntityId>, EntityId), String> {
+struct Loop {
+    cps: Vec<EntityId>,
+    edges: Vec<EntityId>,
+    wire: EntityId,
+}
+
+fn build_loop(doc: &mut Document, corners: &[[f64; 3]]) -> Result<Loop, String> {
     let mut cps = Vec::with_capacity(corners.len());
     for corner in corners {
         cps.push(one(doc, Command::CreateControlPoint { position: *corner })?);
@@ -80,8 +97,8 @@ fn build_loop(doc: &mut Document, corners: &[[f64; 3]]) -> Result<(Vec<EntityId>
         )?;
         edges.push(one(doc, Command::CreateEdge { curve: line })?);
     }
-    let wire = one(doc, Command::CreateWire { edges })?;
-    Ok((cps, wire))
+    let wire = one(doc, Command::CreateWire { edges: edges.clone() })?;
+    Ok(Loop { cps, edges, wire })
 }
 
 /// Face from an outer wire (plus optional holes), extruded along a line
@@ -143,12 +160,13 @@ fn assign_material(
 }
 
 /// Wrap a solid producer in an element and place one instance of it.
+/// Returns the element id.
 fn place(
     doc: &mut Document,
     name: &str,
     member: EntityId,
     translate: [f64; 3],
-) -> Result<(), String> {
+) -> Result<EntityId, String> {
     let element = one(
         doc,
         Command::CreateElement {
@@ -168,13 +186,13 @@ fn place(
             ],
         },
     )?;
-    Ok(())
+    Ok(element)
 }
 
 /// Build the whole scene; returns the slider registry.
 pub fn build_scene(doc: &mut Document) -> Result<SceneIds, String> {
     // --- Floor plate with a hole (ground, instanced at identity) -------
-    let (_, outer_wire) = build_loop(
+    let outer = build_loop(
         doc,
         &[
             [-PLATE_HALF_W, -PLATE_HALF_D, 0.0],
@@ -183,7 +201,7 @@ pub fn build_scene(doc: &mut Document) -> Result<SceneIds, String> {
             [-PLATE_HALF_W, PLATE_HALF_D, 0.0],
         ],
     )?;
-    let (_, hole_wire) = build_loop(
+    let hole = build_loop(
         doc,
         &[
             [-HOLE_HALF, -HOLE_HALF, 0.0],
@@ -194,8 +212,8 @@ pub fn build_scene(doc: &mut Document) -> Result<SceneIds, String> {
     )?;
     let (plate_face, plate_bottom_cp, plate_extrusion) = extrude_face(
         doc,
-        outer_wire,
-        vec![hole_wire],
+        outer.wire,
+        vec![hole.wire],
         [0.0, 0.0, 0.0],
         [0.0, 0.0, -DEFAULT_PLATE_THICKNESS],
     )?;
@@ -204,7 +222,7 @@ pub fn build_scene(doc: &mut Document) -> Result<SceneIds, String> {
 
     // --- Cube (base square centered on its local origin) ---------------
     let s = DEFAULT_CUBE_SIZE / 2.0;
-    let (cube_cps, cube_wire) = build_loop(
+    let cube_loop = build_loop(
         doc,
         &[
             [-s, -s, 0.0],
@@ -215,16 +233,21 @@ pub fn build_scene(doc: &mut Document) -> Result<SceneIds, String> {
     )?;
     let (cube_face, cube_top_cp, cube_extrusion) = extrude_face(
         doc,
-        cube_wire,
+        cube_loop.wire,
         vec![],
         [0.0, 0.0, 0.0],
         [0.0, 0.0, DEFAULT_CUBE_SIZE],
     )?;
     assign_material(doc, cube_face, "brick", [0.72, 0.26, 0.20], 0.8)?;
-    place(doc, "cube", cube_extrusion, [-1.9, -1.0, 0.0])?;
-    let cube_base_cps: [EntityId; 4] = cube_cps
+    let cube_element = place(doc, "cube", cube_extrusion, [-1.9, -1.0, 0.0])?;
+    let cube_base_cps: [EntityId; 4] = cube_loop
+        .cps
         .try_into()
         .map_err(|_| "cube base loop must have 4 control points".to_owned())?;
+    let cube_base_edges: [EntityId; 4] = cube_loop
+        .edges
+        .try_into()
+        .map_err(|_| "cube base loop must have 4 edges".to_owned())?;
 
     // --- Cylinder (the composite command) -------------------------------
     let cyl_ids = ok(
@@ -312,7 +335,10 @@ pub fn build_scene(doc: &mut Document) -> Result<SceneIds, String> {
 
     Ok(SceneIds {
         cube_base_cps,
+        cube_base_edges,
         cube_top_cp,
+        cube_extrusion,
+        cube_element,
         plate_bottom_cp,
         cyl_extrusion,
         cyl_circle,
@@ -322,11 +348,55 @@ pub fn build_scene(doc: &mut Document) -> Result<SceneIds, String> {
     })
 }
 
-/// The six slider parameters as currently stored in the document — the
+/// Top-rim edges of the cube for the chamfer, addressed by provenance
+/// (docs/ARCHITECTURE.md §3.4): each is the intersection of the sweep's
+/// end cap with the lateral face swept from one base profile edge.
+///
+/// KNOWN KERNEL LIMIT (verified 2026-08-22 against monstertruck-fillet):
+/// only *non-adjacent* straight edges chamfer correctly in one
+/// operation. All four rim edges together fail typed ("shell is not
+/// connected" — corner blending is unsupported), and chaining
+/// chamfer-of-chamfer to work around it silently no-ops on the edges
+/// adjacent to an existing blend. The demo therefore chamfers the two
+/// *opposite* rim edges (south + north), the largest supported set.
+pub fn cube_chamfer_sub_edges(ids: &SceneIds) -> Vec<SubRef> {
+    [ids.cube_base_edges[0], ids.cube_base_edges[2]]
+        .iter()
+        .map(|edge| SubRef {
+            owner: ids.cube_extrusion,
+            path: ProvenancePath::shared_edge(
+                ProvenancePath::CapEnd,
+                ProvenancePath::Side { source: *edge },
+            ),
+        })
+        .collect()
+}
+
+/// The chamfer currently targeting the cube's extrusion, if any, with
+/// its distance. Derived from the document on every call rather than
+/// cached: undo/redo can create and delete the chamfer entity behind the
+/// app's back, so the document is the only reliable source.
+pub fn find_cube_chamfer(doc: &Document, ids: &SceneIds) -> Option<(EntityId, f64)> {
+    doc.entities().find_map(|(id, record)| match &record.params {
+        Params::Chamfer { distance, .. }
+            if record
+                .inputs
+                .get(slot::CHAMFER_TARGET)
+                .is_some_and(|slot| slot.referenced().next() == Some(ids.cube_extrusion)) =>
+        {
+            Some((*id, *distance))
+        }
+        _ => None,
+    })
+}
+
+/// The slider parameters as currently stored in the document — the
 /// single source of truth the UI resynchronizes from (startup and after
 /// undo/redo).
 pub struct CurrentParams {
     pub cube_size: f64,
+    /// 0.0 when no chamfer entity targets the cube.
+    pub cube_chamfer: f64,
     pub plate_thickness: f64,
     pub cyl_radius: f64,
     pub cyl_height: f64,
@@ -350,6 +420,7 @@ pub fn current_params(doc: &Document, ids: &SceneIds) -> CurrentParams {
     };
     CurrentParams {
         cube_size: cp_position(ids.cube_top_cp)[2],
+        cube_chamfer: find_cube_chamfer(doc, ids).map_or(0.0, |(_, d)| d),
         plate_thickness: -cp_position(ids.plate_bottom_cp)[2],
         cyl_radius: circle_radius(ids.cyl_circle),
         cyl_height: cp_position(ids.cyl_top_cp)[2],

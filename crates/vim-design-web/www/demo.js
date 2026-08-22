@@ -95,6 +95,7 @@ async function main() {
   // -- Sliders ---------------------------------------------------------
   const sliders = [
     ["cube-size",       "cube size",       "cubeSize",       (v) => app.set_cube_size(v)],
+    ["cube-chamfer",    "cube chamfer",    "cubeChamfer",    (v) => app.set_cube_chamfer(v)],
     ["plate-thickness", "plate height",    "plateThickness", (v) => app.set_plate_thickness(v)],
     ["cyl-radius",      "cylinder radius", "cylRadius",      (v) => app.set_cylinder_radius(v)],
     ["cyl-height",      "cylinder height", "cylHeight",      (v) => app.set_cylinder_height(v)],

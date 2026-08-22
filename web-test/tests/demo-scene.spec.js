@@ -144,6 +144,58 @@ test("demo scene renders and all six sliders re-mesh the scene", async ({ page }
   await expect(page.locator("#cone-height")).toHaveValue("0.4");
   await expect(page.locator("#cone-height-val")).toHaveText("0.40 m");
   await expect(page.locator("#redo")).toBeDisabled();
+  prevHash = await canvasHash(page);
+
+  // --- Cube chamfer: create / update / delete via one slider -----------
+  // The chamfer entity replaces the cube extrusion as mesh owner, so
+  // both directions exercise the tombstone/upsert handoff.
+  stats = await page.evaluate(() => window.__vimStats);
+  const trisUnchamfered = stats.triangles;
+
+  await setSlider(page, "cube-chamfer", 0.15);
+  await waitSettled(page);
+  const chamferHash = await canvasHash(page);
+  expect(chamferHash, "chamfer should change the canvas").not.toBe(prevHash);
+  stats = await page.evaluate(() => window.__vimStats);
+  expect(stats.errors, "chamfer eval errors").toEqual([]);
+  expect(stats.triangles, "chamfer adds blend faces").not.toBe(trisUnchamfered);
+  const trisChamfered = stats.triangles;
+  console.log(
+    `cube-chamfer -> 0.15: commit→mesh ${stats.lastLatencyMs.toFixed(1)} ms, ` +
+    `${trisUnchamfered} -> ${trisChamfered} triangles`,
+  );
+
+  // Back to 0: DeleteChamfer hands the mesh back to the extrusion.
+  await setSlider(page, "cube-chamfer", 0);
+  await waitSettled(page);
+  const unchamferedHash = await canvasHash(page);
+  expect(unchamferedHash, "removing the chamfer should change the canvas").not.toBe(chamferHash);
+  stats = await page.evaluate(() => window.__vimStats);
+  expect(stats.errors).toEqual([]);
+  expect(stats.triangles, "triangle count reverts with the chamfer gone").toBe(trisUnchamfered);
+
+  // Re-apply for the undo/redo slider-sync assertions + final screenshot.
+  await setSlider(page, "cube-chamfer", 0.15);
+  await waitSettled(page);
+  await expect(page.locator("#cube-chamfer")).toHaveValue("0.15");
+
+  // Undo reverts the whole consecutive chamfer gesture group (0.15 -> 0
+  // -> 0.15) back to "no chamfer"; the slider resyncs from the document.
+  await page.locator("#undo").click();
+  await waitSettled(page);
+  await expect(page.locator("#cube-chamfer")).toHaveValue("0");
+  await expect(page.locator("#cube-chamfer-val")).toHaveText("0.00 m");
+  stats = await page.evaluate(() => window.__vimStats);
+  expect(stats.triangles).toBe(trisUnchamfered);
+
+  await page.locator("#redo").click();
+  await waitSettled(page);
+  await expect(page.locator("#cube-chamfer")).toHaveValue("0.15");
+  await expect(page.locator("#cube-chamfer-val")).toHaveText("0.15 m");
+  stats = await page.evaluate(() => window.__vimStats);
+  expect(stats.triangles).toBe(trisChamfered);
+  expect(stats.errors).toEqual([]);
+
   await page.screenshot({
     path: path.join(screenshotDir, "demo-scene-after-sliders.png"),
   });

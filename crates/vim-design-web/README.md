@@ -9,8 +9,12 @@ WASM browser test app. Two pages, served by
   alpha-blended tessellation-wireframe overlay toggled from the panel).
   The scene — floor plate with a hole, cube, cylinder, cone — is authored
   at startup through the real command API, each object wrapped in an
-  `Element` and placed with an `Instance`. Six sliders submit coalesced
-  `Update*` commands and drive the `eval::Engine` facade
+  `Element` and placed with an `Instance`. Seven sliders submit coalesced
+  `Update*` commands (the cube-chamfer slider also creates/deletes a
+  `Chamfer` on the cube's two opposite top-rim edges — the largest set
+  monstertruck-fillet supports in one operation — swapping the cube
+  element's member between extrusion and chamfer) and drive the
+  `eval::Engine` facade
   (`evaluate_pending` → `poll_updates` → GPU upload); the status line
   shows generations, commit→mesh latency, triangle count, and eval
   errors. Undo/Redo buttons revert whole slider gestures.

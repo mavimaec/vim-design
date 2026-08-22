@@ -215,6 +215,75 @@ impl DemoApp {
         self.sync("cube size");
     }
 
+    /// Cube top-rim chamfer distance. 0 means "no chamfer": the entity
+    /// is created on the first movement above zero, updated (coalesced)
+    /// while dragging, and deleted when the slider returns to zero.
+    ///
+    /// Ownership: a chamfer replaces its target as render shape. Because
+    /// the cube's extrusion is consumed by the cube *element*, the
+    /// element's members slot is swapped to the chamfer on create (and
+    /// back on delete) so the instance draws the chamfered solid —
+    /// otherwise the chamfer would surface as a standalone mesh at
+    /// identity while the element kept the raw extrusion. An excessive
+    /// distance (>= half the cube size) is a typed per-entity eval
+    /// error: the previous good mesh is retained and the error surfaces
+    /// in the status line until the parameters are fixed.
+    pub fn set_cube_chamfer(&mut self, distance: f64) {
+        let existing = scene::find_cube_chamfer(&self.doc, &self.ids);
+        if existing.is_none() && distance <= 0.0 {
+            return; // nothing to create, nothing to delete
+        }
+        self.gestures.begin(&self.doc, "cube_chamfer");
+        match (existing, distance > 0.0) {
+            (Some((id, _)), true) => self.submit(Command::UpdateChamfer {
+                id,
+                distance: Some(distance),
+                target: None,
+                edges: None,
+                sub_edges: None,
+                coalesce: true,
+            }),
+            (Some((id, _)), false) => {
+                // Hand the element back its extrusion first — deleting a
+                // chamfer that is still a member would be rejected
+                // (reject-if-dependents).
+                self.submit(Command::UpdateElement {
+                    id: self.ids.cube_element,
+                    name: None,
+                    members: Some(vec![self.ids.cube_extrusion]),
+                    coalesce: false,
+                });
+                self.submit(Command::DeleteChamfer { id });
+            }
+            (None, true) => {
+                let output = self.doc.submit(Command::CreateChamfer {
+                    target: self.ids.cube_extrusion,
+                    distance,
+                    edges: vec![],
+                    sub_edges: scene::cube_chamfer_sub_edges(&self.ids),
+                });
+                match output {
+                    Ok(out) => {
+                        if let [chamfer] = out.created_ids.as_slice() {
+                            self.submit(Command::UpdateElement {
+                                id: self.ids.cube_element,
+                                name: None,
+                                members: Some(vec![*chamfer]),
+                                coalesce: false,
+                            });
+                        }
+                    }
+                    Err(status) => web_sys::console::error_1(&JsValue::from_str(
+                        &format!("CreateChamfer rejected: {status:?}"),
+                    )),
+                }
+            }
+            (None, false) => {} // early-returned above; keep never-crash
+
+        }
+        self.sync("cube chamfer");
+    }
+
     pub fn set_plate_thickness(&mut self, thickness: f64) {
         self.gestures.begin(&self.doc, "plate_thickness");
         let cmd = scene::plate_thickness_command(&self.ids, thickness);
@@ -285,6 +354,7 @@ impl DemoApp {
         let p = scene::current_params(&self.doc, &self.ids);
         serde_json::json!({
             "cubeSize": p.cube_size,
+            "cubeChamfer": p.cube_chamfer,
             "plateThickness": p.plate_thickness,
             "cylRadius": p.cyl_radius,
             "cylHeight": p.cyl_height,
