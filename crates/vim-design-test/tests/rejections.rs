@@ -120,8 +120,20 @@ fn kind_mismatch_wiring_is_rejected() {
     assert_rejected(
         &mut doc,
         Command::CreateChamfer {
+            target: chain.extrusion,
             distance: 0.01,
             edges: vec![chain.face], // faces are not edges/selections
+            sub_edges: vec![],
+        },
+        VimStatus::SlotKindMismatch,
+    );
+    assert_rejected(
+        &mut doc,
+        Command::CreateChamfer {
+            target: chain.face, // faces are not solid producers
+            distance: 0.01,
+            edges: vec![chain.edge],
+            sub_edges: vec![],
         },
         VimStatus::SlotKindMismatch,
     );

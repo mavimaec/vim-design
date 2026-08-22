@@ -32,6 +32,45 @@ pub enum ProvenancePath {
     Blend { a: EntityId, b: EntityId },
     /// A face produced by cutting with a plane (e.g. a section-box cap).
     Cut { plane: EntityId },
+    /// A generated **edge**, addressed as the intersection of two named
+    /// faces (e.g. an extrusion's top rim segment =
+    /// `SharedEdge { CapEnd, Side { e } }`). Chamfer blend faces are also
+    /// named by the `SharedEdge` path of the edge they replace
+    /// (docs/ARCHITECTURE.md §3.4: "a chamfer's blend face is named by
+    /// the edge it blends"). Operands are kept in canonical (sorted)
+    /// order — build via [`ProvenancePath::shared_edge`].
+    SharedEdge {
+        a: Box<ProvenancePath>,
+        b: Box<ProvenancePath>,
+    },
+}
+
+impl ProvenancePath {
+    /// Canonical `SharedEdge` constructor: operand order does not matter,
+    /// so operands are sorted for deterministic equality/serialization.
+    pub fn shared_edge(a: ProvenancePath, b: ProvenancePath) -> ProvenancePath {
+        let (a, b) = if a <= b { (a, b) } else { (b, a) };
+        ProvenancePath::SharedEdge {
+            a: Box::new(a),
+            b: Box::new(b),
+        }
+    }
+
+    /// The canonical form of this path (`SharedEdge` operands sorted,
+    /// recursively). Non-canonical forms can arrive over serde/FFI.
+    pub fn canonical(&self) -> ProvenancePath {
+        match self {
+            ProvenancePath::SharedEdge { a, b } => {
+                ProvenancePath::shared_edge(a.canonical(), b.canonical())
+            }
+            other => other.clone(),
+        }
+    }
+
+    /// True when this path addresses an edge rather than a face.
+    pub fn is_edge(&self) -> bool {
+        matches!(self, ProvenancePath::SharedEdge { .. })
+    }
 }
 
 /// Reference to a generated subelement: the entity whose evaluation owns
@@ -55,6 +94,27 @@ pub enum Ref {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_edge_is_order_insensitive() {
+        let side = ProvenancePath::Side {
+            source: EntityId(7),
+        };
+        let ab = ProvenancePath::shared_edge(side.clone(), ProvenancePath::CapEnd);
+        let ba = ProvenancePath::shared_edge(ProvenancePath::CapEnd, side);
+        assert_eq!(ab, ba);
+        assert!(ab.is_edge());
+        assert_eq!(ab.canonical(), ab);
+        // Non-canonical operand order canonicalizes to the same value.
+        let raw = ProvenancePath::SharedEdge {
+            a: Box::new(ProvenancePath::CapEnd),
+            b: Box::new(ProvenancePath::CapStart),
+        };
+        assert_eq!(
+            raw.canonical(),
+            ProvenancePath::shared_edge(ProvenancePath::CapStart, ProvenancePath::CapEnd)
+        );
+    }
 
     #[test]
     fn subref_orders_deterministically() {

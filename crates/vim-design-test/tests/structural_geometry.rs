@@ -40,22 +40,34 @@ fn chamfer_accepts_explicit_edges_and_selections() {
         },
     );
 
-    // Explicit edges AND a selection in the same multi slot.
+    // Explicit edges AND a selection in the same multi slot; the target
+    // is the chain's extrusion (chamfers blend a solid producer's edges).
     let chamfer = one(
         &mut doc,
         Command::CreateChamfer {
+            target: chain.extrusion,
             distance: 0.02,
             edges: vec![chain.edge, edge2, selection],
+            sub_edges: vec![],
         },
     );
     assert_eq!(
         doc.entity(chamfer).map(|r| r.inputs.clone()),
-        Some(vec![SlotValue::Many(vec![chain.edge, edge2, selection])])
+        Some(vec![
+            SlotValue::One(Some(chain.extrusion)),
+            SlotValue::Many(vec![chain.edge, edge2, selection]),
+        ])
     );
     assert_eq!(
         doc.dependents(selection),
         Ok(vec![chamfer]),
         "the selection is a real graph dependency of the chamfer"
+    );
+    assert_eq!(
+        doc.dependents(chain.extrusion)
+            .map(|deps| deps.contains(&chamfer)),
+        Ok(true),
+        "the target is a real graph dependency of the chamfer"
     );
 
     // Update: distance and a reduced edge set (multi-slot rewire).
@@ -64,7 +76,9 @@ fn chamfer_accepts_explicit_edges_and_selections() {
         Command::UpdateChamfer {
             id: chamfer,
             distance: Some(0.05),
+            target: None,
             edges: Some(vec![selection]),
+            sub_edges: None,
             coalesce: false,
         },
     );

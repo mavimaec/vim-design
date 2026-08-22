@@ -155,6 +155,7 @@ fn kernel_diag(err: KernelError) -> EvalDiag {
         KernelError::Topology(_) => EvalErrorKind::Kernel,
         KernelError::Tessellation(_) => EvalErrorKind::Tessellation,
         KernelError::Unsupported(_) => EvalErrorKind::NotYetSupported,
+        KernelError::Unresolved(_) => EvalErrorKind::UnresolvedSubRef,
         KernelError::Panic(_) => EvalErrorKind::InternalPanic,
     };
     diag(kind, err.to_string())
@@ -331,10 +332,12 @@ pub(crate) fn evaluate_entity(
         }
         EntityKind::Wire => {
             let ids = multi_ids(record, slot::WIRE_EDGES);
-            let mut specs: Vec<CurveSpec> = Vec::with_capacity(ids.len());
+            let mut specs: Vec<(CurveSpec, EntityId)> = Vec::with_capacity(ids.len());
             for id in ids {
                 let curve = as_curve(require(lookup, Some(id), "edge")?, "edge")?;
-                specs.push(curve.clone());
+                // The Edge entity id rides along as the curve's *source*:
+                // the stable id provenance naming derives from (§3.4).
+                specs.push((curve.clone(), id));
             }
             let wire = chain_wire(specs, tol)?;
             Ok(Evaluated::Wire(wire))
@@ -452,7 +455,7 @@ pub(crate) fn evaluate_entity(
         }
         EntityKind::Revolve => {
             let angle = match &record.params {
-                Params::Revolve { angle_radians } => *angle_radians,
+                Params::Revolve { angle_radians, .. } => *angle_radians,
                 _ => return Err(params_mismatch(record)),
             };
             let (face, material) =
@@ -517,16 +520,74 @@ pub(crate) fn evaluate_entity(
             })?;
             Ok(Evaluated::Instance { element, transform })
         }
+        EntityKind::Chamfer => {
+            let (distance, sub_edges) = match &record.params {
+                Params::Chamfer {
+                    distance,
+                    sub_edges,
+                } => (*distance, sub_edges.clone()),
+                _ => return Err(params_mismatch(record)),
+            };
+            let target_id = single_id(record, slot::CHAMFER_TARGET).ok_or_else(|| {
+                diag(EvalErrorKind::MissingInput, "chamfer has no target input")
+            })?;
+            let (solid, material) =
+                match require(lookup, Some(target_id), "target")? {
+                    Evaluated::Solid { solid, material } => (solid, *material),
+                    other => {
+                        return Err(diag(
+                            EvalErrorKind::UpstreamError,
+                            format!("target input evaluated to {other:?}, expected a solid"),
+                        ));
+                    }
+                };
+            let mut addresses: Vec<kernel::EdgeAddress> = Vec::new();
+            for sub in &sub_edges {
+                // A SubRef names topology of its owner; a chamfer can
+                // only blend edges of its own target (§3.4).
+                if sub.owner != target_id {
+                    return Err(diag(
+                        EvalErrorKind::UnresolvedSubRef,
+                        format!(
+                            "SubRef owner (entity {}) is not the chamfer's target \
+                             (entity {})",
+                            sub.owner.0, target_id.0
+                        ),
+                    ));
+                }
+                match sub.path.canonical() {
+                    crate::subref::ProvenancePath::SharedEdge { a, b } => {
+                        addresses.push(kernel::EdgeAddress::Shared { a: *a, b: *b });
+                    }
+                    other => {
+                        return Err(diag(
+                            EvalErrorKind::UnresolvedSubRef,
+                            format!(
+                                "provenance path {other:?} addresses a face, not an \
+                                 edge (use a SharedEdge path)"
+                            ),
+                        ));
+                    }
+                }
+            }
+            // Authored Edge entities (and, later, Selections) from the
+            // edges slot: matched to coincident solid edges.
+            for edge_id in multi_ids(record, slot::CHAMFER_EDGES) {
+                let curve = as_curve(require(lookup, Some(edge_id), "edge")?, "edge")?;
+                addresses.push(kernel::EdgeAddress::Coincident(curve.clone()));
+            }
+            let chamfered = kernel::chamfer_solid(solid, &addresses, distance, tol)
+                .map_err(kernel_diag)?;
+            Ok(Evaluated::Solid {
+                solid: chamfered,
+                material,
+            })
+        }
         // Not evaluated in this milestone (docs/ARCHITECTURE.md §3.5,
         // §5.2): clean per-entity errors, never pipeline failures.
         EntityKind::Selection => Err(diag(
             EvalErrorKind::NotYetImplemented,
             "Selection evaluation is not implemented in this milestone",
-        )),
-        EntityKind::Chamfer => Err(diag(
-            EvalErrorKind::NotYetImplemented,
-            "Chamfer evaluation is not implemented in this milestone \
-             (SubRef resolution is an approved follow-up)",
         )),
         EntityKind::SectionBox => Err(diag(
             EvalErrorKind::NotYetImplemented,
@@ -558,17 +619,26 @@ fn points_near(a: [f64; 3], b: [f64; 3], tol: f64) -> bool {
 /// orientation where needed (edges authored backwards still chain), and
 /// validate that the loop closes. A single closed curve (full circle) is
 /// a valid wire on its own; closed curves cannot be chained with others.
-fn chain_wire(specs: Vec<CurveSpec>, tol: f64) -> Result<WireSpec, EvalDiag> {
+/// Each curve carries its source `Edge` entity id — the stable id
+/// provenance naming derives from (docs/ARCHITECTURE.md §3.4) — which
+/// follows the curve through reordering and flips.
+fn chain_wire(specs: Vec<(CurveSpec, EntityId)>, tol: f64) -> Result<WireSpec, EvalDiag> {
     if specs.is_empty() {
         return Err(EvalDiag::new(
             EvalErrorKind::WireNotClosed,
             "wire has no edges",
         ));
     }
-    let closed_count = specs.iter().filter(|s| s.endpoints().is_none()).count();
+    let closed_count = specs
+        .iter()
+        .filter(|(s, _)| s.endpoints().is_none())
+        .count();
     if closed_count > 0 {
-        if specs.len() == 1 {
-            return Ok(WireSpec { curves: specs });
+        if let [(curve, source)] = specs.as_slice() {
+            return Ok(WireSpec::with_sources(
+                vec![curve.clone()],
+                vec![*source],
+            ));
         }
         return Err(EvalDiag::new(
             EvalErrorKind::WireNotClosed,
@@ -582,13 +652,32 @@ fn chain_wire(specs: Vec<CurveSpec>, tol: f64) -> Result<WireSpec, EvalDiag> {
         ));
     }
 
+    // The first edge fixes the traversal direction; both of its
+    // orientations are legal (a fully reversed edge list still chains).
+    match chain_attempt(specs.clone(), false, tol) {
+        Ok(wire) => Ok(wire),
+        Err(forward_error) => {
+            chain_attempt(specs, true, tol).map_err(|_| forward_error)
+        }
+    }
+}
+
+/// One chaining attempt, with the first edge optionally reversed.
+fn chain_attempt(
+    specs: Vec<(CurveSpec, EntityId)>,
+    flip_first: bool,
+    tol: f64,
+) -> Result<WireSpec, EvalDiag> {
     let mut iter = specs.into_iter();
-    let Some(first) = iter.next() else {
+    let Some((mut first, first_source)) = iter.next() else {
         return Err(EvalDiag::new(
             EvalErrorKind::WireNotClosed,
             "wire has no edges",
         ));
     };
+    if flip_first {
+        first = first.reversed();
+    }
     let Some((chain_start, mut current_end)) = first.endpoints() else {
         return Err(EvalDiag::new(
             EvalErrorKind::WireNotClosed,
@@ -596,7 +685,8 @@ fn chain_wire(specs: Vec<CurveSpec>, tol: f64) -> Result<WireSpec, EvalDiag> {
         ));
     };
     let mut chained: Vec<CurveSpec> = vec![first];
-    for (index, spec) in iter.enumerate() {
+    let mut sources: Vec<EntityId> = vec![first_source];
+    for (index, (spec, source)) in iter.enumerate() {
         let Some((start, end)) = spec.endpoints() else {
             return Err(EvalDiag::new(
                 EvalErrorKind::WireNotClosed,
@@ -619,6 +709,7 @@ fn chain_wire(specs: Vec<CurveSpec>, tol: f64) -> Result<WireSpec, EvalDiag> {
                 ),
             ));
         }
+        sources.push(source);
     }
     if !points_near(current_end, chain_start, tol) {
         return Err(EvalDiag::new(
@@ -626,7 +717,7 @@ fn chain_wire(specs: Vec<CurveSpec>, tol: f64) -> Result<WireSpec, EvalDiag> {
             format!("wire does not close: last edge ends away from the first edge's start (> {tol} m)"),
         ));
     }
-    Ok(WireSpec { curves: chained })
+    Ok(WireSpec::with_sources(chained, sources))
 }
 
 #[cfg(test)]
@@ -640,22 +731,29 @@ mod tests {
     #[test]
     fn chain_accepts_flipped_edges_and_rejects_gaps() {
         let tol = 1e-6;
-        // Triangle with the second edge authored backwards.
+        // Triangle with the second edge authored backwards; sources must
+        // follow their curves through reordering and flips.
         let ok = chain_wire(
             vec![
-                seg([0.0; 3], [1.0, 0.0, 0.0]),
-                seg([0.0, 1.0, 0.0], [1.0, 0.0, 0.0]), // flipped
-                seg([0.0, 1.0, 0.0], [0.0; 3]),
+                (seg([0.0; 3], [1.0, 0.0, 0.0]), EntityId(11)),
+                (seg([0.0, 1.0, 0.0], [1.0, 0.0, 0.0]), EntityId(12)), // flipped
+                (seg([0.0, 1.0, 0.0], [0.0; 3]), EntityId(13)),
             ],
             tol,
         );
         assert!(ok.is_ok());
+        if let Ok(wire) = ok {
+            assert_eq!(
+                wire.sources,
+                vec![EntityId(11), EntityId(12), EntityId(13)]
+            );
+        }
 
         // Gap: does not close.
         let gap = chain_wire(
             vec![
-                seg([0.0; 3], [1.0, 0.0, 0.0]),
-                seg([1.0, 0.0, 0.0], [1.0, 1.0, 0.0]),
+                (seg([0.0; 3], [1.0, 0.0, 0.0]), EntityId(11)),
+                (seg([1.0, 0.0, 0.0], [1.0, 1.0, 0.0]), EntityId(12)),
             ],
             tol,
         );
@@ -665,16 +763,19 @@ mod tests {
         ));
 
         // Single open edge cannot close.
-        let single = chain_wire(vec![seg([0.0; 3], [1.0, 0.0, 0.0])], tol);
+        let single = chain_wire(vec![(seg([0.0; 3], [1.0, 0.0, 0.0]), EntityId(11))], tol);
         assert!(single.is_err());
 
         // Single full circle is fine.
         let circle = chain_wire(
-            vec![CurveSpec::Circle {
-                center: [0.0; 3],
-                normal: [0.0, 0.0, 1.0],
-                radius: 1.0,
-            }],
+            vec![(
+                CurveSpec::Circle {
+                    center: [0.0; 3],
+                    normal: [0.0, 0.0, 1.0],
+                    radius: 1.0,
+                },
+                EntityId(11),
+            )],
             tol,
         );
         assert!(circle.is_ok());

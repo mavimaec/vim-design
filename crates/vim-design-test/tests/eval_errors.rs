@@ -179,13 +179,6 @@ fn not_yet_implemented_kinds_do_not_fail_the_pipeline() {
     let mut engine = Engine::new();
     let cube = build_cube(&mut doc, [0.0, 0.0, 0.0], 1.0, 1.0);
 
-    let chamfer = one(
-        &mut doc,
-        Command::CreateChamfer {
-            distance: 0.02,
-            edges: vec![cube.base.edges[0]],
-        },
-    );
     let selection = one(
         &mut doc,
         Command::CreateSelection {
@@ -203,22 +196,34 @@ fn not_yet_implemented_kinds_do_not_fail_the_pipeline() {
             max: [10.0; 3],
         },
     );
+    // A chamfer fed by a Selection: the selection is NotYetImplemented,
+    // so the chamfer inherits a clean upstream error (no crash, no
+    // pipeline failure) — and the un-chamfered extrusion keeps its mesh
+    // owner role only until the chamfer first succeeds (it never does
+    // here, so the extrusion's mesh would move to the chamfer with no
+    // geometry; the chamfer target keeps stale-retention semantics).
+    let chamfer = one(
+        &mut doc,
+        Command::CreateChamfer {
+            target: cube.extrusion,
+            distance: 0.02,
+            edges: vec![selection],
+            sub_edges: vec![],
+        },
+    );
 
     engine.evaluate_pending(&mut doc);
     let updates = engine.poll_updates(&doc);
 
-    for id in [chamfer, selection, section_box] {
+    for (id, expected) in [
+        (selection, EvalErrorKind::NotYetImplemented),
+        (section_box, EvalErrorKind::NotYetImplemented),
+        (chamfer, EvalErrorKind::UpstreamError),
+    ] {
         let diag = updates.errors.iter().find(|(e, _)| *e == id).map(|(_, d)| d.kind);
-        assert_eq!(
-            diag,
-            Some(EvalErrorKind::NotYetImplemented),
-            "entity {id:?} must report NotYetImplemented"
-        );
+        assert_eq!(diag, Some(expected), "entity {id:?}");
     }
-    // The cube still meshes; the pipeline settles despite three
-    // permanently-unevaluated kinds.
-    assert_eq!(updates.meshes.len(), 1);
-    assert_eq!(updates.meshes[0].id, cube.extrusion);
+    // The pipeline settles despite the unevaluated kinds.
     assert_eq!(updates.committed_generation, updates.evaluated_generation);
     assert_eq!(updates.pending_count, 0);
 

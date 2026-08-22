@@ -29,7 +29,7 @@ pub use document::{CommandGroup, Document, DocumentSettings};
 pub use entity::{EntityKind, EntityRecord, Params, SlotDecl, SlotValue, slots};
 pub use eval::{
     EvalDiag, EvalErrorKind, EvalState, Evaluated, InstanceUpdate, Mesh, MeshUpdate,
-    Submesh, Updates,
+    SubRefResolution, Submesh, Updates,
 };
 pub use graph::GraphState;
 pub use id::{EntityId, IdAllocator};

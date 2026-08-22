@@ -246,11 +246,17 @@ binding, at the cost of the pure-Rust/WASM story).
 
 ### 5.2 Known kernel gaps and plans
 
-- **Chamfer/fillet:** evaluate `monstertruck-fillet` (per-edge radii) first; if it falls
-  short, fall back to the in-house plan scoped to building-shaped cases — chamfers on
-  **straight edges between planar faces** (the dominant case in AEC): split adjacent
-  faces along offset lines, insert the ruled chamfer face, re-stitch the shell. True
-  rolling-ball blends on curved faces are out of scope for v1 either way.
+- **Chamfer/fillet — RESOLVED (2026-08-22): `monstertruck-fillet` adopted** (behind
+  monstertruck-modeling's `fillet` feature; wasm-clean). Verdict from hands-on
+  probes + the shipped evaluator: `fillet_edges` with `FilletProfile::Chamfer` +
+  `RadiusSpec::Constant` handles **straight edges between planar faces** exactly
+  (chamfered-cube volume matches the analytic prism to fp precision; output shell
+  closes; `Solid::try_new` validates). Curved rims (a cylinder's full circular top
+  rim, 4 arc edges) *fail safely*: the call succeeds per-edge but the resulting
+  shell is not closed → typed `NotConnected` from `Solid::try_new` → per-entity
+  eval error. That matches the v1 acceptance bar (building-shaped cases); the
+  in-house split/stitch fallback stays shelved. True rolling-ball blends on curved
+  faces remain out of scope for v1.
 - **Section box (modeling boolean):** implemented via `monstertruck-solid` —
   `plane_cut` (which returns the clipped solid *plus* its cross-section cap faces) per
   box plane where applicable, general `difference()` otherwise. At scale this cannot
@@ -295,14 +301,17 @@ The caller-facing output contract:
   `MeshUpdate { element_id, generation, vertices (pos+normal), indices, submeshes: [(material_id, index_range)] }`
   plus `InstanceUpdate { instance_id, element_id, transform_4x3 }` lists.
 - **Mesh ownership / standalone solids (implemented 2026-08-22, `eval::Engine`):**
-  a *mesh owner* is every `Element` (mesh = members' solids merged, one submesh per
-  member) **plus** every solid producer (`Extrusion`, `Revolve`, `Solid`) not wired
-  into any element's members slot — such producers surface as implicit standalone
-  meshes keyed by their own entity id. Wrapping a producer into an element
-  tombstones its standalone mesh and re-delivers the geometry under the element id.
-  Renderers draw one copy per instance; owners with no instances draw once at
-  identity. v1 materials are whole-solid (profile-face material for sweeps);
-  per-face materials arrive with `SubRef` resolution.
+  a *mesh owner* is every `Element` (mesh = members' solids merged) **plus** every
+  solid producer (`Extrusion`, `Revolve`, `Solid`, `Chamfer`) that is not *consumed*
+  — wired into an element's members slot or targeted by a chamfer (a chamfer
+  replaces its target as owner: the chamfered solid is the target's render shape).
+  Unconsumed producers surface as implicit standalone meshes keyed by their own
+  entity id; consuming one tombstones its standalone mesh and re-delivers the
+  geometry under the consumer's id. Renderers draw one copy per instance; owners
+  with no instances draw once at identity. Materials: a solid's default is its
+  profile-face material; `UpdateSubFaceMaterial` paints individual generated faces
+  by provenance path (§3.4) and submeshes split per material group — paints are
+  index-free, so they survive upstream edits and chamfers.
 - The caller polls: `vim_poll_updates(handle)` returns a **changed-set delta, coalesced,
   keyed by stable ids** — never a full-scene report. Each handle keeps a poll cursor; a
   poll returns only ids whose renderer-visible state changed since the previous poll, and
@@ -481,10 +490,10 @@ Ordered roughly by risk:
 3. **The kernel's tolerance model** — the truck lineage (including monstertruck) uses
    fixed internal tolerance constants. Verify they're compatible with meter-unit building geometry (1 µm target)
    or whether coordinates need internal scaling.
-4. **Chamfer scope** — first evaluate `monstertruck-fillet` (per-edge radii; gained with
-   the kernel swap) before committing to the in-house plan. If in-house is still needed:
-   is planar-face/straight-edge chamfering sufficient for v1? Effort is non-trivial even
-   for that case.
+4. **Chamfer scope** — **RESOLVED (2026-08-22): `monstertruck-fillet` adopted** —
+   straight-edge/planar chamfers work exactly, curved-edge attempts fail with typed
+   errors (see §5.2 for the full verdict); the in-house split/stitch plan stays
+   shelved unless curved-edge chamfers become a requirement.
 5. **WASM threading** — **RESOLVED (2026-08-22):** true parallelism verified in headless
    Chromium (8 rayon workers, ~4.3× speedup); truck compiles and runs in both threaded
    (nightly + explicit RUSTFLAGS, §6.2) and single-threaded fallback builds. Remaining

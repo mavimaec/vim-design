@@ -16,7 +16,7 @@ use crate::kernel::{self, KernelSolid, RawMesh};
 use super::evaluate::{EntityEval, evaluate_waves};
 use super::types::{
     EvalDiag, EvalErrorKind, EvalState, Evaluated, InstanceUpdate, Mesh, MeshUpdate,
-    Submesh, Updates,
+    SubRefResolution, Submesh, Updates,
 };
 
 #[cfg(feature = "parallel")]
@@ -99,6 +99,54 @@ impl Engine {
     /// Total evaluations performed since engine creation.
     pub fn total_eval_count(&self) -> u64 {
         self.eval_counts.values().sum()
+    }
+
+    /// Resolve a provenance-named subelement reference against its
+    /// owner's **current** evaluated solid (docs/ARCHITECTURE.md §3.4).
+    /// Face paths resolve to faces, `SharedEdge` paths to edges; a
+    /// reference that no longer matches (source edge deleted, cap gone
+    /// on an angle change) is a typed error — never a silent re-bind.
+    pub fn resolve_subref(
+        &self,
+        subref: &crate::subref::SubRef,
+    ) -> Result<SubRefResolution, EvalDiag> {
+        let value = self
+            .results
+            .get(&subref.owner)
+            .and_then(|e| e.value.as_ref())
+            .ok_or_else(|| {
+                EvalDiag::new(
+                    EvalErrorKind::UnresolvedSubRef,
+                    format!(
+                        "owner entity {} has no evaluated geometry",
+                        subref.owner.0
+                    ),
+                )
+            })?;
+        let Evaluated::Solid { solid, .. } = value else {
+            return Err(EvalDiag::new(
+                EvalErrorKind::UnresolvedSubRef,
+                format!(
+                    "owner entity {} did not evaluate to a solid",
+                    subref.owner.0
+                ),
+            ));
+        };
+        let (faces, edges) = kernel::match_counts(solid, &subref.path);
+        if subref.path.is_edge() {
+            if edges > 0 {
+                return Ok(SubRefResolution::Edges(edges));
+            }
+        } else if faces > 0 {
+            return Ok(SubRefResolution::Faces(faces));
+        }
+        Err(EvalDiag::new(
+            EvalErrorKind::UnresolvedSubRef,
+            format!(
+                "path {:?} resolves to no topology on entity {}",
+                subref.path, subref.owner.0
+            ),
+        ))
     }
 
     // -- evaluation ---------------------------------------------------------
@@ -224,30 +272,52 @@ impl Engine {
         alive_dirty: &BTreeMap<EntityId, EntityRecord>,
         generation: u64,
     ) {
+        // Consumed producers: wired into an element's members slot, or
+        // targeted by a chamfer (the chamfer replaces its target as mesh
+        // owner — the chamfered solid IS the target's render shape).
         let mut consumed: BTreeSet<EntityId> = BTreeSet::new();
         for (_, record) in doc.entities() {
-            if record.kind() == EntityKind::Element {
-                for member in record
-                    .inputs
-                    .get(slot::ELEMENT_MEMBERS)
-                    .map(|s| s.referenced().collect::<Vec<_>>())
-                    .unwrap_or_default()
-                {
-                    consumed.insert(member);
+            match record.kind() {
+                EntityKind::Element => {
+                    for member in record
+                        .inputs
+                        .get(slot::ELEMENT_MEMBERS)
+                        .map(|s| s.referenced().collect::<Vec<_>>())
+                        .unwrap_or_default()
+                    {
+                        consumed.insert(member);
+                    }
                 }
+                EntityKind::Chamfer => {
+                    for target in record
+                        .inputs
+                        .get(slot::CHAMFER_TARGET)
+                        .map(|s| s.referenced().collect::<Vec<_>>())
+                        .unwrap_or_default()
+                    {
+                        consumed.insert(target);
+                    }
+                }
+                _ => {}
             }
         }
         let owners_now: BTreeSet<EntityId> = doc
             .entities()
             .filter(|(id, record)| match record.kind() {
                 EntityKind::Element => true,
-                EntityKind::Extrusion | EntityKind::Revolve | EntityKind::Solid => {
-                    !consumed.contains(id)
-                }
+                EntityKind::Extrusion
+                | EntityKind::Revolve
+                | EntityKind::Solid
+                | EntityKind::Chamfer => !consumed.contains(id),
                 _ => false,
             })
             .map(|(id, _)| *id)
             .collect();
+
+        // Per-producer sub-face material assignments (canonical paths),
+        // resolved through chamfer chains: a chamfer renders its target's
+        // painted faces (provenance survives the blend — §3.4).
+        let assignments = collect_assignments(doc);
 
         // Owners that ceased to exist as owners: tombstone their meshes.
         let dropped: Vec<EntityId> = self
@@ -274,8 +344,9 @@ impl Engine {
         // Tessellate candidates (parallel on native — §6.2).
         let chordal = doc.settings().chordal_tolerance;
         let results = &self.results;
+        let assignments = &assignments;
         let build = |id: &EntityId| -> (EntityId, Option<Result<Mesh, EvalDiag>>) {
-            (*id, build_owner_mesh(results, *id, chordal))
+            (*id, build_owner_mesh(results, assignments, *id, chordal))
         };
         #[cfg(feature = "parallel")]
         let built: Vec<_> = candidates.par_iter().map(build).collect();
@@ -375,22 +446,78 @@ impl Engine {
     }
 }
 
+/// Per-producer sub-face material assignments (canonical paths), with a
+/// chamfer resolving to its target chain's assignments: paints survive a
+/// chamfer because provenance does (docs/ARCHITECTURE.md §3.4).
+fn collect_assignments(doc: &Document) -> BTreeMap<EntityId, Assignments> {
+    // Direct assignments from Extrusion/Revolve params.
+    let mut direct: BTreeMap<EntityId, Assignments> = BTreeMap::new();
+    for (id, record) in doc.entities() {
+        match &record.params {
+            crate::entity::Params::Extrusion { face_materials }
+            | crate::entity::Params::Revolve { face_materials, .. }
+                if !face_materials.is_empty() =>
+            {
+                direct.insert(
+                    *id,
+                    face_materials
+                        .iter()
+                        .map(|(path, material)| (path.canonical(), *material))
+                        .collect(),
+                );
+            }
+            _ => {}
+        }
+    }
+    // Chamfers inherit their (transitive) target's assignments.
+    let mut resolved = direct.clone();
+    for (id, record) in doc.entities() {
+        if record.kind() != EntityKind::Chamfer {
+            continue;
+        }
+        let mut current = *id;
+        for _ in 0..64 {
+            let Some(target) = doc
+                .entity(current)
+                .and_then(|r| r.inputs.get(slot::CHAMFER_TARGET))
+                .and_then(|s| s.referenced().next())
+            else {
+                break;
+            };
+            if let Some(assigns) = direct.get(&target) {
+                resolved.insert(*id, assigns.clone());
+                break;
+            }
+            current = target;
+        }
+    }
+    resolved
+}
+
+type Assignments = Vec<(crate::subref::ProvenancePath, EntityId)>;
+
 /// Build the mesh for one owner from its evaluated value.
 ///
 /// Returns `None` when no (even stale) solid geometry is available —
-/// the caller retains the previous mesh. Elements merge their members'
-/// meshes with one submesh per member (member material, v1 whole-solid
-/// materials); standalone producers get a single submesh.
+/// the caller retains the previous mesh. Standalone producers get one
+/// submesh per material group (sub-face assignments split the buffer);
+/// elements concatenate their members the same way.
 fn build_owner_mesh(
     results: &BTreeMap<EntityId, EntityEval>,
+    assignments: &BTreeMap<EntityId, Assignments>,
     id: EntityId,
     chordal_tolerance: f64,
 ) -> Option<Result<Mesh, EvalDiag>> {
     let value = results.get(&id)?.value.as_ref()?;
-    match value {
-        Evaluated::Solid { solid, material } => {
-            Some(tessellate_merged(&[(solid, *material)], chordal_tolerance))
-        }
+    let mut mesh = Mesh::default();
+    let outcome = match value {
+        Evaluated::Solid { solid, material } => append_solid(
+            &mut mesh,
+            solid,
+            *material,
+            assignments.get(&id),
+            chordal_tolerance,
+        ),
         Evaluated::SolidSet(members) => {
             if members.is_empty() {
                 return Some(Err(EvalDiag::new(
@@ -398,60 +525,101 @@ fn build_owner_mesh(
                     "element has no evaluable member solids",
                 )));
             }
-            let parts: Vec<(&KernelSolid, Option<EntityId>)> = members
-                .iter()
-                .map(|(_, solid, material)| (solid, *material))
-                .collect();
-            Some(tessellate_merged(&parts, chordal_tolerance))
+            members.iter().try_for_each(|(member, solid, material)| {
+                append_solid(
+                    &mut mesh,
+                    solid,
+                    *material,
+                    assignments.get(member),
+                    chordal_tolerance,
+                )
+            })
         }
-        _ => None,
-    }
+        _ => return None,
+    };
+    Some(outcome.map(|()| mesh))
 }
 
-/// Tessellate a list of solids and concatenate them into one mesh with
-/// one submesh per solid.
-fn tessellate_merged(
-    parts: &[(&KernelSolid, Option<EntityId>)],
+fn tessellation_diag(err: kernel::KernelError) -> EvalDiag {
+    EvalDiag::new(
+        match err {
+            kernel::KernelError::Panic(_) => EvalErrorKind::InternalPanic,
+            _ => EvalErrorKind::Tessellation,
+        },
+        err.to_string(),
+    )
+}
+
+fn range_diag(what: &str) -> EvalDiag {
+    EvalDiag::new(
+        EvalErrorKind::Tessellation,
+        format!("merged mesh exceeds u32 {what} range"),
+    )
+}
+
+/// Tessellate one solid per BREP face, group the faces by material
+/// (provenance-path assignments, falling back to the solid's inherited
+/// material), and append one submesh per non-empty group.
+fn append_solid(
+    mesh: &mut Mesh,
+    solid: &KernelSolid,
+    default_material: Option<EntityId>,
+    assignments: Option<&Assignments>,
     chordal_tolerance: f64,
-) -> Result<Mesh, EvalDiag> {
-    let mut mesh = Mesh::default();
-    for (solid, material) in parts {
-        let raw: RawMesh = kernel::tessellate(solid, chordal_tolerance).map_err(|err| {
-            EvalDiag::new(
-                match err {
-                    kernel::KernelError::Panic(_) => EvalErrorKind::InternalPanic,
-                    _ => EvalErrorKind::Tessellation,
-                },
-                err.to_string(),
-            )
-        })?;
-        let base = u32::try_from(mesh.positions.len()).map_err(|_| {
-            EvalDiag::new(
-                EvalErrorKind::Tessellation,
-                "merged mesh exceeds u32 vertex range",
-            )
-        })?;
-        let index_start = u32::try_from(mesh.indices.len()).map_err(|_| {
-            EvalDiag::new(
-                EvalErrorKind::Tessellation,
-                "merged mesh exceeds u32 index range",
-            )
-        })?;
-        let index_count = u32::try_from(raw.indices.len()).map_err(|_| {
-            EvalDiag::new(
-                EvalErrorKind::Tessellation,
-                "part mesh exceeds u32 index range",
-            )
-        })?;
-        mesh.positions.extend_from_slice(&raw.positions);
-        mesh.normals.extend_from_slice(&raw.normals);
-        mesh.indices
-            .extend(raw.indices.iter().map(|i| i.saturating_add(base)));
-        mesh.submeshes.push(Submesh {
-            material: *material,
-            index_start,
-            index_count,
-        });
+) -> Result<(), EvalDiag> {
+    let face_meshes: Vec<RawMesh> =
+        kernel::tessellate_faces(solid, chordal_tolerance).map_err(tessellation_diag)?;
+    let paths = solid.face_paths();
+
+    // Group face indices by their material, deterministically
+    // (None-material group first, then ascending material id).
+    let mut groups: BTreeMap<Option<EntityId>, Vec<usize>> = BTreeMap::new();
+    for index in 0..face_meshes.len() {
+        let material = paths
+            .get(index)
+            .and_then(|p| p.as_ref())
+            .and_then(|path| {
+                let canonical = path.canonical();
+                assignments?
+                    .iter()
+                    .find(|(assigned, _)| *assigned == canonical)
+                    .map(|(_, material)| *material)
+            })
+            .or(default_material);
+        groups.entry(material).or_default().push(index);
     }
-    Ok(mesh)
+
+    for (material, face_indices) in groups {
+        let index_start = u32::try_from(mesh.indices.len())
+            .map_err(|_| range_diag("index"))?;
+        let mut index_count: u32 = 0;
+        for face_index in face_indices {
+            let Some(raw) = face_meshes.get(face_index) else {
+                continue;
+            };
+            let base = u32::try_from(mesh.positions.len())
+                .map_err(|_| range_diag("vertex"))?;
+            let count =
+                u32::try_from(raw.indices.len()).map_err(|_| range_diag("index"))?;
+            mesh.positions.extend_from_slice(&raw.positions);
+            mesh.normals.extend_from_slice(&raw.normals);
+            mesh.indices
+                .extend(raw.indices.iter().map(|i| i.saturating_add(base)));
+            index_count = index_count.saturating_add(count);
+        }
+        if index_count > 0 {
+            mesh.submeshes.push(Submesh {
+                material,
+                index_start,
+                index_count,
+            });
+        }
+    }
+    if mesh.indices.is_empty() {
+        return Err(EvalDiag::new(
+            EvalErrorKind::Tessellation,
+            "tessellation produced an empty mesh",
+        ));
+    }
+    Ok(())
 }

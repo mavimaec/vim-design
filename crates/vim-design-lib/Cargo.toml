@@ -7,7 +7,9 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-monstertruck-modeling = { workspace = true }
+# `fillet`: monstertruck-fillet chamfer/fillet ops (docs/ARCHITECTURE.md
+# §5.2; wasm-verified 2026-08-22).
+monstertruck-modeling = { workspace = true, features = ["fillet"] }
 monstertruck-geometry = { workspace = true }
 monstertruck-solid = { workspace = true }
 monstertruck-meshing = { workspace = true }

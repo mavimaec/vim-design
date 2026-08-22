@@ -35,14 +35,16 @@
 //!   upserts; a delete + recreate between polls arrives as a plain
 //!   upsert.
 //!
-//! # Mesh ownership (the standalone-solid rule)
+//! # Mesh ownership (the standalone-solid + chamfer rule)
 //!
 //! [`MeshUpdate::id`] is a **mesh owner**:
-//! - every `Element` entity (mesh = its members' solids merged, one
-//!   [`Submesh`] per member), and
-//! - every solid producer (`Extrusion`, `Revolve`, `Solid`) that is
-//!   **not** wired into any element's members slot — it surfaces as an
-//!   implicit standalone mesh keyed by its own entity id.
+//! - every `Element` entity (mesh = its members' solids merged), and
+//! - every solid producer (`Extrusion`, `Revolve`, `Solid`, `Chamfer`)
+//!   that is **not consumed** — i.e. not wired into any element's
+//!   members slot and not targeted by any chamfer. A chamfer *replaces*
+//!   its target as mesh owner: the chamfered solid IS the target's
+//!   render shape, so creating a chamfer tombstones the target's
+//!   standalone mesh and deleting the chamfer hands it back.
 //!
 //! Wrapping a producer into an element tombstones its standalone mesh
 //! and re-delivers the geometry under the element id. Renderers draw an
@@ -50,13 +52,44 @@
 //! owner with no instances (all standalone solids, and elements the user
 //! has not instanced) is drawn once at identity.
 //!
+//! # Provenance naming & SubRefs (docs/ARCHITECTURE.md §3.4)
+//!
+//! Extrusion/revolve evaluators name their generated faces by the stable
+//! ids of the inputs that produced them: `Side { source: edge-entity }`
+//! for lateral faces (hole-wire sides included), `CapStart`/`CapEnd` for
+//! the sweep caps (revolves get caps only for partial angles). Generated
+//! **edges** are addressed as the intersection of two named faces
+//! (`ProvenancePath::SharedEdge`). Names are re-derived from geometry on
+//! every evaluation — kernel face indices never cross this facade — and
+//! survive downstream operations: a chamfered solid keeps its upstream
+//! face names, and each blend face is named by the `SharedEdge` path of
+//! the edge it replaced. [`Engine::resolve_subref`] resolves a `SubRef`
+//! against the owner's current solid; a reference that no longer matches
+//! (source edge deleted, cap gone on an angle change) is a typed
+//! [`EvalErrorKind::UnresolvedSubRef`] — never a silent re-bind.
+//!
 //! # Materials
 //!
 //! [`Submesh::material`] carries a `Material` entity id (or `None` for
 //! the caller's default material); readers fetch color/roughness from
-//! the document's `Params::Material`. v1 assigns whole-solid materials —
-//! an extrusion/revolve inherits its profile face's material; per-face
-//! materials on generated topology arrive with `SubRef` resolution.
+//! the document's `Params::Material`. A solid's default material is its
+//! profile face's material; on top of that, `UpdateSubFaceMaterial`
+//! paints individual *generated* faces by provenance path, and the
+//! submeshes split accordingly (one submesh per material group). Paints
+//! survive upstream edits and chamfers because they are keyed by
+//! provenance, not by face index (the anti-topological-naming rule).
+//! Chamfers render their target's paints; blend faces get the default.
+//!
+//! # Chamfer
+//!
+//! A `Chamfer` blends edges of its `target` producer via
+//! monstertruck-fillet (flat `Chamfer` profile, constant distance).
+//! Edges are addressed by `Params::Chamfer::sub_edges` (`SharedEdge`
+//! SubRefs whose owner is the target) and/or authored `Edge` entities in
+//! the edges slot (matched to coincident solid edges — e.g. a profile
+//! edge coincides with the extrusion's bottom rim). Straight edges
+//! between planar faces are the supported class (docs §5.2);
+//! curved-edge failures surface as typed per-entity errors.
 //!
 //! # Errors (docs/ARCHITECTURE.md §6.4)
 //!
@@ -64,10 +97,11 @@
 //! successful value and mesh (stale), downstream evaluates against the
 //! stale geometry where possible, and the failure surfaces in
 //! [`Updates::errors`] with a typed [`EvalDiag`]. Fixing the parameters
-//! clears the error via [`Updates::errors_cleared`]. `Selection`,
-//! `Chamfer`, and `SectionBox` are not evaluated in this milestone and
-//! report [`EvalErrorKind::NotYetImplemented`] without affecting the
-//! rest of the scene; extrusions along spline paths report
+//! clears the error via [`Updates::errors_cleared`]. `Selection` and
+//! `SectionBox` are not evaluated in this milestone and report
+//! [`EvalErrorKind::NotYetImplemented`] without affecting the rest of
+//! the scene (a chamfer fed by a `Selection` inherits a clean upstream
+//! error); extrusions along spline paths report
 //! [`EvalErrorKind::NotYetSupported`].
 //!
 //! `Solid`-from-faces evaluates, but the kernel requires a closed
@@ -83,5 +117,5 @@ mod types;
 pub use engine::Engine;
 pub use types::{
     EvalDiag, EvalErrorKind, EvalState, Evaluated, InstanceUpdate, Mesh, MeshUpdate,
-    Submesh, Updates,
+    SubRefResolution, Submesh, Updates,
 };

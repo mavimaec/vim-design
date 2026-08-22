@@ -20,6 +20,7 @@ use crate::delta::Delta;
 use crate::id::EntityId;
 use crate::selection::{PredicateAst, SelectionScope};
 use crate::status::VimStatus;
+use crate::subref::{ProvenancePath, SubRef};
 
 /// The closed set of user-level commands — the full requirements list
 /// (docs/PROJECT_REQUIREMENTS.md) plus the composite cylinder commands.
@@ -197,6 +198,18 @@ pub enum Command {
     DeleteExtrusion {
         id: EntityId,
     },
+    /// Assign (or clear, with `material: None`) a material on a
+    /// *generated* face of an `Extrusion` or `Revolve`, addressed by its
+    /// provenance path (docs/ARCHITECTURE.md §3.4) — e.g. paint an
+    /// extrusion's `CapEnd` differently from its sides. The counterpart
+    /// of `UpdateFaceMaterial` for topology that has no `EntityId`.
+    /// Whether the path *resolves* is evaluation-time semantics (§6.4);
+    /// structurally any path may be assigned.
+    UpdateSubFaceMaterial {
+        owner: EntityId,
+        path: ProvenancePath,
+        material: Option<EntityId>,
+    },
     // -- Revolve ---------------------------------------------------------
     /// Revolve a profile face about an axis line. `angle_radians` defaults
     /// to 2π (a closed solid of revolution) when `None`.
@@ -216,16 +229,24 @@ pub enum Command {
         id: EntityId,
     },
     // -- Chamfer ----------------------------------------------------
-    /// `edges` may mix explicit `Edge` ids and `Selection` ids
-    /// (docs/ARCHITECTURE.md §3.5).
+    /// Chamfer edges of `target` (an `Extrusion`/`Revolve`/`Solid`/
+    /// `Chamfer`). `sub_edges` addresses generated edges by provenance
+    /// (`SharedEdge` paths whose `SubRef::owner` is the target);
+    /// `edges` may mix authored `Edge` ids (matched to coincident solid
+    /// edges at evaluation time) and `Selection` ids
+    /// (docs/ARCHITECTURE.md §§3.4–3.5).
     CreateChamfer {
+        target: EntityId,
         distance: f64,
         edges: Vec<EntityId>,
+        sub_edges: Vec<SubRef>,
     },
     UpdateChamfer {
         id: EntityId,
         distance: Option<f64>,
+        target: Option<EntityId>,
         edges: Option<Vec<EntityId>>,
+        sub_edges: Option<Vec<SubRef>>,
         coalesce: bool,
     },
     DeleteChamfer {
@@ -359,6 +380,7 @@ impl Command {
             Command::CreateExtrusion { .. } => "CreateExtrusion",
             Command::UpdateExtrusion { .. } => "UpdateExtrusion",
             Command::DeleteExtrusion { .. } => "DeleteExtrusion",
+            Command::UpdateSubFaceMaterial { .. } => "UpdateSubFaceMaterial",
             Command::CreateRevolve { .. } => "CreateRevolve",
             Command::UpdateRevolve { .. } => "UpdateRevolve",
             Command::DeleteRevolve { .. } => "DeleteRevolve",
@@ -806,8 +828,14 @@ fn run(ctx: &mut Ctx<'_>, command: &Command) -> Result<(), VimStatus> {
         // -- Extrusion --------------------------------------------------
         Command::CreateExtrusion { profile, path } => {
             ctx.create(
-                Params::Extrusion,
-                vec![SlotValue::One(Some(*profile)), SlotValue::One(Some(*path))],
+                Params::Extrusion {
+                    face_materials: Vec::new(),
+                },
+                vec![
+                    SlotValue::One(Some(*profile)),
+                    SlotValue::One(Some(*path)),
+                    SlotValue::Many(Vec::new()),
+                ],
             )?;
             Ok(())
         }
@@ -824,6 +852,11 @@ fn run(ctx: &mut Ctx<'_>, command: &Command) -> Result<(), VimStatus> {
             Ok(())
         }
         Command::DeleteExtrusion { id } => ctx.delete(*id, EntityKind::Extrusion),
+        Command::UpdateSubFaceMaterial {
+            owner,
+            path,
+            material,
+        } => update_sub_face_material(ctx, *owner, path, *material),
 
         // -- Revolve -----------------------------------------------------
         Command::CreateRevolve {
@@ -834,8 +867,13 @@ fn run(ctx: &mut Ctx<'_>, command: &Command) -> Result<(), VimStatus> {
             ctx.create(
                 Params::Revolve {
                     angle_radians: angle_radians.unwrap_or(std::f64::consts::TAU),
+                    face_materials: Vec::new(),
                 },
-                vec![SlotValue::One(Some(*profile)), SlotValue::One(Some(*axis))],
+                vec![
+                    SlotValue::One(Some(*profile)),
+                    SlotValue::One(Some(*axis)),
+                    SlotValue::Many(Vec::new()),
+                ],
             )?;
             Ok(())
         }
@@ -846,12 +884,17 @@ fn run(ctx: &mut Ctx<'_>, command: &Command) -> Result<(), VimStatus> {
             angle_radians,
             ..
         } => {
-            ctx.expect_kind(*id, EntityKind::Revolve)?;
+            let record = ctx.expect_kind(*id, EntityKind::Revolve)?;
             if let Some(angle_radians) = angle_radians {
+                let face_materials = match record.params {
+                    Params::Revolve { face_materials, .. } => face_materials,
+                    _ => return Err(VimStatus::ParamsKindMismatch),
+                };
                 ctx.set_params(
                     *id,
                     Params::Revolve {
                         angle_radians: *angle_radians,
+                        face_materials,
                     },
                 )?;
             }
@@ -866,29 +909,54 @@ fn run(ctx: &mut Ctx<'_>, command: &Command) -> Result<(), VimStatus> {
         Command::DeleteRevolve { id } => ctx.delete(*id, EntityKind::Revolve),
 
         // -- Chamfer -------------------------------------------------
-        Command::CreateChamfer { distance, edges } => {
+        Command::CreateChamfer {
+            target,
+            distance,
+            edges,
+            sub_edges,
+        } => {
             ctx.create(
                 Params::Chamfer {
                     distance: *distance,
+                    sub_edges: canonical_sub_edges(sub_edges),
                 },
-                vec![SlotValue::Many(edges.clone())],
+                vec![
+                    SlotValue::One(Some(*target)),
+                    SlotValue::Many(edges.clone()),
+                ],
             )?;
             Ok(())
         }
         Command::UpdateChamfer {
             id,
             distance,
+            target,
             edges,
+            sub_edges,
             ..
         } => {
-            ctx.expect_kind(*id, EntityKind::Chamfer)?;
-            if let Some(distance) = distance {
+            let record = ctx.expect_kind(*id, EntityKind::Chamfer)?;
+            if distance.is_some() || sub_edges.is_some() {
+                let (old_distance, old_sub_edges) = match record.params {
+                    Params::Chamfer {
+                        distance,
+                        sub_edges,
+                    } => (distance, sub_edges),
+                    _ => return Err(VimStatus::ParamsKindMismatch),
+                };
                 ctx.set_params(
                     *id,
                     Params::Chamfer {
-                        distance: *distance,
+                        distance: distance.unwrap_or(old_distance),
+                        sub_edges: sub_edges
+                            .as_ref()
+                            .map(|s| canonical_sub_edges(s))
+                            .unwrap_or(old_sub_edges),
                     },
                 )?;
+            }
+            if let Some(target) = target {
+                ctx.rewire(*id, slot::CHAMFER_TARGET, SlotValue::One(Some(*target)))?;
             }
             if let Some(edges) = edges {
                 ctx.rewire(*id, slot::CHAMFER_EDGES, SlotValue::Many(edges.clone()))?;
@@ -1051,6 +1119,89 @@ fn run(ctx: &mut Ctx<'_>, command: &Command) -> Result<(), VimStatus> {
     }
 }
 
+/// Canonicalize chamfer sub-edge refs (SharedEdge operand order is
+/// insensitive — docs/ARCHITECTURE.md §3.4) and sort for deterministic
+/// params equality/serialization.
+fn canonical_sub_edges(sub_edges: &[SubRef]) -> Vec<SubRef> {
+    let mut canon: Vec<SubRef> = sub_edges
+        .iter()
+        .map(|s| SubRef {
+            owner: s.owner,
+            path: s.path.canonical(),
+        })
+        .collect();
+    canon.sort();
+    canon.dedup();
+    canon
+}
+
+/// Compile `UpdateSubFaceMaterial`: update the owner's params assignment
+/// list (sorted by path; one material per path) and mirror the material
+/// ids into the owner's `face_materials` slot so they are real graph
+/// edges (reject-if-dependents, dirty propagation).
+fn update_sub_face_material(
+    ctx: &mut Ctx<'_>,
+    owner: EntityId,
+    path: &ProvenancePath,
+    material: Option<EntityId>,
+) -> Result<(), VimStatus> {
+    let record = ctx.record(owner)?;
+    let path = path.canonical();
+    let (params, slot_idx) = match record.params {
+        Params::Extrusion { face_materials } => {
+            let updated = upsert_assignment(face_materials, path, material);
+            (
+                Params::Extrusion {
+                    face_materials: updated,
+                },
+                slot::EXTRUSION_FACE_MATERIALS,
+            )
+        }
+        Params::Revolve {
+            angle_radians,
+            face_materials,
+        } => {
+            let updated = upsert_assignment(face_materials, path, material);
+            (
+                Params::Revolve {
+                    angle_radians,
+                    face_materials: updated,
+                },
+                slot::REVOLVE_FACE_MATERIALS,
+            )
+        }
+        _ => return Err(VimStatus::WrongEntityKind),
+    };
+    let mut ids: Vec<EntityId> = match &params {
+        Params::Extrusion { face_materials }
+        | Params::Revolve { face_materials, .. } => {
+            face_materials.iter().map(|(_, id)| *id).collect()
+        }
+        _ => Vec::new(),
+    };
+    ids.sort();
+    ids.dedup();
+    // Rewire first: it validates that the material ids exist with the
+    // accepted kind before any params change is applied.
+    ctx.rewire(owner, slot_idx, SlotValue::Many(ids))?;
+    ctx.set_params(owner, params)
+}
+
+/// Replace/insert/remove the assignment for `path`, keeping the list
+/// sorted by path (deterministic serialization).
+fn upsert_assignment(
+    mut list: Vec<(ProvenancePath, EntityId)>,
+    path: ProvenancePath,
+    material: Option<EntityId>,
+) -> Vec<(ProvenancePath, EntityId)> {
+    list.retain(|(p, _)| *p != path);
+    if let Some(material) = material {
+        list.push((path, material));
+    }
+    list.sort();
+    list
+}
+
 /// Existence check for selection-scope ids (kind constraints are the
 /// predicate's business, not the scope's).
 fn validate_scope(ctx: &Ctx<'_>, scope: &SelectionScope) -> Result<(), VimStatus> {
@@ -1128,8 +1279,14 @@ fn create_cylinder(
         vec![SlotValue::One(Some(center_cp)), SlotValue::One(Some(top_cp))],
     )?;
     ctx.create(
-        Params::Extrusion,
-        vec![SlotValue::One(Some(face)), SlotValue::One(Some(line))],
+        Params::Extrusion {
+            face_materials: Vec::new(),
+        },
+        vec![
+            SlotValue::One(Some(face)),
+            SlotValue::One(Some(line)),
+            SlotValue::Many(Vec::new()),
+        ],
     )?;
     Ok(())
 }

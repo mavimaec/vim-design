@@ -24,12 +24,16 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use monstertruck_meshing::rexport_polymesh::PolygonMesh;
-use monstertruck_meshing::tessellation::shell_to_polygon_strict;
+use monstertruck_meshing::tessellation::{MeshableShape, shell_to_polygon_strict};
 use monstertruck_modeling::{
-    Edge as MtEdge, Face as MtFace, ParametricSurface3D, Point3, Rad, Shell as MtShell,
-    Solid as MtSolid, Vector3, Vertex as MtVertex, Wire as MtWire, builder,
-    builder::SweepAngle,
+    BoundedCurve, Edge as MtEdge, Face as MtFace, FilletOptions, FilletProfile,
+    Invertible, ParametricCurve, ParametricSurface3D, Point3, Rad, Shell as MtShell, Solid as MtSolid,
+    Vector3, Vertex as MtVertex, Wire as MtWire, builder, builder::SweepAngle,
+    fillet_edges,
 };
+
+use crate::id::EntityId;
+use crate::subref::ProvenancePath;
 
 // ---------------------------------------------------------------------
 // Plain-data specs (safe to construct anywhere; no kernel types inside).
@@ -94,9 +98,41 @@ impl CurveSpec {
 /// A closed loop of curves, already ordered and oriented head-to-tail
 /// (the wire evaluator validates chaining/closure before building one).
 /// A single closed curve (full circle) is also a valid wire.
+///
+/// `sources` runs parallel to `curves`: the `Edge` **entity** each curve
+/// came from — the stable ids provenance naming derives from
+/// (docs/ARCHITECTURE.md §3.4). `EntityId::INVALID` marks curves without
+/// an authored source (their swept faces stay unnamed).
 #[derive(Debug, Clone, PartialEq)]
 pub struct WireSpec {
     pub curves: Vec<CurveSpec>,
+    pub sources: Vec<EntityId>,
+}
+
+impl WireSpec {
+    /// A wire without source attribution (kernel tests, synthetic wires).
+    pub fn from_curves(curves: Vec<CurveSpec>) -> Self {
+        let sources = vec![EntityId::INVALID; curves.len()];
+        Self { curves, sources }
+    }
+
+    /// A wire with per-curve source edge entities (lengths must match;
+    /// a mismatch degrades to unattributed sources rather than failing).
+    pub fn with_sources(curves: Vec<CurveSpec>, sources: Vec<EntityId>) -> Self {
+        let sources = if sources.len() == curves.len() {
+            sources
+        } else {
+            vec![EntityId::INVALID; curves.len()]
+        };
+        Self { curves, sources }
+    }
+
+    /// `(curve, source)` pairs.
+    fn pairs(&self) -> impl Iterator<Item = (&CurveSpec, EntityId)> + '_ {
+        self.curves
+            .iter()
+            .zip(self.sources.iter().copied().chain(std::iter::repeat(EntityId::INVALID)))
+    }
 }
 
 /// An infinite plane (explicit face surface).
@@ -112,12 +148,16 @@ pub struct PlaneSpec {
 // ---------------------------------------------------------------------
 
 /// A planar BREP face. Kernel topology stays private; the plain-data
-/// summary (normal/centroid, meters) is exposed for diagnostics.
+/// summary (normal/centroid, meters) is exposed for diagnostics. The
+/// profile wire specs are retained so sweeps can build the provenance
+/// model (docs/ARCHITECTURE.md §3.4).
 #[derive(Debug, Clone)]
 pub struct KernelFace {
     face: MtFace,
     normal: [f64; 3],
     centroid: [f64; 3],
+    outer: WireSpec,
+    holes: Vec<WireSpec>,
 }
 
 impl KernelFace {
@@ -133,10 +173,55 @@ impl KernelFace {
     }
 }
 
-/// A closed BREP solid.
+/// How a solid was swept — retained so provenance can be *re-derived*
+/// from geometry after downstream operations (chamfer) reshape the
+/// face list. Purely plain-data.
+#[derive(Debug, Clone)]
+enum SweepModel {
+    Extrusion {
+        outer: WireSpec,
+        holes: Vec<WireSpec>,
+        plane_origin: [f64; 3],
+        plane_normal: [f64; 3],
+        direction: [f64; 3],
+    },
+    Revolve {
+        outer: WireSpec,
+        holes: Vec<WireSpec>,
+        /// A point of the profile plane (the profile centroid): fixes
+        /// the rotational reference position of the sweep's caps.
+        plane_origin: [f64; 3],
+        origin: [f64; 3],
+        axis: [f64; 3],
+        angle: f64,
+    },
+}
+
+/// A closed BREP solid with provenance-named faces
+/// (docs/ARCHITECTURE.md §3.4).
+///
+/// `provenance` runs parallel to the solid's faces in boundary/shell
+/// iteration order and is **rebuilt on every evaluation** from geometry;
+/// the face index itself is an internal detail that never crosses the
+/// facade — only [`ProvenancePath`]s do.
 #[derive(Debug, Clone)]
 pub struct KernelSolid {
     solid: MtSolid,
+    provenance: Vec<Option<ProvenancePath>>,
+    model: Option<SweepModel>,
+}
+
+impl KernelSolid {
+    /// Number of BREP faces.
+    pub fn face_count(&self) -> usize {
+        self.provenance.len()
+    }
+
+    /// Provenance path per face, in the same order as
+    /// [`tessellate_faces`] output (`None` = unnamed face).
+    pub fn face_paths(&self) -> &[Option<ProvenancePath>] {
+        &self.provenance
+    }
 }
 
 /// Tessellated triangle mesh: flat GPU-ready buffers. Positions/normals
@@ -171,6 +256,10 @@ pub enum KernelError {
     Tessellation(String),
     /// Operation the seam does not support yet.
     Unsupported(String),
+    /// A provenance-named subelement reference did not resolve against
+    /// the current topology (docs/ARCHITECTURE.md §3.4 — never a silent
+    /// re-bind).
+    Unresolved(String),
     /// The kernel panicked; caught at the seam (docs/ARCHITECTURE.md §8).
     Panic(String),
 }
@@ -185,6 +274,9 @@ impl std::fmt::Display for KernelError {
             KernelError::Topology(msg) => write!(f, "topology error: {msg}"),
             KernelError::Tessellation(msg) => write!(f, "tessellation error: {msg}"),
             KernelError::Unsupported(msg) => write!(f, "unsupported: {msg}"),
+            KernelError::Unresolved(msg) => {
+                write!(f, "subelement reference did not resolve: {msg}")
+            }
             KernelError::Panic(msg) => write!(f, "kernel panic (caught): {msg}"),
         }
     }
@@ -331,6 +423,7 @@ fn wire_centroid(wire: &WireSpec) -> [f64; 3] {
 
 /// The wire re-wound so its winding normal has a positive dot product
 /// with `desired` (no-op when it already does or when degenerate).
+/// Sources stay aligned with their (reversed) curves.
 fn wound_along(wire: &WireSpec, desired: [f64; 3]) -> WireSpec {
     if dot(wire_winding_normal(wire), desired) < 0.0 {
         WireSpec {
@@ -340,6 +433,7 @@ fn wound_along(wire: &WireSpec, desired: [f64; 3]) -> WireSpec {
                 .rev()
                 .map(CurveSpec::reversed)
                 .collect(),
+            sources: wire.sources.iter().rev().copied().collect(),
         }
     } else {
         wire.clone()
@@ -510,6 +604,8 @@ pub fn make_face(
             face,
             normal: desired,
             centroid: wire_centroid(outer),
+            outer: outer.clone(),
+            holes: holes.to_vec(),
         })
     })
 }
@@ -542,7 +638,19 @@ pub fn extrude_solid(
             face.face.clone()
         };
         let solid: MtSolid = builder::extrude(&profile, vector3(direction));
-        Ok(KernelSolid { solid })
+        let model = SweepModel::Extrusion {
+            outer: face.outer.clone(),
+            holes: face.holes.clone(),
+            plane_origin: face.centroid,
+            plane_normal: face.normal,
+            direction,
+        };
+        let provenance = classify_solid(&solid, &model);
+        Ok(KernelSolid {
+            solid,
+            provenance,
+            model: Some(model),
+        })
     })
 }
 
@@ -612,7 +720,20 @@ pub fn revolve_solid(
                 division,
             )
         };
-        Ok(KernelSolid { solid })
+        let model = SweepModel::Revolve {
+            outer: face.outer.clone(),
+            holes: face.holes.clone(),
+            plane_origin: face.centroid,
+            origin,
+            axis,
+            angle: angle_radians,
+        };
+        let provenance = classify_solid(&solid, &model);
+        Ok(KernelSolid {
+            solid,
+            provenance,
+            model: Some(model),
+        })
     })
 }
 
@@ -625,7 +746,13 @@ pub fn solid_from_faces(faces: &[KernelFace]) -> Result<KernelSolid, KernelError
         }
         let shell: MtShell = faces.iter().map(|f| f.face.clone()).collect();
         match MtSolid::try_new(vec![shell]) {
-            Ok(solid) => Ok(KernelSolid { solid }),
+            // Authored faces are addressable by their own Face entity id
+            // (docs/ARCHITECTURE.md §3.4): no generated-topology names.
+            Ok(solid) => Ok(KernelSolid {
+                provenance: vec![None; faces.len()],
+                solid,
+                model: None,
+            }),
             Err(err) => Err(KernelError::Topology(err.to_string())),
         }
     })
@@ -652,8 +779,698 @@ pub fn tessellate(
                 Err(err) => return Err(KernelError::Tessellation(err.to_string())),
             }
         }
-        flatten_polygon(&polygon)
+        let mesh = flatten_polygon(&polygon)?;
+        if mesh.indices.is_empty() {
+            return Err(KernelError::Tessellation(
+                "tessellation produced an empty mesh".to_owned(),
+            ));
+        }
+        Ok(mesh)
     })
+}
+
+/// Tessellate a solid into **one mesh per BREP face**, aligned with
+/// [`KernelSolid::face_paths`] (same boundary/shell iteration order).
+/// Shared edges are still discretized once per shell (the whole shell is
+/// triangulated in one pass), so face meshes stitch watertight by
+/// position. A silently-dropped face is a typed error, as in
+/// [`tessellate`]. Empty per-face meshes (degenerate slivers, e.g. the
+/// on-axis faces of a cone) are allowed and come back empty.
+pub fn tessellate_faces(
+    solid: &KernelSolid,
+    chordal_tolerance: f64,
+) -> Result<Vec<RawMesh>, KernelError> {
+    guard(|| {
+        let tolerance = if chordal_tolerance > 0.0 {
+            chordal_tolerance
+        } else {
+            1e-3
+        };
+        let mut meshes: Vec<RawMesh> = Vec::with_capacity(solid.provenance.len());
+        for shell in solid.solid.boundaries() {
+            let meshed = shell.triangulation(tolerance);
+            for (index, face) in meshed.face_iter().enumerate() {
+                match face.surface() {
+                    None => {
+                        return Err(KernelError::Tessellation(format!(
+                            "tessellation dropped face {index} (no usable mesh)"
+                        )));
+                    }
+                    Some(mut poly) => {
+                        if !face.orientation() {
+                            poly.invert();
+                        }
+                        meshes.push(flatten_polygon(&poly)?);
+                    }
+                }
+            }
+        }
+        Ok(meshes)
+    })
+}
+
+// ---------------------------------------------------------------------
+// Provenance classification (docs/ARCHITECTURE.md §3.4).
+//
+// Faces are named by *geometric membership* against the sweep model —
+// "all boundary samples of this face lie on the surface swept by profile
+// curve `e`" — never by kernel output index. Rebuilt on every
+// evaluation; also re-run after downstream operations (chamfer) so
+// surviving faces keep their upstream names.
+// ---------------------------------------------------------------------
+
+/// Membership tolerance for provenance classification (meters). Coarser
+/// than the kernel tolerance on purpose: it only has to discriminate
+/// faces that differ at model scale.
+const CLASSIFY_TOL: f64 = 1e-5;
+
+/// Sample points of a face's boundary: each edge's start vertex plus two
+/// interior curve points (quarter + mid) — enough to discriminate caps,
+/// swept sides, and blend faces.
+fn face_boundary_samples(face: &MtFace) -> Vec<[f64; 3]> {
+    let mut points = Vec::new();
+    for wire in face.boundaries() {
+        for edge in wire.edge_iter() {
+            let p = edge.front().point();
+            points.push([p.x, p.y, p.z]);
+            let curve = edge.curve();
+            let (t0, t1) = curve.range_tuple();
+            for f in [0.25, 0.5] {
+                let q = curve.subs(t0 + f * (t1 - t0));
+                points.push([q.x, q.y, q.z]);
+            }
+        }
+    }
+    points
+}
+
+/// Evaluate a curve spec at parameter `t` in `[0, 1]`.
+fn curve_spec_point(curve: &CurveSpec, t: f64) -> [f64; 3] {
+    match curve {
+        CurveSpec::Segment { start, end } => add(*start, scale(sub(*end, *start), t)),
+        CurveSpec::Circle {
+            center,
+            normal,
+            radius,
+        } => {
+            let n = normalized(*normal, 0.0).unwrap_or([0.0, 0.0, 1.0]);
+            let u = any_perpendicular(n);
+            let v = cross(n, u);
+            let phi = t * std::f64::consts::TAU;
+            add(
+                *center,
+                add(
+                    scale(u, *radius * phi.cos()),
+                    scale(v, *radius * phi.sin()),
+                ),
+            )
+        }
+        CurveSpec::Bezier { control_points } => {
+            // De Casteljau.
+            let mut pts: Vec<[f64; 3]> = control_points.clone();
+            while pts.len() > 1 {
+                pts = pts
+                    .windows(2)
+                    .filter_map(|pair| match pair {
+                        [a, b] => Some(add(*a, scale(sub(*b, *a), t))),
+                        _ => None,
+                    })
+                    .collect();
+            }
+            pts.first().copied().unwrap_or([0.0; 3])
+        }
+    }
+}
+
+/// Minimize `cost(curve(t))` over `t` in `[0, 1]`: dense sampling plus
+/// ternary refinement around the best bracket. Robust for the smooth
+/// costs used here (distances).
+fn min_cost_over_curve(curve: &CurveSpec, cost: impl Fn([f64; 3]) -> f64) -> f64 {
+    const SAMPLES: usize = 64;
+    let mut best_index = 0usize;
+    let mut best = f64::INFINITY;
+    for i in 0..=SAMPLES {
+        let t = i as f64 / SAMPLES as f64;
+        let c = cost(curve_spec_point(curve, t));
+        if c < best {
+            best = c;
+            best_index = i;
+        }
+    }
+    let mut lo = (best_index.saturating_sub(1)) as f64 / SAMPLES as f64;
+    let mut hi = ((best_index + 1).min(SAMPLES)) as f64 / SAMPLES as f64;
+    for _ in 0..48 {
+        let m1 = lo + (hi - lo) / 3.0;
+        let m2 = hi - (hi - lo) / 3.0;
+        if cost(curve_spec_point(curve, m1)) <= cost(curve_spec_point(curve, m2)) {
+            hi = m2;
+        } else {
+            lo = m1;
+        }
+    }
+    let refined = cost(curve_spec_point(curve, (lo + hi) / 2.0));
+    refined.min(best)
+}
+
+/// 3D distance from `p` to a curve spec (exact for segments/circles,
+/// sampled+refined for Béziers).
+fn curve_distance_3d(curve: &CurveSpec, p: [f64; 3]) -> f64 {
+    match curve {
+        CurveSpec::Segment { start, end } => {
+            let d = sub(*end, *start);
+            let len2 = dot(d, d);
+            if len2 <= f64::MIN_POSITIVE {
+                return norm(sub(p, *start));
+            }
+            let t = (dot(sub(p, *start), d) / len2).clamp(0.0, 1.0);
+            norm(sub(p, add(*start, scale(d, t))))
+        }
+        CurveSpec::Circle {
+            center,
+            normal,
+            radius,
+        } => {
+            let n = normalized(*normal, 0.0).unwrap_or([0.0, 0.0, 1.0]);
+            let v = sub(p, *center);
+            let h = dot(v, n);
+            let in_plane = sub(v, scale(n, h));
+            let radial = norm(in_plane) - *radius;
+            (h * h + radial * radial).sqrt()
+        }
+        CurveSpec::Bezier { .. } => {
+            min_cost_over_curve(curve, |c| norm(sub(p, c)))
+        }
+    }
+}
+
+/// `(radial, axial)` profile coordinates of `p` about an axis.
+fn rz_of(p: [f64; 3], origin: [f64; 3], axis: [f64; 3]) -> (f64, f64) {
+    let v = sub(p, origin);
+    let z = dot(v, axis);
+    let r = norm(sub(v, scale(axis, z)));
+    (r, z)
+}
+
+/// Distance in `(r, z)` profile space from `p` to the surface of
+/// revolution swept by `curve` (membership test for revolve sides).
+fn curve_rz_distance(
+    curve: &CurveSpec,
+    p: [f64; 3],
+    origin: [f64; 3],
+    axis: [f64; 3],
+) -> f64 {
+    let (rp, zp) = rz_of(p, origin, axis);
+    min_cost_over_curve(curve, |c| {
+        let (rc, zc) = rz_of(c, origin, axis);
+        ((rp - rc).powi(2) + (zp - zc).powi(2)).sqrt()
+    })
+}
+
+impl SweepModel {
+    /// Classify one face (by its boundary samples) against this sweep:
+    /// caps first, then per-source swept sides. `None` = no membership
+    /// (e.g. a chamfer blend face).
+    fn classify(&self, samples: &[[f64; 3]]) -> Option<ProvenancePath> {
+        if samples.is_empty() {
+            return None;
+        }
+        let on_plane = |origin: [f64; 3], normal: [f64; 3]| {
+            samples
+                .iter()
+                .all(|p| dot(sub(*p, origin), normal).abs() <= CLASSIFY_TOL)
+        };
+        match self {
+            SweepModel::Extrusion {
+                outer,
+                holes,
+                plane_origin,
+                plane_normal,
+                direction,
+            } => {
+                if on_plane(*plane_origin, *plane_normal) {
+                    return Some(ProvenancePath::CapStart);
+                }
+                if on_plane(add(*plane_origin, *direction), *plane_normal) {
+                    return Some(ProvenancePath::CapEnd);
+                }
+                let axial = dot(*direction, *plane_normal);
+                if axial.abs() <= f64::MIN_POSITIVE {
+                    return None;
+                }
+                for (curve, source) in
+                    outer.pairs().chain(holes.iter().flat_map(|h| h.pairs()))
+                {
+                    if source == EntityId::INVALID {
+                        continue;
+                    }
+                    let all_on_swept = samples.iter().all(|p| {
+                        // Project along the sweep direction onto the
+                        // profile plane, then test curve membership.
+                        let s = dot(sub(*p, *plane_origin), *plane_normal) / axial;
+                        let projected = sub(*p, scale(*direction, s));
+                        curve_distance_3d(curve, projected) <= CLASSIFY_TOL
+                    });
+                    if all_on_swept {
+                        return Some(ProvenancePath::Side { source });
+                    }
+                }
+                None
+            }
+            SweepModel::Revolve {
+                outer,
+                holes,
+                plane_origin,
+                origin,
+                axis,
+                angle,
+            } => {
+                let closed = angle.abs() >= std::f64::consts::TAU - 1e-9;
+                if !closed {
+                    // Caps are identified by ROTATIONAL POSITION, not by
+                    // plane membership: at angle = π the start and end
+                    // cap planes coincide (and the profile plane contains
+                    // every on-axis sliver face). A cap's samples all sit
+                    // at one rotation angle φ (on-axis samples exempt —
+                    // they belong to every φ).
+                    let radial_ref = sub(*plane_origin, *origin);
+                    let radial_ref =
+                        sub(radial_ref, scale(*axis, dot(radial_ref, *axis)));
+                    if let Some(r0) = normalized(radial_ref, CLASSIFY_TOL) {
+                        let y0 = cross(*axis, r0);
+                        const ANG_EPS: f64 = 1e-6;
+                        let phi_of = |p: &[f64; 3]| -> Option<f64> {
+                            let v = sub(*p, *origin);
+                            let v = sub(v, scale(*axis, dot(v, *axis)));
+                            if norm(v) <= CLASSIFY_TOL {
+                                return None; // on the axis: any φ
+                            }
+                            Some(dot(v, y0).atan2(dot(v, r0)))
+                        };
+                        let all_at = |target: f64| {
+                            let mut off_axis = 0usize;
+                            let ok = samples.iter().all(|p| match phi_of(p) {
+                                None => true,
+                                Some(phi) => {
+                                    off_axis += 1;
+                                    let delta = phi - target;
+                                    delta.sin().abs() <= ANG_EPS
+                                        && delta.cos() > 0.0
+                                }
+                            });
+                            // All-on-axis faces are sliver side faces of
+                            // an on-axis profile edge, never caps.
+                            ok && off_axis > 0
+                        };
+                        if all_at(0.0) {
+                            return Some(ProvenancePath::CapStart);
+                        }
+                        if all_at(*angle) {
+                            return Some(ProvenancePath::CapEnd);
+                        }
+                    }
+                }
+                for (curve, source) in
+                    outer.pairs().chain(holes.iter().flat_map(|h| h.pairs()))
+                {
+                    if source == EntityId::INVALID {
+                        continue;
+                    }
+                    let all_on_swept = samples
+                        .iter()
+                        .all(|p| curve_rz_distance(curve, *p, *origin, *axis) <= CLASSIFY_TOL);
+                    if all_on_swept {
+                        return Some(ProvenancePath::Side { source });
+                    }
+                }
+                None
+            }
+        }
+    }
+}
+
+/// All faces of a solid in boundary/shell iteration order (the order
+/// `provenance` and [`tessellate_faces`] use).
+fn solid_faces(solid: &MtSolid) -> Vec<MtFace> {
+    solid
+        .boundaries()
+        .iter()
+        .flat_map(|shell| shell.face_iter().cloned())
+        .collect()
+}
+
+/// Rebuild the face-provenance vector for `solid` from its sweep model.
+fn classify_solid(solid: &MtSolid, model: &SweepModel) -> Vec<Option<ProvenancePath>> {
+    solid_faces(solid)
+        .iter()
+        .map(|face| model.classify(&face_boundary_samples(face)))
+        .collect()
+}
+
+// ---------------------------------------------------------------------
+// SubRef resolution against a solid's provenance (docs §3.4).
+// ---------------------------------------------------------------------
+
+/// Indices of the faces named `path` (canonical comparison).
+fn faces_with_path(solid: &KernelSolid, path: &ProvenancePath) -> Vec<usize> {
+    let wanted = path.canonical();
+    solid
+        .provenance
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.as_ref().is_some_and(|p| p.canonical() == wanted))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Kernel edges shared between two face-index sets (deduped by edge id).
+fn shared_edges_between(
+    faces: &[MtFace],
+    set_a: &[usize],
+    set_b: &[usize],
+) -> Vec<MtEdge> {
+    let ids_a: std::collections::HashSet<_> = set_a
+        .iter()
+        .filter_map(|i| faces.get(*i))
+        .flat_map(|f| f.boundaries().iter().flat_map(|w| w.edge_iter().map(|e| e.id()).collect::<Vec<_>>()).collect::<Vec<_>>())
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut result = Vec::new();
+    for i in set_b {
+        // A SharedEdge address with identical operands is meaningless;
+        // guard against counting a face's own edges as shared.
+        if set_a.contains(i) {
+            continue;
+        }
+        let Some(face) = faces.get(*i) else { continue };
+        for wire in face.boundaries() {
+            for edge in wire.edge_iter() {
+                if ids_a.contains(&edge.id()) && seen.insert(edge.id()) {
+                    result.push(edge.clone());
+                }
+            }
+        }
+    }
+    result
+}
+
+/// How many faces and edges a provenance path resolves to on `solid`.
+/// Face paths resolve to faces; `SharedEdge` paths resolve to the kernel
+/// edges shared by their two operand face sets. `(0, 0)` = unresolved.
+pub fn match_counts(solid: &KernelSolid, path: &ProvenancePath) -> (usize, usize) {
+    match path.canonical() {
+        ProvenancePath::SharedEdge { a, b } => {
+            let faces = solid_faces(&solid.solid);
+            let set_a = faces_with_path(solid, &a);
+            let set_b = faces_with_path(solid, &b);
+            if set_a.is_empty() || set_b.is_empty() {
+                return (0, 0);
+            }
+            (0, shared_edges_between(&faces, &set_a, &set_b).len())
+        }
+        other => (faces_with_path(solid, &other).len(), 0),
+    }
+}
+
+// ---------------------------------------------------------------------
+// Chamfer (monstertruck-fillet, Chamfer profile — docs §5.2).
+// ---------------------------------------------------------------------
+
+/// Address of solid edges to chamfer. Provenance-based, never an index
+/// (docs/ARCHITECTURE.md §3.4).
+#[derive(Debug, Clone, PartialEq)]
+pub enum EdgeAddress {
+    /// A generated edge: the intersection of two provenance-named faces
+    /// (a `ProvenancePath::SharedEdge`, canonicalized by the caller or
+    /// here).
+    Shared {
+        a: ProvenancePath,
+        b: ProvenancePath,
+    },
+    /// Solid edges geometrically coincident with an authored curve (an
+    /// `Edge` entity's evaluated geometry) — e.g. an extrusion's bottom
+    /// rim segment coincides with its profile edge.
+    Coincident(CurveSpec),
+}
+
+/// Chamfer (flat bevel) the addressed edges of `target` by `distance`
+/// meters. Straight edges between planar faces are the supported class
+/// (docs §5.2); curved-edge failures surface as typed errors. The output
+/// solid's provenance is re-derived: surviving faces keep their upstream
+/// names (anti-topological-naming rule), and each blend face is named by
+/// the `SharedEdge` path of the edge it replaces.
+pub fn chamfer_solid(
+    target: &KernelSolid,
+    addresses: &[EdgeAddress],
+    distance: f64,
+    tol: f64,
+) -> Result<KernelSolid, KernelError> {
+    guard(|| {
+        if distance <= tol {
+            return Err(KernelError::Degenerate(format!(
+                "chamfer distance {distance} m is not positive"
+            )));
+        }
+        if addresses.is_empty() {
+            return Err(KernelError::Degenerate(
+                "chamfer has no edges to blend".to_owned(),
+            ));
+        }
+        let boundaries = target.solid.boundaries();
+        let [shell] = boundaries.as_slice() else {
+            return Err(KernelError::Unsupported(
+                "chamfer supports single-shell solids only (v1)".to_owned(),
+            ));
+        };
+        let faces = solid_faces(&target.solid);
+
+        // Resolve every address to kernel edges, remembering per selected
+        // edge the blend name (the SharedEdge path of the edge) and
+        // sample points (for blend-face attribution afterwards).
+        let mut selected: Vec<MtEdge> = Vec::new();
+        let mut seen_ids = std::collections::HashSet::new();
+        let mut blend_info: Vec<(Option<ProvenancePath>, Vec<[f64; 3]>)> = Vec::new();
+        for address in addresses {
+            let (edges, blend_path) = match address {
+                EdgeAddress::Shared { a, b } => {
+                    let set_a = faces_with_path(target, a);
+                    let set_b = faces_with_path(target, b);
+                    if set_a.is_empty() || set_b.is_empty() {
+                        return Err(KernelError::Unresolved(format!(
+                            "SharedEdge operand resolves to no face \
+                             ({:?} -> {} faces, {:?} -> {} faces)",
+                            a,
+                            set_a.len(),
+                            b,
+                            set_b.len()
+                        )));
+                    }
+                    let edges = shared_edges_between(&faces, &set_a, &set_b);
+                    if edges.is_empty() {
+                        return Err(KernelError::Unresolved(format!(
+                            "faces named {a:?} and {b:?} share no edge"
+                        )));
+                    }
+                    (
+                        edges,
+                        Some(ProvenancePath::shared_edge(a.clone(), b.clone())),
+                    )
+                }
+                EdgeAddress::Coincident(curve) => {
+                    let edges = coincident_edges(shell, curve);
+                    if edges.is_empty() {
+                        return Err(KernelError::Unresolved(
+                            "no solid edge coincides with the authored edge's curve"
+                                .to_owned(),
+                        ));
+                    }
+                    // Blend name: the SharedEdge of the two adjacent
+                    // named faces, when both are named.
+                    let blend =
+                        adjacent_face_paths(&faces, &target.provenance, &edges).map(
+                            |(a, b)| ProvenancePath::shared_edge(a, b),
+                        );
+                    (edges, blend)
+                }
+            };
+            for edge in edges {
+                if seen_ids.insert(edge.id()) {
+                    let samples = edge_samples(&edge);
+                    blend_info.push((blend_path.clone(), samples));
+                    selected.push(edge);
+                }
+            }
+        }
+
+        // Apply the chamfer (flat bevel) via monstertruck-fillet.
+        let mut new_shell: MtShell = shell.clone();
+        let options =
+            FilletOptions::constant(distance).with_profile(FilletProfile::Chamfer);
+        fillet_edges(&mut new_shell, &selected, Some(&options))
+            .map_err(|e| KernelError::Topology(format!("chamfer failed: {e:?}")))?;
+        let solid = MtSolid::try_new(vec![new_shell])
+            .map_err(|e| KernelError::Topology(format!("chamfered shell invalid: {e}")))?;
+
+        // Re-derive provenance: (1) sweep-model membership (surviving and
+        // trimmed faces keep their upstream names), (2) plane match
+        // against the pre-chamfer faces (former blend faces in chamfer
+        // chains), (3) nearest chamfered edge (new blend faces).
+        let out_faces = solid_faces(&solid);
+        let mut provenance: Vec<Option<ProvenancePath>> = match &target.model {
+            Some(model) => classify_solid(&solid, model),
+            None => vec![None; out_faces.len()],
+        };
+        for (index, slot) in provenance.iter_mut().enumerate() {
+            if slot.is_some() {
+                continue;
+            }
+            let Some(face) = out_faces.get(index) else {
+                continue;
+            };
+            let samples = face_boundary_samples(face);
+            if let Some(path) = plane_match(&samples, face, &faces, &target.provenance) {
+                *slot = Some(path);
+                continue;
+            }
+            // Nearest chamfered edge, within the chamfer's reach.
+            let centroid = average(&samples);
+            let mut best: Option<(f64, &Option<ProvenancePath>)> = None;
+            for (path, edge_pts) in &blend_info {
+                let d = edge_pts
+                    .iter()
+                    .map(|p| norm(sub(centroid, *p)))
+                    .fold(f64::INFINITY, f64::min);
+                if best.as_ref().is_none_or(|(bd, _)| d < *bd) {
+                    best = Some((d, path));
+                }
+            }
+            if let Some((d, path)) = best {
+                if d <= distance * 4.0 {
+                    *slot = path.clone();
+                }
+            }
+        }
+
+        Ok(KernelSolid {
+            solid,
+            provenance,
+            model: target.model.clone(),
+        })
+    })
+}
+
+/// Sample points along a kernel edge (endpoints + interior points).
+fn edge_samples(edge: &MtEdge) -> Vec<[f64; 3]> {
+    let mut points = Vec::new();
+    let front = edge.front().point();
+    let back = edge.back().point();
+    points.push([front.x, front.y, front.z]);
+    points.push([back.x, back.y, back.z]);
+    let curve = edge.curve();
+    let (t0, t1) = curve.range_tuple();
+    for f in [0.25, 0.5, 0.75] {
+        let p = curve.subs(t0 + f * (t1 - t0));
+        points.push([p.x, p.y, p.z]);
+    }
+    points
+}
+
+/// Solid edges whose sample points all lie on `curve` (within the
+/// classification tolerance) — authored-edge coincidence matching.
+fn coincident_edges(shell: &MtShell, curve: &CurveSpec) -> Vec<MtEdge> {
+    let mut seen = std::collections::HashSet::new();
+    let mut result = Vec::new();
+    for edge in shell.edge_iter() {
+        if !seen.insert(edge.id()) {
+            continue;
+        }
+        let on_curve = edge_samples(&edge)
+            .iter()
+            .all(|p| curve_distance_3d(curve, *p) <= CLASSIFY_TOL);
+        if on_curve {
+            result.push(edge.clone());
+        }
+    }
+    result
+}
+
+/// The provenance paths of the two faces adjacent to `edges` (used to
+/// name the blend when the edge came from coincidence matching). `None`
+/// unless exactly two distinct named faces are adjacent.
+fn adjacent_face_paths(
+    faces: &[MtFace],
+    provenance: &[Option<ProvenancePath>],
+    edges: &[MtEdge],
+) -> Option<(ProvenancePath, ProvenancePath)> {
+    let first = edges.first()?;
+    let id = first.id();
+    let mut adjacent: Vec<ProvenancePath> = Vec::new();
+    for (index, face) in faces.iter().enumerate() {
+        let touches = face
+            .boundaries()
+            .iter()
+            .any(|w| w.edge_iter().any(|e| e.id() == id));
+        if touches {
+            if let Some(Some(path)) = provenance.get(index) {
+                if !adjacent.contains(path) {
+                    adjacent.push(path.clone());
+                }
+            }
+        }
+    }
+    match adjacent.as_slice() {
+        [a, b] => Some((a.clone(), b.clone())),
+        _ => None,
+    }
+}
+
+/// Match a (planar) face against the pre-operation faces by plane
+/// (normal direction + offset): inherits the name of an unchanged or
+/// trimmed planar face whose plane it shares.
+fn plane_match(
+    samples: &[[f64; 3]],
+    face: &MtFace,
+    previous_faces: &[MtFace],
+    previous_provenance: &[Option<ProvenancePath>],
+) -> Option<ProvenancePath> {
+    let normal = face.oriented_surface().normal(0.5, 0.5);
+    let normal = normalized([normal.x, normal.y, normal.z], 0.0)?;
+    let anchor = *samples.first()?;
+    // Only planar faces participate.
+    if !samples
+        .iter()
+        .all(|p| dot(sub(*p, anchor), normal).abs() <= CLASSIFY_TOL)
+    {
+        return None;
+    }
+    for (index, prev) in previous_faces.iter().enumerate() {
+        let Some(Some(path)) = previous_provenance.get(index) else {
+            continue;
+        };
+        let prev_normal = prev.oriented_surface().normal(0.5, 0.5);
+        let Some(prev_normal) = normalized([prev_normal.x, prev_normal.y, prev_normal.z], 0.0)
+        else {
+            continue;
+        };
+        if cross(normal, prev_normal).iter().map(|c| c.abs()).sum::<f64>() > 1e-9 {
+            continue;
+        }
+        let prev_samples = face_boundary_samples(prev);
+        let Some(prev_anchor) = prev_samples.first() else {
+            continue;
+        };
+        if dot(sub(*prev_anchor, anchor), normal).abs() <= CLASSIFY_TOL {
+            return Some(path.clone());
+        }
+    }
+    None
+}
+
+fn average(points: &[[f64; 3]]) -> [f64; 3] {
+    if points.is_empty() {
+        return [0.0; 3];
+    }
+    let sum = points.iter().fold([0.0; 3], |acc, p| add(acc, *p));
+    scale(sum, 1.0 / points.len() as f64)
 }
 
 /// Expand a kernel polygon mesh into flat position/normal/index buffers,
@@ -685,11 +1502,8 @@ fn flatten_polygon(polygon: &PolygonMesh) -> Result<RawMesh, KernelError> {
             }
         }
     }
-    if indices.is_empty() {
-        return Err(KernelError::Tessellation(
-            "tessellation produced an empty mesh".to_owned(),
-        ));
-    }
+    // Empty meshes are legal here (degenerate sliver faces); callers
+    // needing non-emptiness (whole-solid tessellation) check themselves.
 
     // Fill any missing normals from the geometry of the first triangle
     // that references the vertex.
@@ -758,18 +1572,19 @@ mod tests {
             [0.0, size, z],
             [0.0, 0.0, z],
         ];
-        WireSpec {
-            curves: corners
-                .windows(2)
-                .filter_map(|pair| match pair {
-                    [start, end] => Some(CurveSpec::Segment {
-                        start: *start,
-                        end: *end,
-                    }),
-                    _ => None,
-                })
-                .collect(),
-        }
+        let curves: Vec<CurveSpec> = corners
+            .windows(2)
+            .filter_map(|pair| match pair {
+                [start, end] => Some(CurveSpec::Segment {
+                    start: *start,
+                    end: *end,
+                }),
+                _ => None,
+            })
+            .collect();
+        // Synthetic source ids 101.. so provenance tests can name sides.
+        let sources = (0..curves.len()).map(|i| EntityId(101 + i as u64)).collect();
+        WireSpec::with_sources(curves, sources)
     }
 
     #[test]
@@ -805,26 +1620,124 @@ mod tests {
     #[test]
     fn degenerate_wires_report_not_planar() {
         // Collinear "triangle": zero area, no fittable plane.
-        let wire = WireSpec {
-            curves: vec![
-                CurveSpec::Segment {
-                    start: [0.0, 0.0, 0.0],
-                    end: [1.0, 0.0, 0.0],
-                },
-                CurveSpec::Segment {
-                    start: [1.0, 0.0, 0.0],
-                    end: [2.0, 0.0, 0.0],
-                },
-                CurveSpec::Segment {
-                    start: [2.0, 0.0, 0.0],
-                    end: [0.0, 0.0, 0.0],
-                },
-            ],
-        };
+        let wire = WireSpec::from_curves(vec![
+            CurveSpec::Segment {
+                start: [0.0, 0.0, 0.0],
+                end: [1.0, 0.0, 0.0],
+            },
+            CurveSpec::Segment {
+                start: [1.0, 0.0, 0.0],
+                end: [2.0, 0.0, 0.0],
+            },
+            CurveSpec::Segment {
+                start: [2.0, 0.0, 0.0],
+                end: [0.0, 0.0, 0.0],
+            },
+        ]);
         assert_eq!(
             make_face(&wire, &[], None, 1e-6).err(),
             Some(KernelError::NotPlanar)
         );
+    }
+
+    #[test]
+    fn extrusion_provenance_names_caps_and_sides() {
+        let Ok(face) = make_face(&square_wire(1.0, 0.0), &[], None, 1e-6) else {
+            unreachable!("square face must build");
+        };
+        let Ok(solid) = extrude_solid(&face, [0.0, 0.0, 1.0], 1e-6) else {
+            unreachable!("extrude must succeed");
+        };
+        assert_eq!(solid.face_count(), 6);
+        let paths = solid.face_paths();
+        let caps = paths
+            .iter()
+            .filter(|p| {
+                matches!(
+                    p,
+                    Some(ProvenancePath::CapStart) | Some(ProvenancePath::CapEnd)
+                )
+            })
+            .count();
+        assert_eq!(caps, 2, "one start + one end cap: {paths:?}");
+        // Each synthetic source edge 101..=104 names exactly one side.
+        for source in (101..=104).map(EntityId) {
+            let named = paths
+                .iter()
+                .filter(|p| **p == Some(ProvenancePath::Side { source }))
+                .count();
+            assert_eq!(named, 1, "side for {source:?}: {paths:?}");
+        }
+        // match_counts: faces for face-paths, edges for SharedEdge paths.
+        assert_eq!(
+            match_counts(&solid, &ProvenancePath::CapEnd),
+            (1, 0)
+        );
+        let rim = ProvenancePath::shared_edge(
+            ProvenancePath::CapEnd,
+            ProvenancePath::Side {
+                source: EntityId(101),
+            },
+        );
+        assert_eq!(match_counts(&solid, &rim), (0, 1));
+        // Unresolvable path: source edge id that never existed.
+        assert_eq!(
+            match_counts(
+                &solid,
+                &ProvenancePath::Side {
+                    source: EntityId(999)
+                }
+            ),
+            (0, 0)
+        );
+        // tessellate_faces aligns with the provenance vector.
+        let Ok(meshes) = tessellate_faces(&solid, 1e-3) else {
+            unreachable!("tessellation must succeed");
+        };
+        assert_eq!(meshes.len(), 6);
+        assert!(meshes.iter().all(|m| m.triangle_count() == 2));
+    }
+
+    #[test]
+    fn chamfer_blends_a_rim_edge_and_propagates_provenance() {
+        let Ok(face) = make_face(&square_wire(1.0, 0.0), &[], None, 1e-6) else {
+            unreachable!("square face must build");
+        };
+        let Ok(solid) = extrude_solid(&face, [0.0, 0.0, 1.0], 1e-6) else {
+            unreachable!("extrude must succeed");
+        };
+        let side = ProvenancePath::Side {
+            source: EntityId(101),
+        };
+        let rim = EdgeAddress::Shared {
+            a: ProvenancePath::CapEnd,
+            b: side.clone(),
+        };
+        let Ok(chamfered) = chamfer_solid(&solid, &[rim], 0.1, 1e-6) else {
+            unreachable!("straight-edge chamfer must succeed");
+        };
+        assert_eq!(chamfered.face_count(), 7, "one blend face added");
+        let paths = chamfered.face_paths();
+        // Trimmed faces keep their names.
+        assert!(paths.contains(&Some(ProvenancePath::CapEnd)));
+        assert!(paths.contains(&Some(side.clone())));
+        // The blend face is named by the edge it replaces.
+        let blend = ProvenancePath::shared_edge(ProvenancePath::CapEnd, side);
+        assert!(
+            paths.contains(&Some(blend)),
+            "blend named by its SharedEdge: {paths:?}"
+        );
+        // Unresolvable chamfer address → typed Unresolved error.
+        let bogus = EdgeAddress::Shared {
+            a: ProvenancePath::CapStart,
+            b: ProvenancePath::Side {
+                source: EntityId(999),
+            },
+        };
+        assert!(matches!(
+            chamfer_solid(&solid, &[bogus], 0.1, 1e-6),
+            Err(KernelError::Unresolved(_))
+        ));
     }
 
     #[test]

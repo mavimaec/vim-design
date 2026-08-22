@@ -17,7 +17,8 @@ fn create_revolve_defaults_to_full_turn() {
     assert_eq!(
         record.params,
         Params::Revolve {
-            angle_radians: std::f64::consts::TAU
+            angle_radians: std::f64::consts::TAU,
+            face_materials: vec![]
         }
     );
     assert_eq!(
@@ -25,6 +26,7 @@ fn create_revolve_defaults_to_full_turn() {
         vec![
             SlotValue::One(Some(cone.face)),
             SlotValue::One(Some(cone.axis)),
+            SlotValue::Many(vec![]), // face_materials (sub-face paints)
         ]
     );
     // The revolve is a real dependent of both inputs.
@@ -53,7 +55,8 @@ fn update_revolve_params_and_rewires() {
     assert_eq!(
         doc.entity(cone.revolve).map(|r| r.params.clone()),
         Some(Params::Revolve {
-            angle_radians: std::f64::consts::PI
+            angle_radians: std::f64::consts::PI,
+            face_materials: vec![]
         })
     );
 
@@ -100,7 +103,8 @@ fn update_revolve_params_and_rewires() {
     assert_eq!(
         doc.entity(cone.revolve).map(|r| r.params.clone()),
         Some(Params::Revolve {
-            angle_radians: std::f64::consts::PI
+            angle_radians: std::f64::consts::PI,
+            face_materials: vec![]
         })
     );
 

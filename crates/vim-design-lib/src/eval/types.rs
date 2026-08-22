@@ -83,8 +83,14 @@ pub enum EvalErrorKind {
     /// Tessellation failed (dropped face or empty mesh).
     Tessellation,
     /// The entity kind is not evaluated in this milestone
-    /// (`Selection`, `Chamfer`, `SectionBox`).
+    /// (`Selection`, `SectionBox`).
     NotYetImplemented,
+    /// A provenance-named subelement reference (`SubRef`) did not resolve
+    /// against the owner's current topology — the source edge was
+    /// deleted, a cap vanished on an angle change, the named faces no
+    /// longer share an edge (docs/ARCHITECTURE.md §3.4: never a silent
+    /// re-bind).
+    UnresolvedSubRef,
     /// The wiring is valid but this configuration is not supported yet
     /// (e.g. a spline extrusion path).
     NotYetSupported,
@@ -127,6 +133,18 @@ pub enum EvalState {
         diag: EvalDiag,
         stale_generation: Option<u64>,
     },
+}
+
+/// What a `SubRef` currently resolves to on its owner's evaluated
+/// geometry (counts only — kernel topology never crosses the facade;
+/// face/edge *indices* are an internal detail, docs/ARCHITECTURE.md §3.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubRefResolution {
+    /// A face path resolved to this many BREP faces (a `Side` of a
+    /// full revolve spans several kernel faces; they share one name).
+    Faces(usize),
+    /// A `SharedEdge` path resolved to this many kernel edges.
+    Edges(usize),
 }
 
 // ---------------------------------------------------------------------

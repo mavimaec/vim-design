@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::id::EntityId;
 use crate::selection::{PredicateAst, SelectionScope};
 use crate::status::VimStatus;
+use crate::subref::{ProvenancePath, SubRef};
 
 /// The closed set of entity kinds (docs/ARCHITECTURE.md §3.1).
 #[derive(
@@ -77,14 +78,33 @@ pub enum Params {
         roughness: f64,
     },
     /// Sweep of the profile face input along the path input.
-    Extrusion,
+    ///
+    /// `face_materials` assigns materials to *generated* faces by
+    /// provenance path (docs/ARCHITECTURE.md §3.4) — e.g. paint `CapEnd`
+    /// differently from `Side { source }`. Kept sorted by path; the
+    /// referenced material ids are mirrored in the entity's
+    /// `face_materials` slot so they are real graph edges
+    /// (reject-if-dependents, dirty propagation).
+    Extrusion {
+        face_materials: Vec<(ProvenancePath, EntityId)>,
+    },
     /// Revolution of the profile face input about the axis line input by
     /// `angle_radians` (default 2π = closed solid of revolution; angles
-    /// are radians per docs/ARCHITECTURE.md §7).
-    Revolve { angle_radians: f64 },
-    /// Chamfer of `distance` meters over its edges input (explicit edges
-    /// and/or a `Selection`).
-    Chamfer { distance: f64 },
+    /// are radians per docs/ARCHITECTURE.md §7). `face_materials` as on
+    /// `Extrusion`.
+    Revolve {
+        angle_radians: f64,
+        face_materials: Vec<(ProvenancePath, EntityId)>,
+    },
+    /// Chamfer of `distance` meters over edges of its target solid
+    /// producer. Edges are addressed by `sub_edges` (provenance-named
+    /// `SubRef`s whose owner is the target — docs/ARCHITECTURE.md §3.4)
+    /// and/or by the entity's edges slot (authored `Edge` entities
+    /// matched by curve coincidence, or a `Selection`).
+    Chamfer {
+        distance: f64,
+        sub_edges: Vec<SubRef>,
+    },
     /// Axis-aligned section box (min/max corners in meters). Stays out of
     /// the dependency graph by design (docs/ARCHITECTURE.md §14).
     SectionBox { min: [f64; 3], max: [f64; 3] },
@@ -116,7 +136,7 @@ impl Params {
             Params::Face => EntityKind::Face,
             Params::Solid => EntityKind::Solid,
             Params::Material { .. } => EntityKind::Material,
-            Params::Extrusion => EntityKind::Extrusion,
+            Params::Extrusion { .. } => EntityKind::Extrusion,
             Params::Revolve { .. } => EntityKind::Revolve,
             Params::Chamfer { .. } => EntityKind::Chamfer,
             Params::SectionBox { .. } => EntityKind::SectionBox,
@@ -195,9 +215,12 @@ pub mod slot {
     pub const SOLID_FACES: usize = 0;
     pub const EXTRUSION_PROFILE: usize = 0;
     pub const EXTRUSION_PATH: usize = 1;
+    pub const EXTRUSION_FACE_MATERIALS: usize = 2;
     pub const REVOLVE_PROFILE: usize = 0;
     pub const REVOLVE_AXIS: usize = 1;
-    pub const CHAMFER_EDGES: usize = 0;
+    pub const REVOLVE_FACE_MATERIALS: usize = 2;
+    pub const CHAMFER_TARGET: usize = 0;
+    pub const CHAMFER_EDGES: usize = 1;
     pub const ELEMENT_MEMBERS: usize = 0;
     pub const INSTANCE_ELEMENT: usize = 0;
 }
@@ -292,6 +315,16 @@ const SOLID_SLOTS: &[SlotDecl] = &[SlotDecl {
     multi: true,
 }];
 
+// Mirror of the material ids in `Params::Extrusion::face_materials` /
+// `Params::Revolve::face_materials`: the slot makes the assignments real
+// graph edges (kept in sync by the `UpdateSubFaceMaterial` command).
+const FACE_MATERIALS_SLOT: SlotDecl = SlotDecl {
+    name: "face_materials",
+    accepted: &[EntityKind::Material],
+    required: false,
+    multi: true,
+};
+
 const EXTRUSION_SLOTS: &[SlotDecl] = &[
     SlotDecl {
         name: "profile",
@@ -305,6 +338,7 @@ const EXTRUSION_SLOTS: &[SlotDecl] = &[
         required: true,
         multi: false,
     },
+    FACE_MATERIALS_SLOT,
 ];
 
 const REVOLVE_SLOTS: &[SlotDecl] = &[
@@ -322,16 +356,33 @@ const REVOLVE_SLOTS: &[SlotDecl] = &[
         required: true,
         multi: false,
     },
+    FACE_MATERIALS_SLOT,
 ];
 
-// Chamfer edges accept explicit `Edge` entities OR a `Selection` whose
-// evaluation yields the edge set (docs/ARCHITECTURE.md §3.5).
-const CHAMFER_SLOTS: &[SlotDecl] = &[SlotDecl {
-    name: "edges",
-    accepted: &[EntityKind::Edge, EntityKind::Selection],
-    required: true,
-    multi: true,
-}];
+// Chamfer: slot 0 targets the solid producer whose edges are blended
+// (the chamfer replaces the target as mesh owner — eval layer); slot 1
+// optionally holds authored `Edge` entities (matched by curve
+// coincidence) and/or a `Selection` (docs/ARCHITECTURE.md §3.5).
+// Generated edges are addressed via `Params::Chamfer::sub_edges`.
+const CHAMFER_SLOTS: &[SlotDecl] = &[
+    SlotDecl {
+        name: "target",
+        accepted: &[
+            EntityKind::Extrusion,
+            EntityKind::Revolve,
+            EntityKind::Solid,
+            EntityKind::Chamfer,
+        ],
+        required: true,
+        multi: false,
+    },
+    SlotDecl {
+        name: "edges",
+        accepted: &[EntityKind::Edge, EntityKind::Selection],
+        required: false,
+        multi: true,
+    },
+];
 
 const ELEMENT_SLOTS: &[SlotDecl] = &[SlotDecl {
     name: "members",
@@ -515,7 +566,8 @@ mod tests {
         }));
         assert_eq!(
             Params::Revolve {
-                angle_radians: std::f64::consts::TAU
+                angle_radians: std::f64::consts::TAU,
+                face_materials: vec![]
             }
             .kind(),
             EntityKind::Revolve
@@ -523,12 +575,39 @@ mod tests {
     }
 
     #[test]
-    fn chamfer_edges_accept_edges_and_selections() {
+    fn chamfer_targets_a_producer_and_accepts_edges_and_selections() {
         let decls = slots(EntityKind::Chamfer);
+        let target = decls.get(slot::CHAMFER_TARGET);
+        assert!(target.is_some_and(|d| {
+            !d.multi
+                && d.required
+                && d.accepts(EntityKind::Extrusion)
+                && d.accepts(EntityKind::Revolve)
+                && d.accepts(EntityKind::Solid)
+                && d.accepts(EntityKind::Chamfer)
+        }));
         let edges = decls.get(slot::CHAMFER_EDGES);
         assert!(edges.is_some_and(|d| {
-            d.multi && d.accepts(EntityKind::Edge) && d.accepts(EntityKind::Selection)
+            d.multi
+                && !d.required
+                && d.accepts(EntityKind::Edge)
+                && d.accepts(EntityKind::Selection)
         }));
+    }
+
+    #[test]
+    fn sweep_producers_have_a_face_materials_slot() {
+        for kind in [EntityKind::Extrusion, EntityKind::Revolve] {
+            let idx = if kind == EntityKind::Extrusion {
+                slot::EXTRUSION_FACE_MATERIALS
+            } else {
+                slot::REVOLVE_FACE_MATERIALS
+            };
+            let decl = slots(kind).get(idx);
+            assert!(decl.is_some_and(|d| {
+                d.multi && !d.required && d.accepts(EntityKind::Material)
+            }));
+        }
     }
 
     #[test]
@@ -540,6 +619,12 @@ mod tests {
             .kind(),
             EntityKind::ControlPoint
         );
-        assert_eq!(Params::Extrusion.kind(), EntityKind::Extrusion);
+        assert_eq!(
+            Params::Extrusion {
+                face_materials: vec![]
+            }
+            .kind(),
+            EntityKind::Extrusion
+        );
     }
 }
