@@ -79,6 +79,14 @@
 //! owner with no instances (all standalone solids, and elements the user
 //! has not instanced) is drawn once at identity.
 //!
+//! `Site` and `Level` entities are **never mesh owners and never
+//! tessellated** (docs/AUTHORING.md §§1–2): a level evaluates to a
+//! construction-plane [`Evaluated::Frame`], and its translucent display
+//! square is a renderer overlay the app draws directly from
+//! `Params::Level` (elevation, color, extent) — model/view separation, a
+//! level has no volume. An element's `level` association slot is
+//! data-only: rewiring it re-delivers a byte-identical mesh.
+//!
 //! # Provenance naming & SubRefs (docs/ARCHITECTURE.md §3.4)
 //!
 //! Extrusion/revolve evaluators name their generated faces by the stable

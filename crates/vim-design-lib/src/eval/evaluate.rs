@@ -229,10 +229,51 @@ pub(crate) fn evaluate_entity(
 ) -> Result<Evaluated, EvalDiag> {
     let tol = settings.kernel_tolerance;
     match record.kind() {
-        EntityKind::ControlPoint => match &record.params {
-            Params::ControlPoint { position } => Ok(Evaluated::Point(*position)),
-            _ => Err(params_mismatch(record)),
-        },
+        EntityKind::ControlPoint => {
+            let position = match &record.params {
+                Params::ControlPoint { position } => *position,
+                _ => return Err(params_mismatch(record)),
+            };
+            match single_id(record, slot::CONTROL_POINT_PLANE) {
+                // Unattached: stored coordinates ARE world coordinates.
+                None => Ok(Evaluated::Point(position)),
+                // Attached: stored coordinates are (u, v, w) in the
+                // construction plane's frame (docs/AUTHORING.md §3).
+                Some(plane_id) => {
+                    match require(lookup, Some(plane_id), "plane")? {
+                        Evaluated::Frame {
+                            origin,
+                            x_axis,
+                            y_axis,
+                            z_axis,
+                        } => {
+                            let [u, v, w] = position;
+                            let world = [
+                                origin[0]
+                                    + u * x_axis[0]
+                                    + v * y_axis[0]
+                                    + w * z_axis[0],
+                                origin[1]
+                                    + u * x_axis[1]
+                                    + v * y_axis[1]
+                                    + w * z_axis[1],
+                                origin[2]
+                                    + u * x_axis[2]
+                                    + v * y_axis[2]
+                                    + w * z_axis[2],
+                            ];
+                            Ok(Evaluated::Point(world))
+                        }
+                        other => Err(diag(
+                            EvalErrorKind::UpstreamError,
+                            format!(
+                                "plane input evaluated to {other:?}, expected a frame"
+                            ),
+                        )),
+                    }
+                }
+            }
+        }
         EntityKind::Plane => match &record.params {
             Params::Plane { origin, normal } => {
                 let unit = kernel::normalized(*normal, tol).ok_or_else(|| {
@@ -647,6 +688,25 @@ pub(crate) fn evaluate_entity(
             EvalErrorKind::NotYetImplemented,
             "SectionBox evaluation is not implemented in this milestone",
         )),
+        // Geolocation metadata: pass-through marker, never geometry.
+        EntityKind::Site => match &record.params {
+            Params::Site { .. } => Ok(Evaluated::Site),
+            _ => Err(params_mismatch(record)),
+        },
+        // A level IS a construction plane (docs/AUTHORING.md §§2–3):
+        // frame at (0, 0, elevation) with world axes — the trivially
+        // deterministic basis (basis-stability rule). Display square
+        // color/extent are renderer overlay inputs, not geometry: levels
+        // are never tessellated and never own meshes.
+        EntityKind::Level => match &record.params {
+            Params::Level { elevation_m, .. } => Ok(Evaluated::Frame {
+                origin: [0.0, 0.0, *elevation_m],
+                x_axis: [1.0, 0.0, 0.0],
+                y_axis: [0.0, 1.0, 0.0],
+                z_axis: [0.0, 0.0, 1.0],
+            }),
+            _ => Err(params_mismatch(record)),
+        },
     }
 }
 
@@ -844,7 +904,7 @@ mod tests {
             EntityRecord {
                 id: EntityId(1),
                 params: Params::ControlPoint { position: [0.0; 3] },
-                inputs: vec![],
+                inputs: vec![SlotValue::One(None)],
             },
         );
         records.insert(
@@ -852,7 +912,7 @@ mod tests {
             EntityRecord {
                 id: EntityId(2),
                 params: Params::ControlPoint { position: [1.0, 0.0, 0.0] },
-                inputs: vec![],
+                inputs: vec![SlotValue::One(None)],
             },
         );
         records.insert(

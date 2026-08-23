@@ -281,7 +281,7 @@ mod tests {
             params: Params::ControlPoint {
                 position: [0.0, 0.0, 0.0],
             },
-            inputs: vec![],
+            inputs: vec![SlotValue::One(None)], // unattached plane slot
         }
     }
 

@@ -53,6 +53,12 @@ The API lets the caller submit undoable commands similar to the following set:
 - "CreateInstance" (places an Element in the scene at a transform; many instances share one element's evaluated geometry)
 - "UpdateInstance"
 - "DeleteInstance"
+- "CreateSite" (singleton geolocation: latitude/longitude/elevation/true-north mapping the scene origin to Earth)
+- "UpdateSite"
+- "DeleteSite"
+- "CreateLevel" (named elevation, IsBuildingStory flag, display color/extent; usable as a construction plane)
+- "UpdateLevel"
+- "DeleteLevel" (rejected while dependents exist; cascade form deletes level + associated elements as one undo group)
 
 A "VimDesign" object accumulates the state of the entities as commands are submitted. Multiple "VimDesign" objects may be created. A "VimDesign" object contains:
 - The command stack allowing the caller to "UndoCommand" or "RedoCommand".

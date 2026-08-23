@@ -39,6 +39,23 @@ pub enum Command {
         position: [f64; 3],
         coalesce: bool,
     },
+    /// Attach (`plane: Some(level)`) or detach (`plane: None`) a control
+    /// point to a construction plane, optionally rewriting its stored
+    /// coordinates in the same atomic step. When attached, the stored
+    /// coordinates are interpreted as (u, v, w) in the plane's evaluated
+    /// Frame (docs/AUTHORING.md §3). The world-position-preserving
+    /// conversion is explicitly NOT the library's job: the intent layer
+    /// computes the equivalent coordinates and passes them as
+    /// `position` so the rewire + rewrite land as one undoable command
+    /// and the geometry does not jump.
+    UpdateControlPointPlane {
+        id: EntityId,
+        plane: Option<EntityId>,
+        /// Simultaneous coordinate rewrite (world coords when detaching,
+        /// (u,v,w) frame coords when attaching); `None` keeps the stored
+        /// values untouched.
+        position: Option<[f64; 3]>,
+    },
     DeleteControlPoint {
         id: EntityId,
     },
@@ -326,6 +343,67 @@ pub enum Command {
     DeleteSelection {
         id: EntityId,
     },
+    // -- Site (docs/AUTHORING.md §1) --------------------------------------
+    /// Create the document's singleton geolocation record. Rejected with
+    /// `SingletonExists` if a Site already exists (enforced at the delta
+    /// gate, so composites cannot smuggle one in). The library provides
+    /// no defaults — seeding (e.g. Montreal) is the application's job.
+    CreateSite {
+        latitude_deg: f64,
+        longitude_deg: f64,
+        elevation_m: f64,
+        true_north_deg: f64,
+    },
+    UpdateSite {
+        id: EntityId,
+        latitude_deg: Option<f64>,
+        longitude_deg: Option<f64>,
+        elevation_m: Option<f64>,
+        true_north_deg: Option<f64>,
+        coalesce: bool,
+    },
+    DeleteSite {
+        id: EntityId,
+    },
+    // -- Level (docs/AUTHORING.md §§2–3) ------------------------------------
+    CreateLevel {
+        name: String,
+        elevation_m: f64,
+        is_building_story: bool,
+        color: [f32; 4],
+        extent_m: f64,
+    },
+    UpdateLevel {
+        id: EntityId,
+        name: Option<String>,
+        elevation_m: Option<f64>,
+        is_building_story: Option<bool>,
+        color: Option<[f32; 4]>,
+        extent_m: Option<f64>,
+        coalesce: bool,
+    },
+    /// Delete a level. With `cascade: false` this is the standard
+    /// reject-if-dependents delete. With `cascade: true` it expands at
+    /// compile time to a leaf-first delete of the level's full
+    /// TRANSITIVE dependent closure (attached control points and
+    /// everything downstream of them; associated elements and their
+    /// instances) plus the level itself — ONE undo group, so undoing a
+    /// confirmed level deletion restores everything atomically
+    /// (docs/AUTHORING.md §2). Inputs of deleted entities that are not
+    /// themselves dependents of the level (e.g. an associated element's
+    /// member solids) are NOT deleted.
+    DeleteLevel {
+        id: EntityId,
+        cascade: bool,
+    },
+    /// Associate (`level: Some(l)`) or dissociate (`level: None`) an
+    /// element with a level. Data-only (docs/AUTHORING.md §4): zero
+    /// geometric effect — re-evaluation after this rewire produces
+    /// byte-identical meshes.
+    UpdateElementLevel {
+        element: EntityId,
+        level: Option<EntityId>,
+    },
     // -- Composites (docs/ARCHITECTURE.md §4.2) --------------------------
     /// Vertical cylinder at `center`: expands to control points, circle,
     /// edge, face, line path, and extrusion — one undo step.
@@ -364,6 +442,7 @@ impl Command {
         match self {
             Command::CreateControlPoint { .. } => "CreateControlPoint",
             Command::UpdateControlPoint { .. } => "UpdateControlPoint",
+            Command::UpdateControlPointPlane { .. } => "UpdateControlPointPlane",
             Command::DeleteControlPoint { .. } => "DeleteControlPoint",
             Command::CreatePlane { .. } => "CreatePlane",
             Command::UpdatePlane { .. } => "UpdatePlane",
@@ -416,6 +495,13 @@ impl Command {
             Command::CreateSelection { .. } => "CreateSelection",
             Command::UpdateSelection { .. } => "UpdateSelection",
             Command::DeleteSelection { .. } => "DeleteSelection",
+            Command::CreateSite { .. } => "CreateSite",
+            Command::UpdateSite { .. } => "UpdateSite",
+            Command::DeleteSite { .. } => "DeleteSite",
+            Command::CreateLevel { .. } => "CreateLevel",
+            Command::UpdateLevel { .. } => "UpdateLevel",
+            Command::DeleteLevel { .. } => "DeleteLevel",
+            Command::UpdateElementLevel { .. } => "UpdateElementLevel",
             Command::CreateCylinder { .. } => "CreateCylinder",
             Command::UpdateCylinder { .. } => "UpdateCylinder",
             Command::DeleteCylinder { .. } => "DeleteCylinder",
@@ -444,7 +530,9 @@ impl Command {
             | Command::UpdateSectionBox { id, coalesce, .. }
             | Command::UpdateElement { id, coalesce, .. }
             | Command::UpdateInstance { id, coalesce, .. }
-            | Command::UpdateSelection { id, coalesce, .. } => (*coalesce, *id),
+            | Command::UpdateSelection { id, coalesce, .. }
+            | Command::UpdateSite { id, coalesce, .. }
+            | Command::UpdateLevel { id, coalesce, .. } => (*coalesce, *id),
             Command::UpdateCylinder {
                 extrusion, coalesce, ..
             } => (*coalesce, *extrusion),
@@ -593,12 +681,23 @@ fn run(ctx: &mut Ctx<'_>, command: &Command) -> Result<(), VimStatus> {
     match command {
         // -- ControlPoint ------------------------------------------------
         Command::CreateControlPoint { position } => {
-            ctx.create(Params::ControlPoint { position: *position }, vec![])?;
+            ctx.create(
+                Params::ControlPoint { position: *position },
+                vec![SlotValue::One(None)], // plane: unattached (world coords)
+            )?;
             Ok(())
         }
         Command::UpdateControlPoint { id, position, .. } => {
             ctx.expect_kind(*id, EntityKind::ControlPoint)?;
             ctx.set_params(*id, Params::ControlPoint { position: *position })
+        }
+        Command::UpdateControlPointPlane { id, plane, position } => {
+            ctx.expect_kind(*id, EntityKind::ControlPoint)?;
+            ctx.rewire(*id, slot::CONTROL_POINT_PLANE, SlotValue::One(*plane))?;
+            if let Some(position) = position {
+                ctx.set_params(*id, Params::ControlPoint { position: *position })?;
+            }
+            Ok(())
         }
         Command::DeleteControlPoint { id } => ctx.delete(*id, EntityKind::ControlPoint),
 
@@ -1051,7 +1150,10 @@ fn run(ctx: &mut Ctx<'_>, command: &Command) -> Result<(), VimStatus> {
         Command::CreateElement { name, members } => {
             ctx.create(
                 Params::Element { name: name.clone() },
-                vec![SlotValue::Many(members.clone())],
+                vec![
+                    SlotValue::Many(members.clone()),
+                    SlotValue::One(None), // level association (data-only)
+                ],
             )?;
             Ok(())
         }
@@ -1156,6 +1258,117 @@ fn run(ctx: &mut Ctx<'_>, command: &Command) -> Result<(), VimStatus> {
             )
         }
         Command::DeleteSelection { id } => ctx.delete(*id, EntityKind::Selection),
+
+        // -- Site ----------------------------------------------------------
+        Command::CreateSite {
+            latitude_deg,
+            longitude_deg,
+            elevation_m,
+            true_north_deg,
+        } => {
+            // The singleton rule is enforced by the Insert delta itself
+            // (SingletonExists), covering composites and speculative
+            // apply with the same check.
+            ctx.create(
+                Params::Site {
+                    latitude_deg: *latitude_deg,
+                    longitude_deg: *longitude_deg,
+                    elevation_m: *elevation_m,
+                    true_north_deg: *true_north_deg,
+                },
+                vec![],
+            )?;
+            Ok(())
+        }
+        Command::UpdateSite {
+            id,
+            latitude_deg,
+            longitude_deg,
+            elevation_m,
+            true_north_deg,
+            ..
+        } => {
+            let record = ctx.expect_kind(*id, EntityKind::Site)?;
+            let (old_lat, old_lon, old_elev, old_north) = match record.params {
+                Params::Site {
+                    latitude_deg,
+                    longitude_deg,
+                    elevation_m,
+                    true_north_deg,
+                } => (latitude_deg, longitude_deg, elevation_m, true_north_deg),
+                _ => return Err(VimStatus::ParamsKindMismatch),
+            };
+            ctx.set_params(
+                *id,
+                Params::Site {
+                    latitude_deg: latitude_deg.unwrap_or(old_lat),
+                    longitude_deg: longitude_deg.unwrap_or(old_lon),
+                    elevation_m: elevation_m.unwrap_or(old_elev),
+                    true_north_deg: true_north_deg.unwrap_or(old_north),
+                },
+            )
+        }
+        Command::DeleteSite { id } => ctx.delete(*id, EntityKind::Site),
+
+        // -- Level ---------------------------------------------------------
+        Command::CreateLevel {
+            name,
+            elevation_m,
+            is_building_story,
+            color,
+            extent_m,
+        } => {
+            ctx.create(
+                Params::Level {
+                    name: name.clone(),
+                    elevation_m: *elevation_m,
+                    is_building_story: *is_building_story,
+                    color: *color,
+                    extent_m: *extent_m,
+                },
+                vec![],
+            )?;
+            Ok(())
+        }
+        Command::UpdateLevel {
+            id,
+            name,
+            elevation_m,
+            is_building_story,
+            color,
+            extent_m,
+            ..
+        } => {
+            let record = ctx.expect_kind(*id, EntityKind::Level)?;
+            let params = match record.params {
+                Params::Level {
+                    name: old_name,
+                    elevation_m: old_elev,
+                    is_building_story: old_story,
+                    color: old_color,
+                    extent_m: old_extent,
+                } => Params::Level {
+                    name: name.clone().unwrap_or(old_name),
+                    elevation_m: elevation_m.unwrap_or(old_elev),
+                    is_building_story: is_building_story.unwrap_or(old_story),
+                    color: color.unwrap_or(old_color),
+                    extent_m: extent_m.unwrap_or(old_extent),
+                },
+                _ => return Err(VimStatus::ParamsKindMismatch),
+            };
+            ctx.set_params(*id, params)
+        }
+        Command::DeleteLevel { id, cascade } => {
+            if *cascade {
+                delete_level_cascade(ctx, *id)
+            } else {
+                ctx.delete(*id, EntityKind::Level)
+            }
+        }
+        Command::UpdateElementLevel { element, level } => {
+            ctx.expect_kind(*element, EntityKind::Element)?;
+            ctx.rewire(*element, slot::ELEMENT_LEVEL, SlotValue::One(*level))
+        }
 
         // -- Composites -----------------------------------------------------
         Command::CreateCylinder {
@@ -1302,12 +1515,15 @@ fn create_cylinder(
     height: f64,
 ) -> Result<(), VimStatus> {
     let [cx, cy, cz] = center;
-    let center_cp = ctx.create(Params::ControlPoint { position: center }, vec![])?;
+    let center_cp = ctx.create(
+        Params::ControlPoint { position: center },
+        vec![SlotValue::One(None)],
+    )?;
     let top_cp = ctx.create(
         Params::ControlPoint {
             position: [cx, cy, cz + height],
         },
-        vec![],
+        vec![SlotValue::One(None)],
     )?;
     let circle = ctx.create(
         Params::Circle { radius },
@@ -1434,6 +1650,33 @@ fn update_cylinder(
 /// Delete the cylinder subgraph leaf-first as one transaction. Any
 /// external dependent on any constituent rejects the whole composite
 /// (with full rollback of the already-removed constituents).
+/// Cascade form of DeleteLevel (docs/AUTHORING.md §2): delete the
+/// level's full transitive dependent closure leaf-first, then the level
+/// itself, as one transaction. Every dependent of a closure member is
+/// itself in the closure (the closure is transitive downstream), so the
+/// leaf-first sweep always terminates; a non-progressing pass would be a
+/// substrate bug and rejects cleanly.
+fn delete_level_cascade(ctx: &mut Ctx<'_>, level: EntityId) -> Result<(), VimStatus> {
+    ctx.expect_kind(level, EntityKind::Level)?;
+    let mut remaining = ctx.doc.graph_ref().dirty_closure([level]);
+    while !remaining.is_empty() {
+        let deletable: Vec<EntityId> = remaining
+            .iter()
+            .filter(|id| !ctx.doc.graph_ref().has_dependents(**id))
+            .copied()
+            .collect();
+        if deletable.is_empty() {
+            return Err(VimStatus::InvalidCommand);
+        }
+        for id in deletable {
+            let record = ctx.record(id)?;
+            ctx.apply(Delta::Remove { id, record })?;
+            remaining.remove(&id);
+        }
+    }
+    Ok(())
+}
+
 fn delete_cylinder(ctx: &mut Ctx<'_>, extrusion: EntityId) -> Result<(), VimStatus> {
     let shape = resolve_cylinder(ctx, extrusion)?;
     ctx.delete(shape.extrusion, EntityKind::Extrusion)?;

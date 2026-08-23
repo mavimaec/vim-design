@@ -51,6 +51,10 @@ pub enum VimStatus {
     InvalidCommand = 19,
     /// Internal serialization failure (should not occur; never a panic).
     SerializationFailed = 20,
+    /// Creating a second instance of a singleton entity kind (`Site`) —
+    /// enforced at the delta gate, so composites and speculative apply
+    /// cannot smuggle one in (docs/AUTHORING.md §1).
+    SingletonExists = 21,
 }
 
 impl VimStatus {

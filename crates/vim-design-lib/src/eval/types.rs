@@ -54,6 +54,24 @@ pub enum Evaluated {
         /// Rigid row-major 4x3 transform (see `Params::Instance`).
         transform: [f64; 12],
     },
+    /// Marker for the singleton geolocation record (the metadata lives
+    /// in `Params::Site`; readers query the document). Produced by
+    /// `Site`. Never geometry, never a mesh owner.
+    Site,
+    /// A construction-plane frame: origin plus a right-handed
+    /// orthonormal basis (docs/AUTHORING.md §3). Produced by `Level`
+    /// (origin `(0, 0, elevation_m)`, axes = world X/Y/Z) and, later, by
+    /// `FaceFrame`-style kinds. The basis is always a deterministic
+    /// function of stable inputs (the basis-stability rule — the frame
+    /// analog of provenance naming): it must never depend on kernel
+    /// output order or float noise, so attached sketches never flip or
+    /// spin. Never tessellated; levels render as app-side overlays.
+    Frame {
+        origin: [f64; 3],
+        x_axis: [f64; 3],
+        y_axis: [f64; 3],
+        z_axis: [f64; 3],
+    },
 }
 
 // ---------------------------------------------------------------------

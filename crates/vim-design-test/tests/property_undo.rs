@@ -21,6 +21,14 @@ enum Op {
     UpdateCp { pick: usize, x: i16, coalesce: bool },
     DeleteAny(usize),
     CreateCylinder { x: i16, r: u8, h: u8 },
+    // Authoring kinds (docs/AUTHORING.md): the Site singleton (duplicate
+    // creates reject — that's the point), levels, plane attachment, and
+    // the cascade delete (a whole command group to invert).
+    CreateSite(i16),
+    CreateLevel(i16),
+    UpdateLevelElevation { pick: usize, elevation: i16, coalesce: bool },
+    AttachCp { cp: usize, level: usize, detach: bool },
+    DeleteLevelCascade(usize),
 }
 
 fn op_strategy() -> impl Strategy<Value = Op> {
@@ -37,6 +45,17 @@ fn op_strategy() -> impl Strategy<Value = Op> {
         2 => any::<usize>().prop_map(Op::DeleteAny),
         1 => (any::<i16>(), 1u8..200, 1u8..200)
             .prop_map(|(x, r, h)| Op::CreateCylinder { x, r, h }),
+        1 => any::<i16>().prop_map(Op::CreateSite),
+        2 => any::<i16>().prop_map(Op::CreateLevel),
+        2 => (any::<usize>(), any::<i16>(), any::<bool>())
+            .prop_map(|(pick, elevation, coalesce)| Op::UpdateLevelElevation {
+                pick,
+                elevation,
+                coalesce,
+            }),
+        2 => (any::<usize>(), any::<usize>(), any::<bool>())
+            .prop_map(|(cp, level, detach)| Op::AttachCp { cp, level, detach }),
+        1 => any::<usize>().prop_map(Op::DeleteLevelCascade),
     ]
 }
 
@@ -148,6 +167,57 @@ fn run_op(doc: &mut Document, op: &Op) {
             radius: f64::from(*r) * 0.01,
             height: f64::from(*h) * 0.05,
         },
+        // May be rejected with SingletonExists after the first — the
+        // rejection path must be a byte-exact no-op like any other.
+        Op::CreateSite(lat) => Command::CreateSite {
+            latitude_deg: f64::from(*lat) * 0.001,
+            longitude_deg: -73.5674,
+            elevation_m: 36.0,
+            true_north_deg: 0.0,
+        },
+        Op::CreateLevel(elev) => Command::CreateLevel {
+            name: format!("L{elev}"),
+            elevation_m: f64::from(*elev) * 0.01,
+            is_building_story: true,
+            color: [0.2, 0.5, 0.9, 0.35],
+            extent_m: 10.0,
+        },
+        Op::UpdateLevelElevation { pick: p, elevation, coalesce } => {
+            let levels = ids_of_kind(doc, EntityKind::Level);
+            match pick(&levels, *p) {
+                Some(id) => Command::UpdateLevel {
+                    id,
+                    name: None,
+                    elevation_m: Some(f64::from(*elevation) * 0.01),
+                    is_building_story: None,
+                    color: None,
+                    extent_m: None,
+                    coalesce: *coalesce,
+                },
+                None => fallback,
+            }
+        }
+        Op::AttachCp { cp, level, detach } => {
+            let cps = ids_of_kind(doc, EntityKind::ControlPoint);
+            let levels = ids_of_kind(doc, EntityKind::Level);
+            match (pick(&cps, *cp), pick(&levels, *level)) {
+                (Some(id), Some(plane)) => Command::UpdateControlPointPlane {
+                    id,
+                    plane: if *detach { None } else { Some(plane) },
+                    position: None,
+                },
+                _ => fallback,
+            }
+        }
+        // Deletes the whole dependent closure as ONE undo group — the
+        // heaviest mechanical-inversion stress in the suite.
+        Op::DeleteLevelCascade(i) => {
+            let levels = ids_of_kind(doc, EntityKind::Level);
+            match pick(&levels, *i) {
+                Some(id) => Command::DeleteLevel { id, cascade: true },
+                None => fallback,
+            }
+        }
     };
     // Rejections allowed; successes and rejections must both keep the
     // document consistent (checked by the properties below).

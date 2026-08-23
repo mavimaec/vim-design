@@ -136,6 +136,17 @@ fn apply_delta_inner(graph: &mut GraphState, delta: &Delta) -> Result<(), VimSta
             if graph.contains(*id) {
                 return Err(VimStatus::DuplicateEntityId);
             }
+            // Singleton gate (docs/AUTHORING.md §1): enforced at the
+            // delta level, so commands, composites, speculative apply,
+            // undo, and redo all hit the same check. Undo of a delete
+            // re-inserts fine — the original is gone by then.
+            if record.kind() == crate::entity::EntityKind::Site
+                && graph.iter().any(|(_, r)| {
+                    r.kind() == crate::entity::EntityKind::Site
+                })
+            {
+                return Err(VimStatus::SingletonExists);
+            }
             record.validate_shape()?;
             // References must exist with accepted kinds. A brand-new node
             // cannot create a cycle: it has no dependents yet and cannot
@@ -223,7 +234,7 @@ mod tests {
             params: Params::ControlPoint {
                 position: [0.0, 0.0, z],
             },
-            inputs: vec![],
+            inputs: vec![SlotValue::One(None)], // unattached plane slot
         }
     }
 

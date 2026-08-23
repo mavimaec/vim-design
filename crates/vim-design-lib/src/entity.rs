@@ -35,6 +35,10 @@ pub enum EntityKind {
     Element,
     Instance,
     Selection,
+    /// Singleton geolocation metadata (docs/AUTHORING.md §1).
+    Site,
+    /// Named elevation / construction plane (docs/AUTHORING.md §§2–3).
+    Level,
 }
 
 /// Per-kind parameters — a closed serde enum with one variant per
@@ -125,6 +129,32 @@ pub enum Params {
         scope: SelectionScope,
         frozen: bool,
     },
+    /// Singleton geolocation metadata mapping the single scene origin to
+    /// Earth (docs/AUTHORING.md §1). Modeling never happens in
+    /// geographic coordinates; angles in degrees here are metadata, not
+    /// geometry. Defaults (e.g. Montreal) are the application's job.
+    Site {
+        latitude_deg: f64,
+        longitude_deg: f64,
+        elevation_m: f64,
+        /// Bearing of +Y, for future sun studies.
+        true_north_deg: f64,
+    },
+    /// A named elevation that doubles as a construction plane
+    /// (docs/AUTHORING.md §2): evaluates to a Frame at
+    /// `(0, 0, elevation_m)` with world axes. `color`/`extent_m` drive
+    /// the renderer's translucent-square overlay only — a level is never
+    /// tessellated and owns no mesh. Ordering is always derived from
+    /// elevation, never stored.
+    Level {
+        name: String,
+        elevation_m: f64,
+        /// True ⇒ a floor a person can stand on (schedules/filtering).
+        is_building_story: bool,
+        color: [f32; 4],
+        /// Half-size of the display square (meters).
+        extent_m: f64,
+    },
 }
 
 impl Params {
@@ -148,6 +178,8 @@ impl Params {
             Params::Element { .. } => EntityKind::Element,
             Params::Instance { .. } => EntityKind::Instance,
             Params::Selection { .. } => EntityKind::Selection,
+            Params::Site { .. } => EntityKind::Site,
+            Params::Level { .. } => EntityKind::Level,
         }
     }
 }
@@ -206,6 +238,7 @@ impl SlotDecl {
 /// Well-known slot indices, kept next to the tables below so command
 /// compilation never uses bare numbers.
 pub mod slot {
+    pub const CONTROL_POINT_PLANE: usize = 0;
     pub const CIRCLE_CENTER: usize = 0;
     pub const CIRCLE_PLANE: usize = 1;
     pub const LINE_START: usize = 0;
@@ -227,10 +260,24 @@ pub mod slot {
     pub const CHAMFER_TARGET: usize = 0;
     pub const CHAMFER_EDGES: usize = 1;
     pub const ELEMENT_MEMBERS: usize = 0;
+    pub const ELEMENT_LEVEL: usize = 1;
     pub const INSTANCE_ELEMENT: usize = 0;
 }
 
 const NO_SLOTS: &[SlotDecl] = &[];
+
+// A control point may attach to a construction plane: its stored
+// coordinates are then (u, v, w) in the plane's evaluated Frame
+// (docs/AUTHORING.md §3). The accepted-kinds list is the extension
+// point: future Frame-producing kinds (`FaceFrame`, ...) are APPENDED
+// here — existing documents keep validating because acceptance only
+// widens.
+const CONTROL_POINT_SLOTS: &[SlotDecl] = &[SlotDecl {
+    name: "plane",
+    accepted: &[EntityKind::Level],
+    required: false,
+    multi: false,
+}];
 
 const CIRCLE_SLOTS: &[SlotDecl] = &[
     SlotDecl {
@@ -389,17 +436,28 @@ const CHAMFER_SLOTS: &[SlotDecl] = &[
     },
 ];
 
-const ELEMENT_SLOTS: &[SlotDecl] = &[SlotDecl {
-    name: "members",
-    accepted: &[
-        EntityKind::Solid,
-        EntityKind::Extrusion,
-        EntityKind::Revolve,
-        EntityKind::Chamfer,
-    ],
-    required: true,
-    multi: true,
-}];
+const ELEMENT_SLOTS: &[SlotDecl] = &[
+    SlotDecl {
+        name: "members",
+        accepted: &[
+            EntityKind::Solid,
+            EntityKind::Extrusion,
+            EntityKind::Revolve,
+            EntityKind::Chamfer,
+        ],
+        required: true,
+        multi: true,
+    },
+    // Association, not attachment (docs/AUTHORING.md §4): data-only
+    // ("this wall belongs to Level 2") for organization and the deletion
+    // cascade. Zero geometric effect — the element evaluator ignores it.
+    SlotDecl {
+        name: "level",
+        accepted: &[EntityKind::Level],
+        required: false,
+        multi: false,
+    },
+];
 
 const INSTANCE_SLOTS: &[SlotDecl] = &[SlotDecl {
     name: "element",
@@ -412,11 +470,13 @@ const INSTANCE_SLOTS: &[SlotDecl] = &[SlotDecl {
 /// for structural validation (docs/ARCHITECTURE.md §3.2).
 pub fn slots(kind: EntityKind) -> &'static [SlotDecl] {
     match kind {
-        EntityKind::ControlPoint
-        | EntityKind::Plane
+        EntityKind::Plane
         | EntityKind::Material
         | EntityKind::SectionBox
-        | EntityKind::Selection => NO_SLOTS,
+        | EntityKind::Selection
+        | EntityKind::Site
+        | EntityKind::Level => NO_SLOTS,
+        EntityKind::ControlPoint => CONTROL_POINT_SLOTS,
         EntityKind::Circle => CIRCLE_SLOTS,
         EntityKind::Line => LINE_SLOTS,
         EntityKind::Spline => SPLINE_SLOTS,
@@ -517,6 +577,8 @@ mod tests {
         EntityKind::Element,
         EntityKind::Instance,
         EntityKind::Selection,
+        EntityKind::Site,
+        EntityKind::Level,
     ];
 
     #[test]

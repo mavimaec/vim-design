@@ -75,6 +75,18 @@ two kinds implied by the instancing requirement:
   to entities and/or subelements matching a predicate, wireable into other entities'
   slots (§3.5).
 
+Plus two kinds from the authoring-tool direction (2026-08-23, see
+[AUTHORING.md](AUTHORING.md) for full semantics):
+
+- **`Site`** — singleton geolocation metadata (latitude/longitude/elevation/true-north)
+  mapping the single scene origin to Earth; modeling always stays in local Z-up meters.
+- **`Level`** — named elevation with `is_building_story`, display color/extent;
+  evaluates to a **`Frame`** (origin + orthonormal basis) making it a *construction
+  plane*: `ControlPoint` gains an optional `plane` input slot whose coordinates are
+  then interpreted as (u,v,w) in that frame, and `Element` gains an optional `level`
+  *association* slot (data-only, no geometric effect). Frame bases must follow the
+  deterministic basis-stability rule (AUTHORING.md §3 — the frame analog of §3.4).
+
 > Note: `Element`/`Instance` commands (`CreateElement`, `CreateInstance`, …) extend the
 > command list in the requirements; they fall out of the performance requirement (§8 of
 > the discussion) and should be added there.
