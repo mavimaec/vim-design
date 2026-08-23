@@ -13,7 +13,7 @@ use crate::entity::{EntityKind, EntityRecord, slot};
 use crate::id::EntityId;
 use crate::kernel::{self, KernelSolid, RawMesh};
 
-use super::evaluate::{EntityEval, evaluate_waves};
+use super::evaluate::{EntityEval, Space, compute_spaces, evaluate_waves, topo_waves};
 use super::types::{
     EvalDiag, EvalErrorKind, EvalState, Evaluated, InstanceUpdate, Mesh, MeshUpdate,
     QueryResolution, SubRefResolution, Submesh, Updates,
@@ -27,6 +27,9 @@ use rayon::prelude::*;
 struct MeshEntry {
     mesh: Mesh,
     generation: u64,
+    /// The level whose local space the mesh is evaluated in (`None` =
+    /// world space, identity base transform).
+    base_level: Option<EntityId>,
 }
 
 /// The evaluation engine: derived-layer cache + poll cursor for one
@@ -60,6 +63,19 @@ pub struct Engine {
     /// Interest filter for `params_changed` (never for meshes/instances/
     /// errors). `None` = report all touched ids.
     params_watch: Option<BTreeSet<EntityId>>,
+    /// Translation factoring opt-in (default OFF — the poll then
+    /// behaves exactly as before this milestone: world-baked meshes,
+    /// identity base transforms). Renderers that compose
+    /// `instance ∘ base` enable it via `set_translation_factoring`.
+    factoring: bool,
+    /// Structural evaluation space per entity (translation factoring —
+    /// see the module docs). Cached; recomputed for dirty entities each
+    /// round (spaces depend only on wiring, and wiring changes dirty).
+    /// Empty (all-world) while factoring is disabled.
+    spaces: BTreeMap<EntityId, Space>,
+    /// Owners needing a transform-only re-placement at the next poll
+    /// (their base level's frame moved; their geometry did not).
+    transform_dirty: BTreeSet<EntityId>,
     // -- instrumentation --------------------------------------------------
     eval_counts: BTreeMap<EntityId, u64>,
     tess_counts: BTreeMap<EntityId, u64>,
@@ -122,6 +138,21 @@ impl Engine {
     /// accumulated (they are not retained for a later unwatch).
     pub fn set_params_watch(&mut self, watch: Option<BTreeSet<EntityId>>) {
         self.params_watch = watch;
+    }
+
+    /// Opt into translation factoring (see the module docs): qualified
+    /// owners then deliver level-LOCAL meshes plus base transforms, and
+    /// elevation drags become transform-only polls. OFF by default so
+    /// existing renderers that ignore [`MeshUpdate::base_transform`]
+    /// keep rendering correctly. Set it once, before the first
+    /// `evaluate_pending` on a document (toggling later resets the
+    /// space cache; already-delivered meshes are only re-derived when
+    /// their entities next change).
+    pub fn set_translation_factoring(&mut self, enabled: bool) {
+        if self.factoring != enabled {
+            self.factoring = enabled;
+            self.spaces.clear();
+        }
     }
 
     /// Resolve a provenance-named subelement reference against its
@@ -223,8 +254,12 @@ impl Engine {
     /// can be added without restructuring.
     pub fn evaluate_pending(&mut self, doc: &mut Document) {
         // Pump the parametric changed-set (delta targets recorded at the
-        // document's commit gate — §6.3) into the poll accumulator.
-        self.params_touched.extend(doc.take_params_touched());
+        // document's commit gate — §6.3) into the poll accumulator. The
+        // fresh targets double as the cutoff ROOTS: entities whose own
+        // params/wiring changed must re-evaluate; everything else only
+        // re-evaluates when an input's result actually changed.
+        let roots = doc.take_params_touched();
+        self.params_touched.extend(roots.iter().copied());
         let mut dirty = doc.take_dirty();
         if !self.initialized {
             self.initialized = true;
@@ -249,13 +284,30 @@ impl Engine {
             }
         }
 
-        // 2. Evaluate the dirty closure in topological waves (pure
-        //    function of the snapshot + previous results).
+        // 2. Assign evaluation spaces for the batch (structural; cached
+        //    spaces of untouched entities stay valid), then evaluate in
+        //    topological waves with the early cutoff (pure function of
+        //    the snapshot + previous results).
+        let waves = topo_waves(&alive);
+        if self.factoring {
+            let fresh_spaces =
+                compute_spaces(doc.graph_ref(), &alive, &waves, &self.spaces);
+            self.spaces.extend(fresh_spaces);
+        }
         let settings = doc.settings().clone();
-        let outcomes = evaluate_waves(&alive, &settings, &self.results);
+        let wave_result = evaluate_waves(
+            &alive,
+            &waves,
+            &roots,
+            &self.spaces,
+            &settings,
+            &self.results,
+        );
+        let frames_changed = wave_result.frames_changed;
+        let changed = wave_result.changed;
 
         // 3. Merge outcomes: stale retention + error transitions (§6.4).
-        for (id, outcome) in outcomes {
+        for (id, outcome) in wave_result.outcomes {
             *self.eval_counts.entry(id).or_insert(0) += 1;
             let entry = self.results.entry(id).or_default();
             match outcome {
@@ -301,8 +353,23 @@ impl Engine {
             }
         }
 
-        // 5. Mesh ownership + tessellation.
-        self.refresh_meshes(doc, &alive, generation);
+        // 5. Mesh ownership + tessellation (owners whose geometry
+        //    actually changed; cutoff-skipped owners are untouched).
+        self.refresh_meshes(doc, &alive, &changed, generation);
+
+        // 6. Transform-only re-placements: owners riding a level whose
+        //    frame moved but whose (level-local) geometry did not.
+        if !frames_changed.is_empty() {
+            for (owner, entry) in &self.meshes {
+                if let Some(level) = entry.base_level {
+                    if frames_changed.contains(&level)
+                        && !self.changed_meshes.contains(owner)
+                    {
+                        self.transform_dirty.insert(*owner);
+                    }
+                }
+            }
+        }
 
         self.evaluated_generation = generation;
     }
@@ -314,6 +381,8 @@ impl Engine {
         self.tess_counts.remove(&id);
         self.error_transitions.remove(&id);
         self.owners.remove(&id);
+        self.spaces.remove(&id);
+        self.transform_dirty.remove(&id);
         if self.meshes.remove(&id).is_some() {
             self.changed_meshes.remove(&id);
             self.removed_meshes.insert(id);
@@ -337,8 +406,10 @@ impl Engine {
         &mut self,
         doc: &Document,
         alive_dirty: &BTreeMap<EntityId, EntityRecord>,
+        changed: &BTreeSet<EntityId>,
         generation: u64,
     ) {
+        let _ = alive_dirty;
         // Consumed producers: wired into an element's members slot, or
         // targeted by a chamfer (the chamfer replaces its target as mesh
         // owner — the chamfered solid IS the target's render shape).
@@ -399,11 +470,13 @@ impl Engine {
             self.removed_meshes.insert(id);
         }
 
-        // Candidates: owners whose value was (re-)evaluated this round or
-        // that just became owners.
+        // Candidates: owners whose value actually CHANGED this round
+        // (cutoff-skipped owners keep their meshes untouched — that is
+        // the early-cutoff/translation-factoring payoff) or that just
+        // became owners.
         let candidates: Vec<EntityId> = owners_now
             .iter()
-            .filter(|id| alive_dirty.contains_key(id) || !self.owners.contains(*id))
+            .filter(|id| changed.contains(id) || !self.owners.contains(*id))
             .copied()
             .collect();
         self.owners = owners_now;
@@ -428,9 +501,21 @@ impl Engine {
                 }
                 Some(Ok(mesh)) => {
                     *self.tess_counts.entry(id).or_insert(0) += 1;
-                    self.meshes.insert(id, MeshEntry { mesh, generation });
+                    let base_level = match self.spaces.get(&id) {
+                        Some(Space::Level(level)) => Some(*level),
+                        _ => None,
+                    };
+                    self.meshes.insert(
+                        id,
+                        MeshEntry {
+                            mesh,
+                            generation,
+                            base_level,
+                        },
+                    );
                     self.changed_meshes.insert(id);
                     self.removed_meshes.remove(&id);
+                    self.transform_dirty.remove(&id);
                 }
                 Some(Err(diag)) => {
                     // Tessellation failure: per-entity error on the owner;
@@ -455,6 +540,26 @@ impl Engine {
         }
     }
 
+    /// Current base transform of a mesh entry: identity for world-space
+    /// owners, translation to the base level's frame origin otherwise
+    /// (read fresh at poll time — coalescing is structural, §6.3).
+    fn base_transform_of(&self, entry: &MeshEntry) -> [f64; 12] {
+        let Some(level) = entry.base_level else {
+            return super::types::IDENTITY_TRANSFORM;
+        };
+        match self.results.get(&level).and_then(|e| e.value.as_ref()) {
+            Some(Evaluated::Frame { origin, .. }) => {
+                let [x, y, z] = *origin;
+                [
+                    1.0, 0.0, 0.0, x, //
+                    0.0, 1.0, 0.0, y, //
+                    0.0, 0.0, 1.0, z,
+                ]
+            }
+            _ => super::types::IDENTITY_TRANSFORM,
+        }
+    }
+
     // -- poll facade (docs/ARCHITECTURE.md §6.3) -----------------------------
 
     /// Drain the changed-set accumulated since the previous poll:
@@ -475,6 +580,17 @@ impl Engine {
                     id,
                     generation: entry.generation,
                     mesh: entry.mesh.clone(),
+                    base_transform: self.base_transform_of(entry),
+                });
+            }
+        }
+        // Transform-only re-placements (geometry unchanged): never
+        // overlaps the mesh upserts above.
+        for id in std::mem::take(&mut self.transform_dirty) {
+            if let Some(entry) = self.meshes.get(&id) {
+                updates.base_transforms.push(super::types::BaseTransformUpdate {
+                    id,
+                    transform: self.base_transform_of(entry),
                 });
             }
         }

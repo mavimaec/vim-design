@@ -215,6 +215,14 @@ pub struct Submesh {
     pub index_count: u32,
 }
 
+/// Identity rigid transform (row-major 4x3) — the default
+/// [`MeshUpdate::base_transform`].
+pub const IDENTITY_TRANSFORM: [f64; 12] = [
+    1.0, 0.0, 0.0, 0.0, //
+    0.0, 1.0, 0.0, 0.0, //
+    0.0, 0.0, 1.0, 0.0,
+];
+
 /// Upsert of one renderable mesh, keyed by the mesh-owner entity id — an
 /// `Element`, or a standalone solid producer (`Extrusion` / `Revolve` /
 /// `Solid` not consumed by any element); see the module docs for the
@@ -226,6 +234,26 @@ pub struct MeshUpdate {
     /// Committed generation at which this mesh was produced.
     pub generation: u64,
     pub mesh: Mesh,
+    /// Base placement of the mesh (row-major 4x3, identity for
+    /// world-space owners). Owners whose whole construction closure is
+    /// attached to one Level evaluate in level-local space and carry the
+    /// level elevation here instead of baked coordinates (translation
+    /// factoring — see the module docs). Composition order:
+    /// `world = instance_transform ∘ base_transform` (base applied
+    /// first); standalone owners render at `base_transform` alone.
+    pub base_transform: [f64; 12],
+}
+
+/// Transform-only update for a mesh owner whose geometry did NOT change
+/// (e.g. a level-elevation drag over a fully-attached owner): re-place
+/// the existing mesh, no re-upload.
+#[derive(Debug, Clone, Copy)]
+pub struct BaseTransformUpdate {
+    /// Mesh-owner id (matches a previously delivered [`MeshUpdate`]).
+    pub id: EntityId,
+    /// The new base transform (composition as on
+    /// [`MeshUpdate::base_transform`]).
+    pub transform: [f64; 12],
 }
 
 /// Upsert of one instance placement.
@@ -250,6 +278,10 @@ pub struct Updates {
     pub meshes_removed: Vec<EntityId>,
     /// Instance upserts.
     pub instances: Vec<InstanceUpdate>,
+    /// Transform-only owner re-placements (geometry unchanged; see
+    /// [`BaseTransformUpdate`]). Never overlaps `meshes` in one poll —
+    /// a mesh upsert already carries its own base transform.
+    pub base_transforms: Vec<BaseTransformUpdate>,
     /// Tombstones: deleted instances.
     pub instances_removed: Vec<EntityId>,
     /// Entities newly in error (or whose diagnostic changed), with the
@@ -285,6 +317,7 @@ impl Updates {
             && self.meshes_removed.is_empty()
             && self.instances.is_empty()
             && self.instances_removed.is_empty()
+            && self.base_transforms.is_empty()
             && self.errors.is_empty()
             && self.errors_cleared.is_empty()
             && self.params_changed.is_empty()

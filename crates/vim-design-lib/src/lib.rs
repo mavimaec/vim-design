@@ -28,7 +28,8 @@ pub use delta::{Delta, SlotIdx, apply_delta};
 pub use document::{CommandGroup, Document, DocumentSettings};
 pub use entity::{EntityKind, EntityRecord, Params, SlotDecl, SlotValue, slots};
 pub use eval::{
-    EvalDiag, EvalErrorKind, EvalState, Evaluated, InstanceUpdate, Mesh, MeshUpdate,
+    BaseTransformUpdate, EvalDiag, EvalErrorKind, EvalState, Evaluated, IDENTITY_TRANSFORM,
+    InstanceUpdate, Mesh, MeshUpdate,
     QueryResolution, SubRefResolution, Submesh, Updates,
 };
 pub use graph::GraphState;

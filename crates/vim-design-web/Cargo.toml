@@ -46,4 +46,4 @@ default = []
 #   rustup toolchain: nightly (with rust-src)
 #   RUSTFLAGS="-C target-feature=+atomics,+bulk-memory,+mutable-globals"
 #   cargo build -Z build-std=std,panic_abort --target wasm32-unknown-unknown
-threads = ["dep:rayon", "dep:wasm-bindgen-rayon"]
+threads = ["dep:rayon", "dep:wasm-bindgen-rayon", "vim-design-lib/parallel"]

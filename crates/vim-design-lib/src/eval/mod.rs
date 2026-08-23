@@ -87,6 +87,53 @@
 //! level has no volume. An element's `level` association slot is
 //! data-only: rewiring it re-delivers a byte-identical mesh.
 //!
+//! # Evaluation performance: early cutoff and translation factoring
+//!
+//! **Early cutoff.** Only entities whose own params/wiring changed (the
+//! commit-gate roots) are forced to re-evaluate; everything downstream
+//! re-evaluates only when an input's *result* actually changed. Change
+//! detection is exact equality on the plain-data [`Evaluated`] variants
+//! (`Point`, `Plane`, `Curve`/`Edge`, `Wire`, `Frame`, `Site`,
+//! `Material`, `Instance`) plus error-state transitions; kernel-handle
+//! variants (`Face`, `Solid`, `SolidSet`) are **not comparable** and
+//! always count as changed when they re-evaluate (documented
+//! limitation). Headline consequence: a Level edit that does not move
+//! the frame (name/color/extent/story flag) does zero downstream work —
+//! the pump still reports the level in `params_changed`.
+//!
+//! **Translation factoring (level-local evaluation) — OPT-IN via
+//! [`Engine::set_translation_factoring`], default OFF.** While off, the
+//! engine behaves exactly as before this milestone (world-baked meshes,
+//! identity base transforms) so renderers that ignore base transforms
+//! keep rendering correctly; a renderer opts in the moment it composes
+//! `instance ∘ base`. When enabled: an entity whose entire *spatial*
+//! input closure is attached to one Level evaluates in that level's
+//! LOCAL space (the level origin treated as zero):
+//! attached control points evaluate to their stored `(u, v, w)`
+//! verbatim, and everything built from them — curves, faces, solids,
+//! provenance names, paints, chamfers — is level-local. The mesh owner
+//! then delivers a **local mesh** plus [`MeshUpdate::base_transform`]
+//! (the level origin). An elevation drag therefore re-evaluates nothing
+//! downstream and re-tessellates nothing: the poll carries only
+//! [`Updates::base_transforms`] entries (never overlapping `meshes`),
+//! and undoing the drag is transform-only too.
+//!
+//! *Qualification rule:* `Level(l)` space is assigned bottom-up — a
+//! control point wired to level `l`, and any entity all of whose
+//! spatial inputs are in `Level(l)`. Disqualified to world space: any
+//! unattached point, mixed-level attachment, or an explicit `Plane`
+//! input (conservative); and kernel *handles* never cross spaces — a
+//! Face/Solid consumed by a world-space entity is demoted to world
+//! itself (its plain-data wire/curve inputs are translated at
+//! consumption instead). Disqualified owners keep the full re-eval path
+//! and identity base transforms — exactly today's behavior.
+//!
+//! *Renderer contract:* `world = instance_transform ∘ base_transform`
+//! (base applied first); standalone owners render at `base_transform`
+//! alone. Note that `Evaluated::Point` (and every derived value) for
+//! level-attached geometry is level-LOCAL — compose with the level's
+//! frame origin for world positions.
+//!
 //! # Provenance naming & SubRefs (docs/ARCHITECTURE.md §3.4)
 //!
 //! Extrusion/revolve evaluators name their generated faces by the stable
@@ -171,6 +218,7 @@ mod types;
 
 pub use engine::Engine;
 pub use types::{
-    EvalDiag, EvalErrorKind, EvalState, Evaluated, InstanceUpdate, Mesh, MeshUpdate,
+    BaseTransformUpdate, EvalDiag, EvalErrorKind, EvalState, Evaluated, IDENTITY_TRANSFORM,
+    InstanceUpdate, Mesh, MeshUpdate,
     QueryResolution, SubRefResolution, Submesh, Updates,
 };

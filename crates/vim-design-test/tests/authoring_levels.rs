@@ -300,6 +300,9 @@ fn attached_and_unattached_points_mix_in_one_wire() {
         "mixed wire face evaluates: {:?}",
         engine.state(face)
     );
+    // Default engine (translation factoring off): attached points bake
+    // world coordinates. (With factoring enabled they evaluate
+    // level-local instead — see eval_perf.rs.)
     match engine.value(a) {
         Some(Evaluated::Point(p)) => assert_eq!(*p, [0.0, 0.0, 1.0]),
         other => panic!("attached point value: {other:?}"),
@@ -498,11 +501,15 @@ fn attach_detach_rewires_under_undo_redo() {
     let cp = one(&mut doc, Command::CreateControlPoint { position: [1.0, 1.0, 0.5] });
     engine.evaluate_pending(&mut doc);
 
-    let world_of = |engine: &Engine| match engine.value(cp) {
-        Some(Evaluated::Point(p)) => *p,
-        other => panic!("point value: {other:?}"),
+    // Default engine (translation factoring off): point values are
+    // world coordinates whether attached or not.
+    let world_of = |_doc: &Document, engine: &Engine| -> [f64; 3] {
+        match engine.value(cp) {
+            Some(Evaluated::Point(p)) => *p,
+            other => panic!("point value: {other:?}"),
+        }
     };
-    assert_eq!(world_of(&engine), [1.0, 1.0, 0.5], "unattached = world");
+    assert_eq!(world_of(&doc, &engine), [1.0, 1.0, 0.5], "unattached = world");
 
     // Attach WITH the intent-layer conversion: same world position, so
     // the point does not jump ((u,v,w) = (1, 1, -1.5) on a z=2 level).
@@ -515,7 +522,7 @@ fn attach_detach_rewires_under_undo_redo() {
         },
     );
     engine.evaluate_pending(&mut doc);
-    assert_eq!(world_of(&engine), [1.0, 1.0, 0.5], "attach did not jump");
+    assert_eq!(world_of(&doc, &engine), [1.0, 1.0, 0.5], "attach did not jump");
 
     // The attachment is live: the level's elevation now drives the point.
     ok(
@@ -531,7 +538,7 @@ fn attach_detach_rewires_under_undo_redo() {
         },
     );
     engine.evaluate_pending(&mut doc);
-    assert_eq!(world_of(&engine), [1.0, 1.0, 1.5]);
+    assert_eq!(world_of(&doc, &engine), [1.0, 1.0, 1.5]);
 
     // Detach with conversion back to world coordinates.
     ok(
@@ -543,23 +550,23 @@ fn attach_detach_rewires_under_undo_redo() {
         },
     );
     engine.evaluate_pending(&mut doc);
-    assert_eq!(world_of(&engine), [1.0, 1.0, 1.5], "detach did not jump");
+    assert_eq!(world_of(&doc, &engine), [1.0, 1.0, 1.5], "detach did not jump");
 
     // Undo/redo walk the whole history coherently (attach and detach are
     // single undoable commands: rewire + rewrite together).
     doc.undo().expect("undo detach");
     engine.evaluate_pending(&mut doc);
-    assert_eq!(world_of(&engine), [1.0, 1.0, 1.5], "attached to z=3 level");
+    assert_eq!(world_of(&doc, &engine), [1.0, 1.0, 1.5], "attached to z=3 level");
     doc.undo().expect("undo level move");
     engine.evaluate_pending(&mut doc);
-    assert_eq!(world_of(&engine), [1.0, 1.0, 0.5]);
+    assert_eq!(world_of(&doc, &engine), [1.0, 1.0, 0.5]);
     doc.undo().expect("undo attach");
     engine.evaluate_pending(&mut doc);
-    assert_eq!(world_of(&engine), [1.0, 1.0, 0.5], "back to world coords");
+    assert_eq!(world_of(&doc, &engine), [1.0, 1.0, 0.5], "back to world coords");
     doc.redo().expect("redo attach");
     doc.redo().expect("redo level move");
     engine.evaluate_pending(&mut doc);
-    assert_eq!(world_of(&engine), [1.0, 1.0, 1.5]);
+    assert_eq!(world_of(&doc, &engine), [1.0, 1.0, 1.5]);
 
     // Kind safety: the plane slot accepts construction planes only.
     let stray = one(&mut doc, Command::CreateControlPoint { position: [0.0; 3] });

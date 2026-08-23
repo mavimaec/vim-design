@@ -111,33 +111,339 @@ pub(crate) fn topo_waves(
     waves
 }
 
-/// Evaluate the batch wave by wave. Pure: only reads `records`,
-/// `settings`, and `base`; returns one outcome per entity. Within a wave
-/// entities evaluate in parallel under the `parallel` feature
-/// (docs/ARCHITECTURE.md §6.2); the wasm fallback is sequential.
+// ---------------------------------------------------------------------
+// Evaluation spaces (translation factoring — see eval/mod.rs docs).
+// ---------------------------------------------------------------------
+
+/// The coordinate space an entity's geometry is evaluated in.
+///
+/// `Level(l)` = level-local space of construction plane `l` (identical
+/// to world except that the level's origin is treated as zero) — chosen
+/// when the entity's *entire* spatial input closure is attached to that
+/// one level. The mesh owner then carries the level origin as a base
+/// transform, so an elevation drag is transform-only. Anything else
+/// (unattached points, mixed frames, explicit Plane inputs) is `World`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Space {
+    World,
+    Level(EntityId),
+}
+
+/// Structural space assignment for the dirty batch (waves in topo
+/// order), consulting `cache` for out-of-batch inputs. Two passes:
+/// bottom-up combination, then a top-down demotion so kernel *handles*
+/// (Face/Solid values) never cross spaces — a handle whose consumer is
+/// World-space is itself World, recursively; plain-data specs (points,
+/// curves, wires) may cross and are translated at consumption.
+pub(crate) fn compute_spaces(
+    graph: &crate::graph::GraphState,
+    records: &BTreeMap<EntityId, EntityRecord>,
+    waves: &[Vec<EntityId>],
+    cache: &BTreeMap<EntityId, Space>,
+) -> BTreeMap<EntityId, Space> {
+    let mut spaces: BTreeMap<EntityId, Space> = BTreeMap::new();
+    let space_of = |spaces: &BTreeMap<EntityId, Space>, id: EntityId| -> Space {
+        spaces
+            .get(&id)
+            .or_else(|| cache.get(&id))
+            .copied()
+            .unwrap_or(Space::World)
+    };
+    // Combine the spaces of the record's *spatial* inputs (geometry-kind
+    // slots only): a unique level wins, anything mixed is World.
+    let combine = |spaces: &BTreeMap<EntityId, Space>,
+                   inputs: &mut dyn Iterator<Item = EntityId>|
+     -> Space {
+        let mut unified: Option<Space> = None;
+        for input in inputs {
+            let space = space_of(spaces, input);
+            unified = Some(match unified {
+                None => space,
+                Some(existing) if existing == space => existing,
+                Some(_) => return Space::World,
+            });
+        }
+        unified.unwrap_or(Space::World)
+    };
+    let spatial = |kind: EntityKind| {
+        matches!(
+            kind,
+            EntityKind::ControlPoint
+                | EntityKind::Line
+                | EntityKind::Circle
+                | EntityKind::Spline
+                | EntityKind::Edge
+                | EntityKind::Wire
+                | EntityKind::Face
+                | EntityKind::Solid
+                | EntityKind::Extrusion
+                | EntityKind::Revolve
+                | EntityKind::Chamfer
+        )
+    };
+
+    // Pass 1: bottom-up.
+    for wave in waves {
+        for id in wave {
+            let Some(record) = records.get(id) else { continue };
+            let space = match record.kind() {
+                EntityKind::ControlPoint => {
+                    match record
+                        .inputs
+                        .get(slot::CONTROL_POINT_PLANE)
+                        .and_then(|s| s.referenced().next())
+                    {
+                        Some(level) => Space::Level(level),
+                        None => Space::World,
+                    }
+                }
+                // An explicit Plane input anchors the entity to world
+                // coordinates (conservative disqualifier, documented).
+                EntityKind::Circle
+                    if record
+                        .inputs
+                        .get(slot::CIRCLE_PLANE)
+                        .is_some_and(|s| !s.is_empty()) =>
+                {
+                    Space::World
+                }
+                EntityKind::Face
+                    if record
+                        .inputs
+                        .get(slot::FACE_PLANE)
+                        .is_some_and(|s| !s.is_empty()) =>
+                {
+                    Space::World
+                }
+                EntityKind::Element => {
+                    // Members only: the level *association* slot is
+                    // data-only and must not affect spaces.
+                    let mut members = record
+                        .inputs
+                        .get(slot::ELEMENT_MEMBERS)
+                        .map(|s| s.referenced().collect::<Vec<_>>())
+                        .unwrap_or_default()
+                        .into_iter();
+                    combine(&spaces, &mut members)
+                }
+                kind if spatial(kind) => {
+                    // Spatial inputs only: materials, planes (guarded
+                    // above), and levels never affect the space.
+                    let mut inputs = record
+                        .referenced()
+                        .filter(|input| {
+                            graph
+                                .get(*input)
+                                .map(|r| spatial(r.kind()))
+                                .unwrap_or(false)
+                        })
+                        .collect::<Vec<_>>()
+                        .into_iter();
+                    combine(&spaces, &mut inputs)
+                }
+                _ => Space::World,
+            };
+            spaces.insert(*id, space);
+        }
+    }
+
+    // Pass 2: top-down demotion (reverse topo): a handle producer with a
+    // World-space handle consumer becomes World itself.
+    for wave in waves.iter().rev() {
+        for id in wave {
+            let Some(record) = records.get(id) else { continue };
+            if spaces.get(id) != Some(&Space::World) {
+                continue;
+            }
+            // Handle-consuming slots per kind.
+            let handle_inputs: Vec<EntityId> = match record.kind() {
+                EntityKind::Extrusion => record
+                    .inputs
+                    .get(slot::EXTRUSION_PROFILE)
+                    .map(|s| s.referenced().collect())
+                    .unwrap_or_default(),
+                EntityKind::Revolve => record
+                    .inputs
+                    .get(slot::REVOLVE_PROFILE)
+                    .map(|s| s.referenced().collect())
+                    .unwrap_or_default(),
+                EntityKind::Solid => record
+                    .inputs
+                    .get(slot::SOLID_FACES)
+                    .map(|s| s.referenced().collect())
+                    .unwrap_or_default(),
+                EntityKind::Chamfer => record
+                    .inputs
+                    .get(slot::CHAMFER_TARGET)
+                    .map(|s| s.referenced().collect())
+                    .unwrap_or_default(),
+                EntityKind::Element => record
+                    .inputs
+                    .get(slot::ELEMENT_MEMBERS)
+                    .map(|s| s.referenced().collect())
+                    .unwrap_or_default(),
+                _ => Vec::new(),
+            };
+            for input in handle_inputs {
+                if records.contains_key(&input) {
+                    spaces.insert(input, Space::World);
+                }
+                // Out-of-batch handle inputs cannot disagree: a wiring
+                // or space change dirties the whole downstream closure,
+                // so producer and consumer are always in-batch together
+                // when either side changes.
+            }
+        }
+    }
+    spaces
+}
+
+/// Cheap-and-exact value equality for the early cutoff. Plain-data
+/// variants compare exactly; kernel-handle variants (`Face`, `Solid`,
+/// `SolidSet`) are NOT comparable and always count as changed
+/// (documented limitation — comparing BREP handles would be neither
+/// cheap nor reliable).
+fn value_equal(a: &Evaluated, b: &Evaluated) -> bool {
+    match (a, b) {
+        (Evaluated::Point(x), Evaluated::Point(y)) => x == y,
+        (
+            Evaluated::Plane { origin: ao, normal: an },
+            Evaluated::Plane { origin: bo, normal: bn },
+        ) => ao == bo && an == bn,
+        (Evaluated::Curve(x), Evaluated::Curve(y))
+        | (Evaluated::Edge(x), Evaluated::Edge(y)) => x == y,
+        (Evaluated::Wire(x), Evaluated::Wire(y)) => x == y,
+        (Evaluated::Material, Evaluated::Material) => true,
+        (Evaluated::Site, Evaluated::Site) => true,
+        (
+            Evaluated::Frame {
+                origin: ao,
+                x_axis: ax,
+                y_axis: ay,
+                z_axis: az,
+            },
+            Evaluated::Frame {
+                origin: bo,
+                x_axis: bx,
+                y_axis: by,
+                z_axis: bz,
+            },
+        ) => ao == bo && ax == bx && ay == by && az == bz,
+        (
+            Evaluated::Instance { element: ae, transform: at },
+            Evaluated::Instance { element: be, transform: bt },
+        ) => ae == be && at == bt,
+        _ => false,
+    }
+}
+
+/// Result of one wave-batch evaluation.
+pub(crate) struct WaveResult {
+    /// Outcomes for the entities that actually evaluated (skipped
+    /// entities are absent — their cached value/state stands).
+    pub outcomes: BTreeMap<EntityId, Result<Evaluated, EvalDiag>>,
+    /// Entities whose observable result changed (value inequality,
+    /// incomparable kernel handles, or an error-state transition).
+    pub changed: std::collections::BTreeSet<EntityId>,
+    /// Levels whose `Frame` changed (drives cross-space re-evaluation
+    /// and transform-only mesh re-placement).
+    pub frames_changed: std::collections::BTreeSet<EntityId>,
+}
+
+/// Evaluate the batch wave by wave with the early cutoff
+/// (docs eval/mod.rs "Evaluation performance"): a non-root entity
+/// evaluates only if it has never evaluated, an input's result changed,
+/// or a cross-space input's level frame moved. Pure: only reads its
+/// arguments. Within a wave entities evaluate in parallel under the
+/// `parallel` feature (docs/ARCHITECTURE.md §6.2).
 pub(crate) fn evaluate_waves(
     records: &BTreeMap<EntityId, EntityRecord>,
+    waves: &[Vec<EntityId>],
+    roots: &std::collections::BTreeSet<EntityId>,
+    spaces: &BTreeMap<EntityId, Space>,
     settings: &DocumentSettings,
     base: &BTreeMap<EntityId, EntityEval>,
-) -> BTreeMap<EntityId, Result<Evaluated, EvalDiag>> {
-    let waves = topo_waves(records);
+) -> WaveResult {
     let mut fresh: BTreeMap<EntityId, Result<Evaluated, EvalDiag>> = BTreeMap::new();
+    let mut changed = std::collections::BTreeSet::new();
+    let mut frames_changed = std::collections::BTreeSet::new();
+    let space_of = |id: EntityId| spaces.get(&id).copied().unwrap_or(Space::World);
     for wave in waves {
+        let todo: Vec<EntityId> = wave
+            .iter()
+            .filter(|id| {
+                let Some(record) = records.get(id) else { return false };
+                if roots.contains(id) {
+                    return true; // its own params/wiring changed
+                }
+                let Some(entry) = base.get(id) else {
+                    return true; // never evaluated (first sight / load)
+                };
+                if entry.state.is_none() {
+                    return true;
+                }
+                let own_space = space_of(**id);
+                record.referenced().any(|input| {
+                    if changed.contains(&input) {
+                        return true;
+                    }
+                    // Cross-space consumption: a level-local input is
+                    // world-ified with the level's CURRENT origin, so a
+                    // frame move re-evaluates the consumer even though
+                    // the input's local value is unchanged.
+                    match space_of(input) {
+                        Space::Level(level) => {
+                            frames_changed.contains(&level)
+                                && own_space != Space::Level(level)
+                        }
+                        Space::World => false,
+                    }
+                })
+            })
+            .copied()
+            .collect();
         let lookup = Lookup {
             fresh: &fresh,
             base,
         };
         let run = |id: &EntityId| -> Option<(EntityId, Result<Evaluated, EvalDiag>)> {
             let record = records.get(id)?;
-            Some((*id, evaluate_entity(record, &lookup, settings)))
+            Some((*id, evaluate_entity(record, &lookup, settings, spaces)))
         };
         #[cfg(feature = "parallel")]
-        let outcomes: Vec<_> = wave.par_iter().filter_map(run).collect();
+        let outcomes: Vec<_> = todo.par_iter().filter_map(run).collect();
         #[cfg(not(feature = "parallel"))]
-        let outcomes: Vec<_> = wave.iter().filter_map(run).collect();
-        fresh.extend(outcomes);
+        let outcomes: Vec<_> = todo.iter().filter_map(run).collect();
+        for (id, outcome) in outcomes {
+            let previous = base.get(&id);
+            let was_error = matches!(
+                previous.and_then(|e| e.state.as_ref()),
+                Some(super::types::EvalState::Error { .. })
+            ) || previous.is_none();
+            let result_changed = match &outcome {
+                Err(_) => true,
+                Ok(value) => {
+                    was_error
+                        || previous
+                            .and_then(|e| e.value.as_ref())
+                            .map(|old| !value_equal(value, old))
+                            .unwrap_or(true)
+                }
+            };
+            if result_changed {
+                changed.insert(id);
+                if records.get(&id).map(|r| r.kind()) == Some(EntityKind::Level) {
+                    frames_changed.insert(id);
+                }
+            }
+            fresh.insert(id, outcome);
+        }
     }
-    fresh
+    WaveResult {
+        outcomes: fresh,
+        changed,
+        frames_changed,
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -221,12 +527,97 @@ fn as_curve<'a>(value: &'a Evaluated, what: &str) -> Result<&'a CurveSpec, EvalD
     }
 }
 
+/// The origin of a level's frame (for world-ifying level-local inputs
+/// at space crossings).
+fn frame_origin(lookup: &Lookup<'_>, level: EntityId) -> Result<[f64; 3], EvalDiag> {
+    match lookup.value(level) {
+        Some(Evaluated::Frame { origin, .. }) => Ok(*origin),
+        _ => Err(diag(
+            EvalErrorKind::UpstreamError,
+            format!("level entity {} has no evaluated frame", level.0),
+        )),
+    }
+}
+
+/// Offset to apply to an input evaluated in `input_space` when consumed
+/// by an entity in `own_space` (zero when spaces match; the level origin
+/// when a level-local value crosses into world space).
+fn crossing_offset(
+    lookup: &Lookup<'_>,
+    own_space: Space,
+    input_space: Space,
+    spaces_note: &str,
+) -> Result<[f64; 3], EvalDiag> {
+    match (input_space, own_space) {
+        (a, b) if a == b => Ok([0.0; 3]),
+        (Space::Level(level), Space::World) => frame_origin(lookup, level),
+        // A world (or other-level) input consumed in level-local space
+        // cannot happen by construction (the combine rule makes any
+        // mixed consumer World); reaching here is a substrate bug.
+        _ => Err(diag(
+            EvalErrorKind::Kernel,
+            format!("inconsistent evaluation spaces at {spaces_note} (substrate bug)"),
+        )),
+    }
+}
+
+fn translate_point(p: [f64; 3], offset: [f64; 3]) -> [f64; 3] {
+    [p[0] + offset[0], p[1] + offset[1], p[2] + offset[2]]
+}
+
+fn translate_curve(spec: &CurveSpec, offset: [f64; 3]) -> CurveSpec {
+    if offset == [0.0; 3] {
+        return spec.clone();
+    }
+    match spec {
+        CurveSpec::Segment { start, end } => CurveSpec::Segment {
+            start: translate_point(*start, offset),
+            end: translate_point(*end, offset),
+        },
+        CurveSpec::Circle {
+            center,
+            normal,
+            radius,
+        } => CurveSpec::Circle {
+            center: translate_point(*center, offset),
+            normal: *normal,
+            radius: *radius,
+        },
+        CurveSpec::Bezier { control_points } => CurveSpec::Bezier {
+            control_points: control_points
+                .iter()
+                .map(|p| translate_point(*p, offset))
+                .collect(),
+        },
+    }
+}
+
+fn translate_wire(wire: &WireSpec, offset: [f64; 3]) -> WireSpec {
+    if offset == [0.0; 3] {
+        return wire.clone();
+    }
+    WireSpec::with_sources(
+        wire.curves.iter().map(|c| translate_curve(c, offset)).collect(),
+        wire.sources.clone(),
+    )
+}
+
 /// Evaluate one entity from its record and already-evaluated inputs.
+/// Geometry is produced in the entity's assigned [`Space`]: level-local
+/// values stay local (translation factoring); level-local INPUTS
+/// consumed by a World-space entity are world-ified here with the
+/// level's current origin.
 pub(crate) fn evaluate_entity(
     record: &EntityRecord,
     lookup: &Lookup<'_>,
     settings: &DocumentSettings,
+    spaces: &BTreeMap<EntityId, Space>,
 ) -> Result<Evaluated, EvalDiag> {
+    let own_space = spaces.get(&record.id).copied().unwrap_or(Space::World);
+    let space_of = |id: EntityId| spaces.get(&id).copied().unwrap_or(Space::World);
+    let input_offset = |lookup: &Lookup<'_>, id: EntityId, what: &str| {
+        crossing_offset(lookup, own_space, space_of(id), what)
+    };
     let tol = settings.kernel_tolerance;
     match record.kind() {
         EntityKind::ControlPoint => {
@@ -239,39 +630,35 @@ pub(crate) fn evaluate_entity(
                 None => Ok(Evaluated::Point(position)),
                 // Attached: stored coordinates are (u, v, w) in the
                 // construction plane's frame (docs/AUTHORING.md §3).
-                Some(plane_id) => {
-                    match require(lookup, Some(plane_id), "plane")? {
-                        Evaluated::Frame {
-                            origin,
-                            x_axis,
-                            y_axis,
-                            z_axis,
-                        } => {
-                            let [u, v, w] = position;
-                            let world = [
-                                origin[0]
-                                    + u * x_axis[0]
-                                    + v * y_axis[0]
-                                    + w * z_axis[0],
-                                origin[1]
-                                    + u * x_axis[1]
-                                    + v * y_axis[1]
-                                    + w * z_axis[1],
-                                origin[2]
-                                    + u * x_axis[2]
-                                    + v * y_axis[2]
-                                    + w * z_axis[2],
-                            ];
-                            Ok(Evaluated::Point(world))
-                        }
-                        other => Err(diag(
-                            EvalErrorKind::UpstreamError,
-                            format!(
-                                "plane input evaluated to {other:?}, expected a frame"
-                            ),
-                        )),
+                // Under translation factoring (own space = the level's)
+                // the point stays LEVEL-LOCAL — the frame's origin is
+                // delivered as the owner's base transform, never baked
+                // here; otherwise (factoring off, or a world-space
+                // assignment) the full world position is baked.
+                Some(plane_id) => match require(lookup, Some(plane_id), "plane")? {
+                    Evaluated::Frame {
+                        origin,
+                        x_axis,
+                        y_axis,
+                        z_axis,
+                    } => {
+                        let [u, v, w] = position;
+                        let base = match own_space {
+                            Space::Level(_) => [0.0; 3],
+                            Space::World => *origin,
+                        };
+                        let point = [
+                            base[0] + u * x_axis[0] + v * y_axis[0] + w * z_axis[0],
+                            base[1] + u * x_axis[1] + v * y_axis[1] + w * z_axis[1],
+                            base[2] + u * x_axis[2] + v * y_axis[2] + w * z_axis[2],
+                        ];
+                        Ok(Evaluated::Point(point))
                     }
-                }
+                    other => Err(diag(
+                        EvalErrorKind::UpstreamError,
+                        format!("plane input evaluated to {other:?}, expected a frame"),
+                    )),
+                },
             }
         }
         EntityKind::Plane => match &record.params {
@@ -297,10 +684,15 @@ pub(crate) fn evaluate_entity(
                     format!("circle radius {radius} m is not positive"),
                 ));
             }
-            let center = as_point(
-                require(lookup, single_id(record, slot::CIRCLE_CENTER), "center")?,
-                "center",
-            )?;
+            let center_id = single_id(record, slot::CIRCLE_CENTER);
+            let center = as_point(require(lookup, center_id, "center")?, "center")?;
+            let center = translate_point(
+                center,
+                center_id
+                    .map(|id| input_offset(lookup, id, "circle center"))
+                    .transpose()?
+                    .unwrap_or([0.0; 3]),
+            );
             let normal = match single_id(record, slot::CIRCLE_PLANE) {
                 Some(plane_id) => match require(lookup, Some(plane_id), "plane")? {
                     Evaluated::Plane { normal, .. } => *normal,
@@ -321,14 +713,24 @@ pub(crate) fn evaluate_entity(
             }))
         }
         EntityKind::Line => {
-            let start = as_point(
-                require(lookup, single_id(record, slot::LINE_START), "start")?,
-                "start",
-            )?;
-            let end = as_point(
-                require(lookup, single_id(record, slot::LINE_END), "end")?,
-                "end",
-            )?;
+            let start_id = single_id(record, slot::LINE_START);
+            let end_id = single_id(record, slot::LINE_END);
+            let start = as_point(require(lookup, start_id, "start")?, "start")?;
+            let end = as_point(require(lookup, end_id, "end")?, "end")?;
+            let start = translate_point(
+                start,
+                start_id
+                    .map(|id| input_offset(lookup, id, "line start"))
+                    .transpose()?
+                    .unwrap_or([0.0; 3]),
+            );
+            let end = translate_point(
+                end,
+                end_id
+                    .map(|id| input_offset(lookup, id, "line end"))
+                    .transpose()?
+                    .unwrap_or([0.0; 3]),
+            );
             let length = kernel::norm([
                 end[0] - start[0],
                 end[1] - start[1],
@@ -359,7 +761,8 @@ pub(crate) fn evaluate_entity(
                     require(lookup, Some(id), "control point")?,
                     "control point",
                 )?;
-                control_points.push(point);
+                let offset = input_offset(lookup, id, "spline control point")?;
+                control_points.push(translate_point(point, offset));
             }
             Ok(Evaluated::Curve(CurveSpec::Bezier { control_points }))
         }
@@ -376,15 +779,17 @@ pub(crate) fn evaluate_entity(
             let mut specs: Vec<(CurveSpec, EntityId)> = Vec::with_capacity(ids.len());
             for id in ids {
                 let curve = as_curve(require(lookup, Some(id), "edge")?, "edge")?;
+                let offset = input_offset(lookup, id, "wire edge")?;
                 // The Edge entity id rides along as the curve's *source*:
                 // the stable id provenance naming derives from (§3.4).
-                specs.push((curve.clone(), id));
+                specs.push((translate_curve(curve, offset), id));
             }
             let wire = chain_wire(specs, tol)?;
             Ok(Evaluated::Wire(wire))
         }
         EntityKind::Face => {
-            let outer = match require(lookup, single_id(record, slot::FACE_OUTER), "outer wire")? {
+            let outer_id = single_id(record, slot::FACE_OUTER);
+            let outer = match require(lookup, outer_id, "outer wire")? {
                 Evaluated::Wire(wire) => wire.clone(),
                 other => {
                     return Err(diag(
@@ -393,10 +798,20 @@ pub(crate) fn evaluate_entity(
                     ));
                 }
             };
+            let outer = translate_wire(
+                &outer,
+                outer_id
+                    .map(|id| input_offset(lookup, id, "face outer wire"))
+                    .transpose()?
+                    .unwrap_or([0.0; 3]),
+            );
             let mut holes = Vec::new();
             for id in multi_ids(record, slot::FACE_HOLES) {
                 match require(lookup, Some(id), "hole wire")? {
-                    Evaluated::Wire(wire) => holes.push(wire.clone()),
+                    Evaluated::Wire(wire) => {
+                        let offset = input_offset(lookup, id, "face hole wire")?;
+                        holes.push(translate_wire(wire, offset));
+                    }
                     other => {
                         return Err(diag(
                             EvalErrorKind::UpstreamError,
@@ -509,10 +924,13 @@ pub(crate) fn evaluate_entity(
                         ));
                     }
                 };
-            let axis = as_curve(
-                require(lookup, single_id(record, slot::REVOLVE_AXIS), "axis")?,
-                "axis",
-            )?;
+            let axis_id = single_id(record, slot::REVOLVE_AXIS);
+            let axis = as_curve(require(lookup, axis_id, "axis")?, "axis")?;
+            let axis_offset = axis_id
+                .map(|id| input_offset(lookup, id, "revolve axis"))
+                .transpose()?
+                .unwrap_or([0.0; 3]);
+            let axis = &translate_curve(axis, axis_offset);
             let (origin, direction) = match axis {
                 CurveSpec::Segment { start, end } => (
                     *start,
@@ -659,7 +1077,10 @@ pub(crate) fn evaluate_entity(
             // edges slot: matched to coincident solid edges.
             for edge_id in slot_edge_ids {
                 let curve = as_curve(require(lookup, Some(edge_id), "edge")?, "edge")?;
-                addresses.push(kernel::EdgeAddress::Coincident(curve.clone()));
+                let offset = input_offset(lookup, edge_id, "chamfer edge")?;
+                addresses.push(kernel::EdgeAddress::Coincident(translate_curve(
+                    curve, offset,
+                )));
             }
             if addresses.is_empty() {
                 // Targets were configured but every query set expanded to
