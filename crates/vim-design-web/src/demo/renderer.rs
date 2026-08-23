@@ -135,7 +135,12 @@ struct GpuMesh {
     wire_indices: wgpu::Buffer,
     wire_index_count: u32,
     triangle_count: u32,
-    /// Local-space AABB (before instance transforms), for scene queries.
+    /// Base placement (translation factoring): mesh bytes are owner-
+    /// local; `world = instance ∘ base`, base applied first. Identity
+    /// for world-baked owners.
+    base: Mat4,
+    /// Local-space AABB (before base/instance transforms), for scene
+    /// queries.
     bbox_min: [f32; 3],
     bbox_max: [f32; 3],
 }
@@ -525,9 +530,25 @@ impl Renderer {
             .insert(id, (element, mat4_from_row_major_4x3(transform)));
     }
 
+    /// Transform-only re-placement of a previously delivered mesh (the
+    /// poll's `base_transforms` — geometry unchanged, no re-upload).
+    pub fn set_base_transform(&mut self, id: EntityId, transform: &[f64; 12]) {
+        if let Some(mesh) = self.meshes.get_mut(&id) {
+            mesh.base = mat4_from_row_major_4x3(transform);
+        }
+    }
+
     /// Upload one mesh. `submesh_colors` is parallel to `mesh.submeshes`
-    /// (material colors already resolved by the caller).
-    pub fn upsert_mesh(&mut self, id: EntityId, mesh: &Mesh, submesh_colors: &[[f32; 3]]) {
+    /// (material colors already resolved by the caller);
+    /// `base_transform` is the owner's base placement (identity for
+    /// world-baked owners, the level origin for factored ones).
+    pub fn upsert_mesh(
+        &mut self,
+        id: EntityId,
+        mesh: &Mesh,
+        submesh_colors: &[[f32; 3]],
+        base_transform: &[f64; 12],
+    ) {
         // Expand to an interleaved (pos, normal, color) vertex stream.
         // Vertices are remapped per submesh so each vertex carries its
         // submesh's color (a vertex referenced by two submeshes is
@@ -604,6 +625,7 @@ impl Renderer {
                 wire_indices: wire_buf,
                 wire_index_count: wire.len() as u32,
                 triangle_count: (indices.len() / 3) as u32,
+                base: mat4_from_row_major_4x3(base_transform),
                 bbox_min,
                 bbox_max,
             },
@@ -665,19 +687,20 @@ impl Renderer {
     }
 
     /// Draw list per the facade rule: one draw per instance of a mesh
-    /// owner; owners with no instances draw once at identity.
+    /// owner (`world = instance ∘ base`, base applied first); owners
+    /// with no instances draw once at their base transform alone.
     fn draw_list(&self) -> Vec<(EntityId, Mat4)> {
         let mut draws: Vec<(EntityId, Mat4)> = Vec::new();
-        for id in self.meshes.keys() {
+        for (id, mesh) in &self.meshes {
             let mut any = false;
             for (element, m) in self.instances.values() {
                 if element == id {
-                    draws.push((*id, *m));
+                    draws.push((*id, *m * mesh.base));
                     any = true;
                 }
             }
             if !any {
-                draws.push((*id, Mat4::IDENTITY));
+                draws.push((*id, mesh.base));
             }
         }
         draws

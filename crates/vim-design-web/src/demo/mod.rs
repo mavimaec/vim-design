@@ -151,6 +151,10 @@ pub struct DemoApp {
     /// Commit -> mesh-ready latency of the last operation, milliseconds
     /// (evaluate_pending + poll_updates + GPU upload).
     last_latency_ms: f64,
+    /// Composition of the last poll (diagnostics for the perf work):
+    /// mesh upserts vs transform-only re-placements.
+    last_mesh_upserts: usize,
+    last_base_transforms: usize,
     committed: u64,
     evaluated: u64,
     pending: usize,
@@ -188,6 +192,11 @@ impl DemoApp {
         // initial slider sync then flows through the same pump path as
         // every later change.
         let mut engine = Engine::new();
+        // Translation factoring: this renderer composes
+        // `world = instance ∘ base`, so it opts in — level-elevation
+        // drags over fully-attached owners become transform-only
+        // (no re-evaluation, no re-tessellation, no buffer uploads).
+        engine.set_translation_factoring(true);
         let watch: BTreeSet<EntityId> = ids
             .cube_base_cps
             .iter()
@@ -230,6 +239,8 @@ impl DemoApp {
             active_elevation: 0.0,
             last_op: "initial scene".to_owned(),
             last_latency_ms: 0.0,
+            last_mesh_upserts: 0,
+            last_base_transforms: 0,
             committed: 0,
             evaluated: 0,
             pending: 0,
@@ -555,6 +566,15 @@ impl DemoApp {
         }
     }
 
+    /// True when element-creating actions are allowed: at least one
+    /// level exists and one is active (docs/AUTHORING.md §4: every new
+    /// element is associated with the active level, so with no levels
+    /// there is nothing to associate with). Phase C authoring controls
+    /// bind to this; today the Levels panel shows a hint when false.
+    pub fn can_author(&self) -> bool {
+        self.active_level.is_some()
+    }
+
     /// World AABB of the drawn scene (meshes x instances; overlays
     /// excluded) — the Playwright proof that dragging Ground moves the
     /// geometry while dragging an empty level does not.
@@ -639,6 +659,8 @@ impl DemoApp {
             "triangles": self.renderer.drawn_triangle_count(),
             "lastOp": self.last_op,
             "lastLatencyMs": self.last_latency_ms,
+            "lastMeshUpserts": self.last_mesh_upserts,
+            "lastBaseTransforms": self.last_base_transforms,
             "wireframe": self.renderer.wireframe,
             "canUndo": self.can_undo(),
             "canRedo": self.can_redo(),
@@ -710,7 +732,13 @@ impl DemoApp {
                 .iter()
                 .map(|sub| self.material_color(sub.material))
                 .collect();
-            self.renderer.upsert_mesh(mu.id, &mu.mesh, &colors);
+            self.renderer
+                .upsert_mesh(mu.id, &mu.mesh, &colors, &mu.base_transform);
+        }
+        // Transform-only re-placements (translation factoring): update
+        // the stored base, leave the GPU buffers alone.
+        for bt in &updates.base_transforms {
+            self.renderer.set_base_transform(bt.id, &bt.transform);
         }
         for iu in &updates.instances {
             self.renderer.upsert_instance(iu.id, iu.element_id, &iu.transform);
@@ -732,6 +760,8 @@ impl DemoApp {
         self.committed = updates.committed_generation;
         self.evaluated = updates.evaluated_generation;
         self.pending = updates.pending_count;
+        self.last_mesh_upserts = updates.meshes.len();
+        self.last_base_transforms = updates.base_transforms.len();
 
         // Session state + overlays react to any document change (levels
         // can appear/disappear via undo/redo as well as via the panel).

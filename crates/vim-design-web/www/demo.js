@@ -192,12 +192,14 @@ async function main() {
       .join("");
   const hexToFloat = (hex) => [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16) / 255);
 
+  // Honest cascade wording (docs/AUTHORING.md §2/§4, orphan-sweep
+  // semantics: association is mandatory and the cascade sweeps —
+  // associated elements are deleted COMPLETELY, construction geometry
+  // included; nothing survives as an orphan).
   const CASCADE_WORDING = (name) =>
     `Delete level "${name}"?\n\n` +
-    `Geometry ATTACHED to this level (control points and everything built ` +
-    `on them) will be deleted.\n` +
-    `Elements merely ASSOCIATED with it lose their element wrapper and ` +
-    `instances, but their geometry survives as standalone meshes.\n\n` +
+    `All elements associated with this level — and their geometry — ` +
+    `will be deleted.\n\n` +
     `One undo restores everything.`;
 
   const buildLevelRow = (lvl) => {
@@ -262,6 +264,11 @@ async function main() {
   const renderLevelsPanel = () => {
     const state = JSON.parse(app.levels_json());
     const list = $("level-list");
+    // No-levels guard: element creation is impossible without a level
+    // to associate with (app.can_author()); Phase C authoring controls
+    // bind to the same predicate. Today the visible affordance is this
+    // hint row.
+    $("no-levels-hint").style.display = state.levels.length === 0 ? "" : "none";
     // Display order: top story first (descending elevation); the sort
     // itself always derives from elevations (AUTHORING §2).
     const desired = [...state.levels].reverse();
@@ -316,6 +323,7 @@ async function main() {
     bbox: () => JSON.parse(app.scene_bbox_json()),
     levels: () => JSON.parse(app.levels_json()),
     site: () => JSON.parse(app.site_json()),
+    canAuthor: () => app.can_author(),
   };
 
   // -- Display options ---------------------------------------------------

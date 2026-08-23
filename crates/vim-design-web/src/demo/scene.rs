@@ -131,8 +131,8 @@ fn build_loop(doc: &mut Document, corners: &[[f64; 3]]) -> Result<Loop, String> 
 }
 
 /// Face from an outer wire (plus optional holes), extruded along a line
-/// from `path_from` to `path_to`. Returns (face, path_to control point,
-/// extrusion).
+/// from `path_from` to `path_to`. Returns (face, [path start cp, path
+/// end cp], extrusion).
 #[allow(clippy::type_complexity)]
 fn extrude_face(
     doc: &mut Document,
@@ -140,7 +140,7 @@ fn extrude_face(
     holes: Vec<EntityId>,
     path_from: [f64; 3],
     path_to: [f64; 3],
-) -> Result<(EntityId, EntityId, EntityId), String> {
+) -> Result<(EntityId, [EntityId; 2], EntityId), String> {
     let face = one(
         doc,
         Command::CreateFace {
@@ -159,7 +159,7 @@ fn extrude_face(
         },
     )?;
     let extrusion = one(doc, Command::CreateExtrusion { profile: face, path })?;
-    Ok((face, end_cp, extrusion))
+    Ok((face, [start_cp, end_cp], extrusion))
 }
 
 /// Material + face assignment.
@@ -297,17 +297,22 @@ pub fn build_scene(doc: &mut Document) -> Result<SceneIds, String> {
             [-HOLE_HALF, HOLE_HALF, 0.0],
         ],
     )?;
-    let (plate_face, plate_bottom_cp, plate_extrusion) = extrude_face(
+    let (plate_face, plate_path_cps, plate_extrusion) = extrude_face(
         doc,
         outer.wire,
         vec![hole.wire],
         [0.0, 0.0, 0.0],
         [0.0, 0.0, -DEFAULT_PLATE_THICKNESS],
     )?;
+    let plate_bottom_cp = plate_path_cps[1];
     assign_material(doc, plate_face, "concrete", [0.62, 0.61, 0.58], 0.9)?;
+    // Attach the WHOLE spatial closure — profile loops AND path points —
+    // so translation factoring qualifies the owner for level-local
+    // evaluation (one unattached point demotes it to world space).
     attach_all(doc, ground, &outer.cps)?;
     attach_all(doc, ground, &hole.cps)?;
-    let plate_element = place(doc, "floor plate", plate_extrusion, ground, [0.0, 0.0, 0.0])?;
+    attach_all(doc, ground, &plate_path_cps)?;
+    place(doc, "floor plate", plate_extrusion, ground, [0.0, 0.0, 0.0])?;
 
     // --- Cube (base square centered on its local origin) ---------------
     let s = DEFAULT_CUBE_SIZE / 2.0;
@@ -320,15 +325,17 @@ pub fn build_scene(doc: &mut Document) -> Result<SceneIds, String> {
             [-s, s, 0.0],
         ],
     )?;
-    let (cube_face, cube_top_cp, cube_extrusion) = extrude_face(
+    let (cube_face, cube_path_cps, cube_extrusion) = extrude_face(
         doc,
         cube_loop.wire,
         vec![],
         [0.0, 0.0, 0.0],
         [0.0, 0.0, DEFAULT_CUBE_SIZE],
     )?;
+    let cube_top_cp = cube_path_cps[1];
     assign_material(doc, cube_face, "brick", [0.72, 0.26, 0.20], 0.8)?;
     attach_all(doc, ground, &cube_loop.cps)?;
+    attach_all(doc, ground, &cube_path_cps)?;
     let cube_element = place(doc, "cube", cube_extrusion, ground, [-1.9, -1.0, 0.0])?;
     let cube_base_cps: [EntityId; 4] = cube_loop
         .cps
@@ -378,7 +385,7 @@ pub fn build_scene(doc: &mut Document) -> Result<SceneIds, String> {
     // the path start, so attaching only the center would change the path
     // vector (and thus the height) when the level moves.
     attach_all(doc, ground, &[cyl_center_cp, cyl_top_cp])?;
-    let cyl_element = place(doc, "cylinder", cyl_extrusion, ground, [1.9, -1.0, 0.0])?;
+    place(doc, "cylinder", cyl_extrusion, ground, [1.9, -1.0, 0.0])?;
 
     // --- Cone (right-triangle profile revolved 2π about the Z axis) ----
     let base_cp = one(doc, Command::CreateControlPoint { position: [0.0, 0.0, 0.0] })?;
@@ -431,7 +438,7 @@ pub fn build_scene(doc: &mut Document) -> Result<SceneIds, String> {
     attach_all(doc, ground, &[base_cp, cone_rim_cp, cone_apex_cp])?;
     // Back-right, clear of the cube's line of sight from the default
     // camera even when the cube is at its maximum size.
-    let cone_element = place(doc, "cone", cone_revolve, ground, [1.2, 1.4, 0.0])?;
+    place(doc, "cone", cone_revolve, ground, [1.2, 1.4, 0.0])?;
 
     Ok(SceneIds {
         cube_base_cps,

@@ -122,13 +122,20 @@ test("level-based authoring: site, level manager, ground drag, cascade delete, u
   const rowIdsAfterAdd = await page.$$eval(".level-row", (rows) => rows.map((r) => r.dataset.id));
   expect(rowIdsAfterAdd[0]).toBe(String(level3)); // sorted to the top
 
-  // --- Color change reflects in the overlay pixels ---------------------
+  // --- Color change reflects in the overlay pixels — and is COSMETIC:
+  // the change cutoff means zero re-tessellation (triangle count
+  // identical, trivial latency), yet the overlay repaints.
   const beforeColor = await canvasHash(page);
+  const trisBeforeColor = (await page.evaluate(() => window.__vimStats)).triangles;
   await setField(page, rowFor(page, ground).locator(".lvl-color"), "#ff2020");
   await waitSettled(page);
   expect(await canvasHash(page), "overlay color change repaints").not.toBe(beforeColor);
   state = await levels(page);
   expect(state.levels.find((l) => l.id === ground).color[0]).toBeCloseTo(1.0, 2);
+  stats = await page.evaluate(() => window.__vimStats);
+  expect(stats.triangles, "cosmetic edit does not re-tessellate").toBe(trisBeforeColor);
+  expect(stats.lastLatencyMs, "cosmetic edit is trivial").toBeLessThan(15);
+  console.log(`level color (cosmetic): commit→mesh ${stats.lastLatencyMs.toFixed(2)} ms`);
 
   // --- Active-level switching (session state) --------------------------
   const beforeActive = await canvasHash(page);
@@ -147,8 +154,11 @@ test("level-based authoring: site, level manager, ground drag, cascade delete, u
   // --- Delete an empty level: immediate, no dialog ----------------------
   page.on("dialog", (d) => {
     dialogCount++;
-    expect(d.message()).toContain("ATTACHED");
-    expect(d.message()).toContain("survives as standalone");
+    // Orphan-sweep semantics: the cascade deletes associated elements
+    // and their geometry completely.
+    expect(d.message()).toContain("All elements associated with this level");
+    expect(d.message()).toContain("and their geometry");
+    expect(d.message()).toContain("One undo restores everything");
     d.accept();
   });
   await rowFor(page, level3).locator(".lvl-delete").click();
@@ -185,6 +195,26 @@ test("level-based authoring: site, level manager, ground drag, cascade delete, u
 
   mkdirSync(screenshotDir, { recursive: true });
   await page.screenshot({ path: path.join(screenshotDir, "authoring-levels.png") });
+
+  // --- No-levels guard: deleting ALL levels (only reachable by
+  // cascading the last one) must not crash; the active level falls back
+  // to None, authoring is disabled, and the hint row shows.
+  expect(await page.evaluate(() => window.__vim.canAuthor())).toBe(true);
+  await expect(page.locator("#no-levels-hint")).toBeHidden();
+  await rowFor(page, level2).locator(".lvl-delete").click(); // empty: immediate
+  await waitSettled(page);
+  expect(dialogCount).toBe(1);
+  await rowFor(page, ground).locator(".lvl-delete").click(); // cascade: dialog #2
+  await waitSettled(page);
+  expect(dialogCount).toBe(2);
+  state = await levels(page);
+  expect(state.levels).toEqual([]);
+  expect(state.activeId).toBeNull();
+  expect(await page.evaluate(() => window.__vim.canAuthor())).toBe(false);
+  await expect(page.locator("#no-levels-hint")).toBeVisible();
+  stats = await page.evaluate(() => window.__vimStats);
+  expect(stats.settled).toBe(true);
+  expect(stats.errors).toEqual([]);
 
   expect(pageErrors, `page errors: ${pageErrors.join("; ")}`).toEqual([]);
 });
