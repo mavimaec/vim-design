@@ -4,9 +4,34 @@
 //! in an `Element`, and placed with an `Instance` (exercising the
 //! element/instance path of the mesh facade). The returned [`SceneIds`]
 //! registry holds exactly the entity ids the sliders need to update.
+//!
+//! Authoring-tool phase (docs/AUTHORING.md): the document is seeded with
+//! the Site singleton (downtown Montreal — the default lives HERE, in
+//! the app, per §1) and two levels; every object's profile control
+//! points are attached to "Ground" and every element is associated with
+//! it, so dragging Ground's elevation moves the whole scene.
 
 use vim_design_lib::entity::slot;
 use vim_design_lib::{Command, Document, EntityId, EntityKind, Params, ProvenancePath, SubRef};
+
+/// Site defaults (docs/AUTHORING.md §1): downtown Montreal.
+pub const DEFAULT_LATITUDE: f64 = 45.5019;
+pub const DEFAULT_LONGITUDE: f64 = -73.5674;
+pub const DEFAULT_SITE_ELEVATION: f64 = 36.0;
+pub const DEFAULT_TRUE_NORTH: f64 = 0.0;
+
+/// Display half-size of level overlay squares (meters).
+pub const LEVEL_EXTENT_M: f64 = 5.0;
+
+/// Palette for level colors (RGBA, translucent). Add-level cycles it.
+pub const LEVEL_COLORS: [[f32; 4]; 6] = [
+    [0.24, 0.62, 0.95, 0.28], // azure    (Ground)
+    [0.95, 0.62, 0.20, 0.28], // orange   (Level 2)
+    [0.45, 0.85, 0.45, 0.28], // green
+    [0.85, 0.45, 0.85, 0.28], // magenta
+    [0.95, 0.90, 0.30, 0.28], // yellow
+    [0.50, 0.90, 0.90, 0.28], // cyan
+];
 
 /// Default parameter values (meters) — must match the sliders' initial
 /// values in `www/index.html`.
@@ -54,6 +79,10 @@ pub struct SceneIds {
     pub cone_rim_cp: EntityId,
     /// Cone profile apex control point ((0, 0, height)).
     pub cone_apex_cp: EntityId,
+    /// The Site singleton (geolocation metadata).
+    pub site: EntityId,
+    /// The "Ground" level the scene is authored on.
+    pub ground: EntityId,
 }
 
 /// Submit a command that must succeed during scene construction.
@@ -190,7 +219,68 @@ fn place(
 }
 
 /// Build the whole scene; returns the slider registry.
+/// Attach control points to a construction plane. The scene is authored
+/// with Ground at elevation 0, whose frame is the identity — so keeping
+/// the stored coordinates verbatim (`position: None`) IS the
+/// world-preserving conversion: (u, v, w) == (x, y, z) at attach time,
+/// and no point jumps. This "attach at creation" choice (we control
+/// creation) avoids conversion arithmetic entirely; a later attach to a
+/// non-zero level would need the explicit `position: Some(world - frame
+/// origin)` form documented in docs/AUTHORING.md §3.
+fn attach_all(doc: &mut Document, plane: EntityId, cps: &[EntityId]) -> Result<(), String> {
+    for cp in cps {
+        ok(
+            doc,
+            Command::UpdateControlPointPlane {
+                id: *cp,
+                plane: Some(plane),
+                position: None,
+            },
+        )?;
+    }
+    Ok(())
+}
+
+/// Associate an element with a level (data-only, docs/AUTHORING.md §4).
+fn associate(doc: &mut Document, element: EntityId, level: EntityId) -> Result<(), String> {
+    ok(doc, Command::UpdateElementLevel { element, level: Some(level) })?;
+    Ok(())
+}
+
 pub fn build_scene(doc: &mut Document) -> Result<SceneIds, String> {
+    // --- Site singleton: the Montreal default lives in the app ---------
+    let site = one(
+        doc,
+        Command::CreateSite {
+            latitude_deg: DEFAULT_LATITUDE,
+            longitude_deg: DEFAULT_LONGITUDE,
+            elevation_m: DEFAULT_SITE_ELEVATION,
+            true_north_deg: DEFAULT_TRUE_NORTH,
+        },
+    )?;
+
+    // --- Levels: Ground (the scene's construction plane) + Level 2 -----
+    let ground = one(
+        doc,
+        Command::CreateLevel {
+            name: "Ground".to_owned(),
+            elevation_m: 0.0,
+            is_building_story: true,
+            color: LEVEL_COLORS[0],
+            extent_m: LEVEL_EXTENT_M,
+        },
+    )?;
+    one(
+        doc,
+        Command::CreateLevel {
+            name: "Level 2".to_owned(),
+            elevation_m: 3.0,
+            is_building_story: true,
+            color: LEVEL_COLORS[1],
+            extent_m: LEVEL_EXTENT_M,
+        },
+    )?;
+
     // --- Floor plate with a hole (ground, instanced at identity) -------
     let outer = build_loop(
         doc,
@@ -218,7 +308,10 @@ pub fn build_scene(doc: &mut Document) -> Result<SceneIds, String> {
         [0.0, 0.0, -DEFAULT_PLATE_THICKNESS],
     )?;
     assign_material(doc, plate_face, "concrete", [0.62, 0.61, 0.58], 0.9)?;
-    place(doc, "floor plate", plate_extrusion, [0.0, 0.0, 0.0])?;
+    attach_all(doc, ground, &outer.cps)?;
+    attach_all(doc, ground, &hole.cps)?;
+    let plate_element = place(doc, "floor plate", plate_extrusion, [0.0, 0.0, 0.0])?;
+    associate(doc, plate_element, ground)?;
 
     // --- Cube (base square centered on its local origin) ---------------
     let s = DEFAULT_CUBE_SIZE / 2.0;
@@ -239,7 +332,9 @@ pub fn build_scene(doc: &mut Document) -> Result<SceneIds, String> {
         [0.0, 0.0, DEFAULT_CUBE_SIZE],
     )?;
     assign_material(doc, cube_face, "brick", [0.72, 0.26, 0.20], 0.8)?;
+    attach_all(doc, ground, &cube_loop.cps)?;
     let cube_element = place(doc, "cube", cube_extrusion, [-1.9, -1.0, 0.0])?;
+    associate(doc, cube_element, ground)?;
     let cube_base_cps: [EntityId; 4] = cube_loop
         .cps
         .try_into()
@@ -278,8 +373,18 @@ pub fn build_scene(doc: &mut Document) -> Result<SceneIds, String> {
         .and_then(|line| line.inputs.get(1))
         .and_then(|slot| slot.referenced().next())
         .ok_or_else(|| "cylinder path line has no end control point".to_owned())?;
+    let cyl_center_cp = doc
+        .entity(cyl_line)
+        .and_then(|line| line.inputs.first())
+        .and_then(|slot| slot.referenced().next())
+        .ok_or_else(|| "cylinder path line has no start control point".to_owned())?;
     assign_material(doc, cyl_face, "steel blue", [0.22, 0.42, 0.72], 0.4)?;
-    place(doc, "cylinder", cyl_extrusion, [1.9, -1.0, 0.0])?;
+    // Attach BOTH path endpoints: the composite shares the center cp as
+    // the path start, so attaching only the center would change the path
+    // vector (and thus the height) when the level moves.
+    attach_all(doc, ground, &[cyl_center_cp, cyl_top_cp])?;
+    let cyl_element = place(doc, "cylinder", cyl_extrusion, [1.9, -1.0, 0.0])?;
+    associate(doc, cyl_element, ground)?;
 
     // --- Cone (right-triangle profile revolved 2π about the Z axis) ----
     let base_cp = one(doc, Command::CreateControlPoint { position: [0.0, 0.0, 0.0] })?;
@@ -329,9 +434,11 @@ pub fn build_scene(doc: &mut Document) -> Result<SceneIds, String> {
         },
     )?;
     assign_material(doc, cone_face, "amber", [0.88, 0.63, 0.14], 0.6)?;
+    attach_all(doc, ground, &[base_cp, cone_rim_cp, cone_apex_cp])?;
     // Back-right, clear of the cube's line of sight from the default
     // camera even when the cube is at its maximum size.
-    place(doc, "cone", cone_revolve, [1.2, 1.4, 0.0])?;
+    let cone_element = place(doc, "cone", cone_revolve, [1.2, 1.4, 0.0])?;
+    associate(doc, cone_element, ground)?;
 
     Ok(SceneIds {
         cube_base_cps,
@@ -345,6 +452,70 @@ pub fn build_scene(doc: &mut Document) -> Result<SceneIds, String> {
         cyl_top_cp,
         cone_rim_cp,
         cone_apex_cp,
+        site,
+        ground,
+    })
+}
+
+// ---------------------------------------------------------------------
+// Authoring-tool readers (site + levels are enumerated from the
+// document — order derived from elevation, never stored).
+// ---------------------------------------------------------------------
+
+/// One level's params, read back for the level manager UI.
+pub struct LevelInfo {
+    pub id: EntityId,
+    pub name: String,
+    pub elevation_m: f64,
+    pub is_building_story: bool,
+    pub color: [f32; 4],
+    pub extent_m: f64,
+}
+
+/// All levels, sorted by elevation ASCENDING (ties broken by id for
+/// determinism). The UI displays them top-story-first (descending); the
+/// sort itself is always derived, never stored (docs/AUTHORING.md §2).
+pub fn levels_sorted(doc: &Document) -> Vec<LevelInfo> {
+    let mut levels: Vec<LevelInfo> = doc
+        .entities()
+        .filter_map(|(id, record)| match &record.params {
+            Params::Level {
+                name,
+                elevation_m,
+                is_building_story,
+                color,
+                extent_m,
+            } => Some(LevelInfo {
+                id: *id,
+                name: name.clone(),
+                elevation_m: *elevation_m,
+                is_building_story: *is_building_story,
+                color: *color,
+                extent_m: *extent_m,
+            }),
+            _ => None,
+        })
+        .collect();
+    levels.sort_by(|a, b| {
+        a.elevation_m
+            .partial_cmp(&b.elevation_m)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.id.cmp(&b.id))
+    });
+    levels
+}
+
+/// The Site singleton's params (there is at most one; `None` on a
+/// document without a site).
+pub fn site_params(doc: &Document) -> Option<(EntityId, f64, f64, f64, f64)> {
+    doc.entities().find_map(|(id, record)| match &record.params {
+        Params::Site {
+            latitude_deg,
+            longitude_deg,
+            elevation_m,
+            true_north_deg,
+        } => Some((*id, *latitude_deg, *longitude_deg, *elevation_m, *true_north_deg)),
+        _ => None,
     })
 }
 

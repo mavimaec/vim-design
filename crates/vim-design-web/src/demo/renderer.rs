@@ -105,6 +105,27 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 fn fs_wire(in: VsOut) -> @location(0) vec4<f32> {
     return vec4<f32>(encode(globals.wire_color.rgb), globals.wire_color.a);
 }
+
+// Level overlays (docs/AUTHORING.md §2): translucent colored squares in
+// world coordinates — unlit, alpha-blended, depth-tested but not
+// depth-written so the scene stays visible through them.
+struct OverlayOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) color: vec4<f32>,
+};
+
+@vertex
+fn vs_overlay(@location(0) p: vec3<f32>, @location(1) c: vec4<f32>) -> OverlayOut {
+    var out: OverlayOut;
+    out.pos = globals.view_proj * vec4<f32>(p, 1.0);
+    out.color = c;
+    return out;
+}
+
+@fragment
+fn fs_overlay(in: OverlayOut) -> @location(0) vec4<f32> {
+    return vec4<f32>(encode(in.color.rgb), in.color.a);
+}
 "#;
 
 struct GpuMesh {
@@ -114,6 +135,18 @@ struct GpuMesh {
     wire_indices: wgpu::Buffer,
     wire_index_count: u32,
     triangle_count: u32,
+    /// Local-space AABB (before instance transforms), for scene queries.
+    bbox_min: [f32; 3],
+    bbox_max: [f32; 3],
+}
+
+/// One level overlay square, in world coordinates.
+pub struct OverlayQuad {
+    pub elevation: f32,
+    /// Half-size of the square (meters).
+    pub extent: f32,
+    /// RGBA; the caller pre-applies any active-level emphasis.
+    pub color: [f32; 4],
 }
 
 pub struct Renderer {
@@ -124,6 +157,9 @@ pub struct Renderer {
     depth_view: wgpu::TextureView,
     fill_pipeline: wgpu::RenderPipeline,
     wire_pipeline: wgpu::RenderPipeline,
+    overlay_pipeline: wgpu::RenderPipeline,
+    overlay_buf: Option<wgpu::Buffer>,
+    overlay_vertex_count: u32,
     globals_buf: wgpu::Buffer,
     globals_bind: wgpu::BindGroup,
     model_layout: wgpu::BindGroupLayout,
@@ -383,6 +419,56 @@ impl Renderer {
             Some(wgpu::BlendState::ALPHA_BLENDING),
         );
 
+        // Level overlays: own pipeline (pos + rgba vertices, no model
+        // matrix — world coordinates directly; globals only).
+        let overlay_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("overlay pipeline layout"),
+            bind_group_layouts: &[&globals_layout],
+            push_constant_ranges: &[],
+        });
+        let overlay_vertex = wgpu::VertexBufferLayout {
+            array_stride: 7 * 4,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4],
+        };
+        let overlay_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("overlay"),
+            layout: Some(&overlay_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_overlay"),
+                compilation_options: Default::default(),
+                buffers: std::slice::from_ref(&overlay_vertex),
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                // Depth-tested (occluded by geometry in front) but never
+                // written, so the scene stays visible through the plane.
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_overlay"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview: None,
+            cache: None,
+        });
+
         Ok(Renderer {
             surface,
             device,
@@ -391,6 +477,9 @@ impl Renderer {
             depth_view,
             fill_pipeline,
             wire_pipeline,
+            overlay_pipeline,
+            overlay_buf: None,
+            overlay_vertex_count: 0,
             globals_buf,
             globals_bind,
             model_layout,
@@ -498,6 +587,14 @@ impl Renderer {
                 contents: &u32s_to_bytes(&wire),
                 usage: wgpu::BufferUsages::INDEX,
             });
+        let mut bbox_min = [f32::INFINITY; 3];
+        let mut bbox_max = [f32::NEG_INFINITY; 3];
+        for p in &mesh.positions {
+            for axis in 0..3 {
+                bbox_min[axis] = bbox_min[axis].min(p[axis]);
+                bbox_max[axis] = bbox_max[axis].max(p[axis]);
+            }
+        }
         self.meshes.insert(
             id,
             GpuMesh {
@@ -507,8 +604,64 @@ impl Renderer {
                 wire_indices: wire_buf,
                 wire_index_count: wire.len() as u32,
                 triangle_count: (indices.len() / 3) as u32,
+                bbox_min,
+                bbox_max,
             },
         );
+    }
+
+    /// Replace the level-overlay quads (world coordinates; caller passes
+    /// them back-to-front, i.e. ascending elevation).
+    pub fn set_overlays(&mut self, quads: &[OverlayQuad]) {
+        let mut verts: Vec<f32> = Vec::with_capacity(quads.len() * 6 * 7);
+        for q in quads {
+            let (e, z) = (q.extent, q.elevation);
+            let corners = [
+                [-e, -e], [e, -e], [e, e], // triangle 1
+                [-e, -e], [e, e], [-e, e], // triangle 2
+            ];
+            for [x, y] in corners {
+                verts.extend_from_slice(&[x, y, z]);
+                verts.extend_from_slice(&q.color);
+            }
+        }
+        self.overlay_vertex_count = (verts.len() / 7) as u32;
+        self.overlay_buf = (!verts.is_empty()).then(|| {
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("level overlays"),
+                    contents: &f32s_to_bytes(&verts),
+                    usage: wgpu::BufferUsages::VERTEX,
+                })
+        });
+    }
+
+    /// World-space AABB of the drawn scene (meshes x instance
+    /// transforms; overlays excluded). `None` when nothing is drawn.
+    pub fn scene_bbox(&self) -> Option<([f64; 3], [f64; 3])> {
+        let mut min = [f64::INFINITY; 3];
+        let mut max = [f64::NEG_INFINITY; 3];
+        let mut any = false;
+        for (id, m) in self.draw_list() {
+            let mesh = &self.meshes[&id];
+            if mesh.index_count == 0 {
+                continue;
+            }
+            any = true;
+            for cx in [mesh.bbox_min[0], mesh.bbox_max[0]] {
+                for cy in [mesh.bbox_min[1], mesh.bbox_max[1]] {
+                    for cz in [mesh.bbox_min[2], mesh.bbox_max[2]] {
+                        let world = m * glam::Vec4::new(cx, cy, cz, 1.0);
+                        let w = [f64::from(world.x), f64::from(world.y), f64::from(world.z)];
+                        for axis in 0..3 {
+                            min[axis] = min[axis].min(w[axis]);
+                            max[axis] = max[axis].max(w[axis]);
+                        }
+                    }
+                }
+            }
+        }
+        any.then_some((min, max))
     }
 
     /// Draw list per the facade rule: one draw per instance of a mesh
@@ -628,6 +781,15 @@ impl Renderer {
                     pass.set_index_buffer(mesh.wire_indices.slice(..), wgpu::IndexFormat::Uint32);
                     pass.draw_indexed(0..mesh.wire_index_count, 0, 0..1);
                 }
+            }
+
+            // Level overlays last: translucent planes blended over the
+            // opaque scene, depth-tested against it.
+            if let Some(buf) = &self.overlay_buf {
+                pass.set_pipeline(&self.overlay_pipeline);
+                pass.set_bind_group(0, &self.globals_bind, &[]);
+                pass.set_vertex_buffer(0, buf.slice(..));
+                pass.draw(0..self.overlay_vertex_count, 0..1);
             }
         }
         self.queue.submit([encoder.finish()]);

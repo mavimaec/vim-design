@@ -18,6 +18,16 @@ WASM browser test app. Two pages, served by
   (`evaluate_pending` → `poll_updates` → GPU upload); the status line
   shows generations, commit→mesh latency, triangle count, and eval
   errors. Undo/Redo buttons revert whole slider gestures.
+  Authoring phase B (docs/AUTHORING.md): the document seeds a Site
+  singleton (Montreal defaults live in the app) and two levels; every
+  object's profile control points are attached to "Ground" and every
+  element associated with it — dragging Ground's elevation moves the
+  whole scene. The right-hand panel hosts project settings (lat/long/
+  elevation) and the level manager (derived elevation sort, add/rename/
+  re-elevate/story/color, cascade delete with an honest confirmation,
+  one-undo restore); level overlays are translucent squares drawn from
+  Level params (never meshes); the active level is session state with
+  nearest-elevation fallback.
 - **`www/probe.html` — the wasm threading probe**: measures whether
   rayon-on-wasm achieves true parallelism in the browser.
 

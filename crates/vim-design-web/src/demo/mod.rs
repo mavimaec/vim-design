@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use glam::{Mat4, Vec3};
 use vim_design_lib::eval::Engine;
-use vim_design_lib::{Command, Document, EntityId, Params};
+use vim_design_lib::{Command, Document, EntityId, Params, VimStatus};
 use wasm_bindgen::prelude::*;
 
 use renderer::{Renderer, DEFAULT_COLOR};
@@ -50,17 +50,28 @@ struct Gestures {
     marks: Vec<usize>,
     /// Step counts popped by `undo`, consumed by `redo`.
     redo_counts: Vec<usize>,
-    current: Option<&'static str>,
+    current: Option<String>,
 }
 
 impl Gestures {
-    fn begin(&mut self, doc: &Document, name: &'static str) {
-        if self.current != Some(name) {
+    fn begin(&mut self, doc: &Document, name: &str) {
+        if self.current.as_deref() != Some(name) {
             self.marks.push(doc.undo_depth());
-            self.current = Some(name);
+            self.current = Some(name.to_owned());
         }
         // Any new command invalidates the document's redo stack.
         self.redo_counts.clear();
+    }
+
+    /// Record a one-shot operation (add/delete level, ...) that was
+    /// already submitted successfully: `depth` is the undo depth
+    /// captured BEFORE the submit. Used instead of `begin` when the
+    /// command may be rejected — a rejected command must not leave a
+    /// stray gesture mark or clear the redo counts.
+    fn one_shot(&mut self, depth: usize) {
+        self.marks.push(depth);
+        self.redo_counts.clear();
+        self.current = None;
     }
 
     fn undo(&mut self, doc: &mut Document) -> bool {
@@ -129,6 +140,13 @@ pub struct DemoApp {
     /// [`DemoApp::take_params_dirty`] — the page's trigger to resync the
     /// slider DOM from the document.
     params_dirty: bool,
+    /// The active level (docs/AUTHORING.md §5): SESSION state, never in
+    /// the document, never undoable. `None` only when no levels exist.
+    active_level: Option<EntityId>,
+    /// Last known elevation of the active level — the fallback metric
+    /// when the active level disappears (delete, undo of its creation):
+    /// the nearest remaining level by elevation becomes active.
+    active_elevation: f64,
     last_op: String,
     /// Commit -> mesh-ready latency of the last operation, milliseconds
     /// (evaluate_pending + poll_updates + GPU upload).
@@ -181,9 +199,17 @@ impl DemoApp {
                 ids.cyl_top_cp,
                 ids.cone_rim_cp,
                 ids.cone_apex_cp,
+                // Authoring panels: the Site singleton and every level
+                // (later-created levels are added dynamically, grow-only).
+                ids.site,
             ])
+            .chain(scene::levels_sorted(&doc).iter().map(|l| l.id))
             .collect();
         engine.set_params_watch(Some(watch.clone()));
+
+        // Session state: the scene is authored on Ground, so it starts
+        // as the active level.
+        let ground = ids.ground;
 
         let mut app = DemoApp {
             doc,
@@ -200,6 +226,8 @@ impl DemoApp {
             errors: BTreeMap::new(),
             watch,
             params_dirty: false,
+            active_level: Some(ground),
+            active_elevation: 0.0,
             last_op: "initial scene".to_owned(),
             last_latency_ms: 0.0,
             committed: 0,
@@ -364,6 +392,181 @@ impl DemoApp {
         self.sync("cone height");
     }
 
+    // -- Authoring: Site + Levels (docs/AUTHORING.md) ---------------------
+    // Ids cross the JS boundary as f64 (they are small; f64 is exact far
+    // beyond any id this app will allocate).
+
+    /// The Site singleton's editable fields.
+    pub fn site_json(&self) -> String {
+        match scene::site_params(&self.doc) {
+            Some((id, lat, lon, elev, north)) => serde_json::json!({
+                "id": id.0 as f64,
+                "latitude": lat,
+                "longitude": lon,
+                "elevation": elev,
+                "trueNorth": north,
+            })
+            .to_string(),
+            None => "null".to_owned(),
+        }
+    }
+
+    pub fn set_site(&mut self, latitude: f64, longitude: f64, elevation: f64) {
+        let Some((id, ..)) = scene::site_params(&self.doc) else {
+            return;
+        };
+        self.gestures.begin(&self.doc, "site");
+        self.submit(Command::UpdateSite {
+            id,
+            latitude_deg: Some(latitude),
+            longitude_deg: Some(longitude),
+            elevation_m: Some(elevation),
+            true_north_deg: None,
+            coalesce: true,
+        });
+        self.sync("site");
+    }
+
+    /// Level list (ascending elevation — the panel displays it top story
+    /// first) plus the session's active level id.
+    pub fn levels_json(&self) -> String {
+        let levels: Vec<serde_json::Value> = scene::levels_sorted(&self.doc)
+            .iter()
+            .map(|l| {
+                serde_json::json!({
+                    "id": l.id.0 as f64,
+                    "name": l.name,
+                    "elevation": l.elevation_m,
+                    "isStory": l.is_building_story,
+                    "color": l.color,
+                    "extent": l.extent_m,
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "activeId": self.active_level.map(|id| id.0 as f64),
+            "levels": levels,
+        })
+        .to_string()
+    }
+
+    /// Select the active level — SESSION state only: no document
+    /// mutation, no undo step, no pump traffic. The overlay emphasis
+    /// updates immediately; the page re-renders its panel by hand (this
+    /// is the one legitimate hand-placed refresh, because there is no
+    /// document change to pump).
+    pub fn set_active_level(&mut self, id: f64) -> bool {
+        let id = EntityId(id as u64);
+        if self.doc.entity(id).is_none() {
+            return false;
+        }
+        self.active_level = Some(id);
+        self.refresh_session_and_overlays();
+        true
+    }
+
+    /// Create a level above the current top (+3 m), cycling the palette.
+    pub fn add_level(&mut self) {
+        let levels = scene::levels_sorted(&self.doc);
+        let top = levels.last().map_or(0.0, |l| l.elevation_m);
+        let elevation = if levels.is_empty() { 0.0 } else { top + 3.0 };
+        let name = format!("Level {}", levels.len() + 1);
+        let color = scene::LEVEL_COLORS[levels.len() % scene::LEVEL_COLORS.len()];
+        let depth = self.doc.undo_depth();
+        match self.doc.submit(Command::CreateLevel {
+            name,
+            elevation_m: elevation,
+            is_building_story: true,
+            color,
+            extent_m: scene::LEVEL_EXTENT_M,
+        }) {
+            Ok(out) => {
+                self.gestures.one_shot(depth);
+                for id in out.created_ids {
+                    if self.watch.insert(id) {
+                        self.engine.set_params_watch(Some(self.watch.clone()));
+                    }
+                }
+            }
+            Err(status) => web_sys::console::error_1(&JsValue::from_str(&format!(
+                "CreateLevel rejected: {status:?}"
+            ))),
+        }
+        self.sync("add level");
+    }
+
+    pub fn update_level_name(&mut self, id: f64, name: String) {
+        self.submit_level_update(id, "level name", Some(name), None, None, None);
+    }
+
+    pub fn update_level_elevation(&mut self, id: f64, elevation: f64) {
+        self.submit_level_update(id, "level elevation", None, Some(elevation), None, None);
+    }
+
+    pub fn update_level_story(&mut self, id: f64, is_story: bool) {
+        self.submit_level_update(id, "level story", None, None, Some(is_story), None);
+    }
+
+    /// Update a level's overlay color, preserving its stored alpha.
+    pub fn update_level_color(&mut self, id: f64, r: f32, g: f32, b: f32) {
+        let eid = EntityId(id as u64);
+        let alpha = scene::levels_sorted(&self.doc)
+            .iter()
+            .find(|l| l.id == eid)
+            .map_or(0.28, |l| l.color[3]);
+        self.submit_level_update(id, "level color", None, None, None, Some([r, g, b, alpha]));
+    }
+
+    /// Non-cascade delete attempt. Returns `"deleted"`,
+    /// `"has_dependents"` (the page shows the cascade confirmation), or
+    /// an error string. A rejection leaves the document, the pump, and
+    /// the gesture stack completely untouched.
+    pub fn delete_level(&mut self, id: f64) -> String {
+        let eid = EntityId(id as u64);
+        let depth = self.doc.undo_depth();
+        match self.doc.submit(Command::DeleteLevel { id: eid, cascade: false }) {
+            Ok(_) => {
+                self.gestures.one_shot(depth);
+                self.sync("delete level");
+                "deleted".to_owned()
+            }
+            Err(VimStatus::HasDependents) => "has_dependents".to_owned(),
+            Err(status) => format!("error: {status:?}"),
+        }
+    }
+
+    /// Confirmed cascade delete: the level plus its transitive dependent
+    /// closure, ONE undo step (docs/AUTHORING.md §2).
+    pub fn delete_level_cascade(&mut self, id: f64) -> bool {
+        let eid = EntityId(id as u64);
+        let depth = self.doc.undo_depth();
+        match self.doc.submit(Command::DeleteLevel { id: eid, cascade: true }) {
+            Ok(_) => {
+                self.gestures.one_shot(depth);
+                self.sync("delete level (cascade)");
+                true
+            }
+            Err(status) => {
+                web_sys::console::error_1(&JsValue::from_str(&format!(
+                    "DeleteLevel cascade rejected: {status:?}"
+                )));
+                false
+            }
+        }
+    }
+
+    /// World AABB of the drawn scene (meshes x instances; overlays
+    /// excluded) — the Playwright proof that dragging Ground moves the
+    /// geometry while dragging an empty level does not.
+    pub fn scene_bbox_json(&self) -> String {
+        match self.renderer.scene_bbox() {
+            Some((min, max)) => {
+                serde_json::json!({ "min": min, "max": max }).to_string()
+            }
+            None => "null".to_owned(),
+        }
+    }
+
     // -- Undo / redo ------------------------------------------------------
 
     pub fn undo(&mut self) -> bool {
@@ -446,6 +649,37 @@ impl DemoApp {
 }
 
 impl DemoApp {
+    /// Shared body of the level-field updates: one gesture per
+    /// (field, level), coalesced document-side per entity. Note the
+    /// document's coalesce key is (label, id), so consecutive edits to
+    /// DIFFERENT fields of the same level merge into one undo step —
+    /// acceptable "per-level fiddling burst" granularity for a testbed.
+    fn submit_level_update(
+        &mut self,
+        id: f64,
+        op: &str,
+        name: Option<String>,
+        elevation_m: Option<f64>,
+        is_building_story: Option<bool>,
+        color: Option<[f32; 4]>,
+    ) {
+        let eid = EntityId(id as u64);
+        if self.doc.entity(eid).is_none() {
+            return;
+        }
+        self.gestures.begin(&self.doc, &format!("{op}_{}", eid.0));
+        self.submit(Command::UpdateLevel {
+            id: eid,
+            name,
+            elevation_m,
+            is_building_story,
+            color,
+            extent_m: None,
+            coalesce: true,
+        });
+        self.sync(op);
+    }
+
     fn submit(&mut self, cmd: Command) {
         let label = cmd.label();
         if let Err(status) = self.doc.submit(cmd) {
@@ -498,8 +732,63 @@ impl DemoApp {
         self.committed = updates.committed_generation;
         self.evaluated = updates.evaluated_generation;
         self.pending = updates.pending_count;
+
+        // Session state + overlays react to any document change (levels
+        // can appear/disappear via undo/redo as well as via the panel).
+        self.refresh_session_and_overlays();
+
         self.last_latency_ms = now_ms() - t0;
         self.last_op = op.to_owned();
+    }
+
+    /// Validate the active level against the document (fallback: nearest
+    /// remaining level by elevation — docs/AUTHORING.md §5) and rebuild
+    /// the renderer's level-overlay quads from current Level params.
+    fn refresh_session_and_overlays(&mut self) {
+        let levels = scene::levels_sorted(&self.doc);
+
+        let alive = self
+            .active_level
+            .filter(|id| self.doc.entity(*id).is_some());
+        self.active_level = alive.or_else(|| {
+            levels
+                .iter()
+                .min_by(|a, b| {
+                    let da = (a.elevation_m - self.active_elevation).abs();
+                    let db = (b.elevation_m - self.active_elevation).abs();
+                    da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .map(|l| l.id)
+        });
+        if let Some(active) = self.active_level {
+            if let Some(info) = levels.iter().find(|l| l.id == active) {
+                self.active_elevation = info.elevation_m;
+            }
+        }
+
+        // Overlay quads, ascending elevation (back-to-front from the
+        // usual above-the-scene camera). The active level is emphasized
+        // with a brighter alpha.
+        let quads: Vec<renderer::OverlayQuad> = levels
+            .iter()
+            .map(|l| {
+                let active = Some(l.id) == self.active_level;
+                // Seen nearly edge-on the squares cover much of the
+                // viewport, so the resting alpha is modest; the active
+                // level is emphasized with a brighter one.
+                let alpha = if active {
+                    (l.color[3] * 1.2).min(0.6)
+                } else {
+                    l.color[3] * 0.45
+                };
+                renderer::OverlayQuad {
+                    elevation: l.elevation_m as f32,
+                    extent: l.extent_m as f32,
+                    color: [l.color[0], l.color[1], l.color[2], alpha],
+                }
+            })
+            .collect();
+        self.renderer.set_overlays(&quads);
     }
 
     fn material_color(&self, material: Option<EntityId>) -> [f32; 3] {
