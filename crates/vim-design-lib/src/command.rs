@@ -300,9 +300,13 @@ pub enum Command {
         id: EntityId,
     },
     // -- Element -------------------------------------------------------
+    /// Every element is associated with exactly one level (mandatory,
+    /// 2026-08-23 — docs/AUTHORING.md §4): element creation is rejected
+    /// (`MissingRequiredSlot`) when no Level exists to associate with.
     CreateElement {
         name: String,
         members: Vec<EntityId>,
+        level: EntityId,
     },
     UpdateElement {
         id: EntityId,
@@ -310,8 +314,23 @@ pub enum Command {
         members: Option<Vec<EntityId>>,
         coalesce: bool,
     },
+    /// Delete an element. With `sweep_orphans` (the default), the
+    /// element's construction-geometry input closure is garbage-collected
+    /// afterwards: members whose only consumer was this element — and
+    /// transitively their now-unreferenced inputs — are deleted leaf-first
+    /// in the same command group (one undo step). Geometry still
+    /// referenced elsewhere (shared control points, selection scopes)
+    /// survives by the ordinary dependent rules. Only construction kinds
+    /// are swept (ControlPoint/Line/Circle/Spline/Edge/Wire/Face/
+    /// Extrusion/Revolve/Solid/Chamfer) — never Site, Level, Material,
+    /// Selection, Plane (authored reference geometry), Element, or
+    /// Instance. `sweep_orphans: false` is the keep-geometry escape hatch
+    /// for re-grouping workflows. Deleting an *instance* never sweeps —
+    /// the last placement must not destroy the reusable definition.
     DeleteElement {
         id: EntityId,
+        #[serde(default = "default_true")]
+        sweep_orphans: bool,
     },
     // -- Instance -----------------------------------------------------
     CreateInstance {
@@ -396,13 +415,13 @@ pub enum Command {
         id: EntityId,
         cascade: bool,
     },
-    /// Associate (`level: Some(l)`) or dissociate (`level: None`) an
-    /// element with a level. Data-only (docs/AUTHORING.md §4): zero
-    /// geometric effect — re-evaluation after this rewire produces
-    /// byte-identical meshes.
+    /// Re-associate an element with a different level (association is
+    /// mandatory — there is no dissociated state). Data-only
+    /// (docs/AUTHORING.md §4): zero geometric effect — re-evaluation
+    /// after this rewire produces byte-identical meshes.
     UpdateElementLevel {
         element: EntityId,
-        level: Option<EntityId>,
+        level: EntityId,
     },
     // -- Composites (docs/ARCHITECTURE.md §4.2) --------------------------
     /// Vertical cylinder at `center`: expands to control points, circle,
@@ -426,6 +445,12 @@ pub enum Command {
     DeleteCylinder {
         extrusion: EntityId,
     },
+}
+
+/// Serde default for `DeleteElement::sweep_orphans` — sweeping is the
+/// normal semantic; opting out is explicit.
+fn default_true() -> bool {
+    true
 }
 
 /// Result of a successful command.
@@ -1147,12 +1172,12 @@ fn run(ctx: &mut Ctx<'_>, command: &Command) -> Result<(), VimStatus> {
         Command::DeleteSectionBox { id } => ctx.delete(*id, EntityKind::SectionBox),
 
         // -- Element ------------------------------------------------------
-        Command::CreateElement { name, members } => {
+        Command::CreateElement { name, members, level } => {
             ctx.create(
                 Params::Element { name: name.clone() },
                 vec![
                     SlotValue::Many(members.clone()),
-                    SlotValue::One(None), // level association (data-only)
+                    SlotValue::One(Some(*level)), // mandatory association
                 ],
             )?;
             Ok(())
@@ -1176,7 +1201,22 @@ fn run(ctx: &mut Ctx<'_>, command: &Command) -> Result<(), VimStatus> {
             }
             Ok(())
         }
-        Command::DeleteElement { id } => ctx.delete(*id, EntityKind::Element),
+        Command::DeleteElement { id, sweep_orphans } => {
+            let record = ctx.expect_kind(*id, EntityKind::Element)?;
+            let candidates = if *sweep_orphans {
+                sweepable_input_closure(ctx.doc.graph_ref(), record.referenced())
+            } else {
+                std::collections::BTreeSet::new()
+            };
+            // Reject-if-dependents (instances) is enforced by the Remove
+            // delta as usual; the sweep runs only after the element
+            // itself is gone.
+            ctx.apply(Delta::Remove {
+                id: *id,
+                record,
+            })?;
+            sweep_orphans_now(ctx, candidates)
+        }
 
         // -- Instance ----------------------------------------------------
         Command::CreateInstance { element, transform } => {
@@ -1216,8 +1256,8 @@ fn run(ctx: &mut Ctx<'_>, command: &Command) -> Result<(), VimStatus> {
             scope,
             frozen,
         } => {
-            // Scope ids live in params (docs/ARCHITECTURE.md §3.5), but
-            // they still get a structural existence check at creation.
+            // Explicit scope ids are mirrored into the scope slot so they
+            // are real graph edges (dependents pin them; 2026-08-23).
             validate_scope(ctx, scope)?;
             ctx.create(
                 Params::Selection {
@@ -1225,7 +1265,7 @@ fn run(ctx: &mut Ctx<'_>, command: &Command) -> Result<(), VimStatus> {
                     scope: scope.clone(),
                     frozen: *frozen,
                 },
-                vec![],
+                vec![SlotValue::Many(scope_mirror_ids(scope))],
             )?;
             Ok(())
         }
@@ -1247,6 +1287,11 @@ fn run(ctx: &mut Ctx<'_>, command: &Command) -> Result<(), VimStatus> {
             };
             if let Some(scope) = scope {
                 validate_scope(ctx, scope)?;
+                ctx.rewire(
+                    *id,
+                    slot::SELECTION_SCOPE,
+                    SlotValue::Many(scope_mirror_ids(scope)),
+                )?;
             }
             ctx.set_params(
                 *id,
@@ -1367,7 +1412,7 @@ fn run(ctx: &mut Ctx<'_>, command: &Command) -> Result<(), VimStatus> {
         }
         Command::UpdateElementLevel { element, level } => {
             ctx.expect_kind(*element, EntityKind::Element)?;
-            ctx.rewire(*element, slot::ELEMENT_LEVEL, SlotValue::One(*level))
+            ctx.rewire(*element, slot::ELEMENT_LEVEL, SlotValue::One(Some(*level)))
         }
 
         // -- Composites -----------------------------------------------------
@@ -1463,6 +1508,94 @@ fn upsert_assignment(
     }
     list.sort();
     list
+}
+
+/// The graph-edge mirror of a selection scope: explicit ids for
+/// `Entities`/`Element` scopes (sorted, deduplicated), empty for
+/// `Global` (the sanctioned implicit dependency, docs/ARCHITECTURE.md
+/// §3.5).
+fn scope_mirror_ids(scope: &SelectionScope) -> Vec<EntityId> {
+    let mut ids = match scope {
+        SelectionScope::Entities(ids) => ids.clone(),
+        SelectionScope::Element(id) => vec![*id],
+        SelectionScope::Global { .. } => Vec::new(),
+    };
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+/// Kinds the orphan sweep may collect: the geometry construction chain.
+/// Deliberately excluded (flagged decisions, docs/AUTHORING.md §4):
+/// `Site`/`Level` (document structure), `Material` (shared assets),
+/// `Selection` (queries), `Plane` (authored reference geometry),
+/// `Element`/`Instance` (grouping/placement are deleted explicitly,
+/// never collected).
+fn sweepable(kind: EntityKind) -> bool {
+    matches!(
+        kind,
+        EntityKind::ControlPoint
+            | EntityKind::Line
+            | EntityKind::Circle
+            | EntityKind::Spline
+            | EntityKind::Edge
+            | EntityKind::Wire
+            | EntityKind::Face
+            | EntityKind::Extrusion
+            | EntityKind::Revolve
+            | EntityKind::Solid
+            | EntityKind::Chamfer
+    )
+}
+
+/// Transitive input closure of `roots`, traversing only sweepable kinds
+/// (a non-sweepable node is neither collected nor traversed through —
+/// e.g. a face's material or a point's level stops the walk).
+fn sweepable_input_closure(
+    graph: &crate::graph::GraphState,
+    roots: impl IntoIterator<Item = EntityId>,
+) -> std::collections::BTreeSet<EntityId> {
+    let mut closure = std::collections::BTreeSet::new();
+    let mut stack: Vec<EntityId> = roots.into_iter().collect();
+    while let Some(id) = stack.pop() {
+        let Some(record) = graph.get(id) else { continue };
+        if !sweepable(record.kind()) {
+            continue;
+        }
+        if closure.insert(id) {
+            stack.extend(record.referenced());
+        }
+    }
+    closure
+}
+
+/// Scoped reference-counting collection: iteratively delete candidates
+/// whose remaining dependent count is zero, leaf-first, until a
+/// fixpoint. Survivors (shared inputs, selection-scoped geometry) are
+/// left alone by the ordinary reject-if-dependents rules — no special
+/// cases. Runs inside the calling command's group: one undo step.
+fn sweep_orphans_now(
+    ctx: &mut Ctx<'_>,
+    mut candidates: std::collections::BTreeSet<EntityId>,
+) -> Result<(), VimStatus> {
+    loop {
+        let deletable: Vec<EntityId> = candidates
+            .iter()
+            .filter(|id| {
+                ctx.doc.graph_ref().contains(**id)
+                    && !ctx.doc.graph_ref().has_dependents(**id)
+            })
+            .copied()
+            .collect();
+        if deletable.is_empty() {
+            return Ok(());
+        }
+        for id in deletable {
+            let record = ctx.record(id)?;
+            ctx.apply(Delta::Remove { id, record })?;
+            candidates.remove(&id);
+        }
+    }
 }
 
 /// Existence check for selection-scope ids (kind constraints are the
@@ -1659,6 +1792,21 @@ fn update_cylinder(
 fn delete_level_cascade(ctx: &mut Ctx<'_>, level: EntityId) -> Result<(), VimStatus> {
     ctx.expect_kind(level, EntityKind::Level)?;
     let mut remaining = ctx.doc.graph_ref().dirty_closure([level]);
+    // Cascaded element deletions sweep too (2026-08-23): collect every
+    // closure element's construction-input closure up front, so a level
+    // cascade leaves zero orphaned geometry (association is mandatory,
+    // so every element of the level is in the dependent closure).
+    let mut sweep_candidates = std::collections::BTreeSet::new();
+    for id in &remaining {
+        if let Some(record) = ctx.doc.graph_ref().get(*id) {
+            if record.kind() == EntityKind::Element {
+                sweep_candidates.extend(sweepable_input_closure(
+                    ctx.doc.graph_ref(),
+                    record.referenced(),
+                ));
+            }
+        }
+    }
     while !remaining.is_empty() {
         let deletable: Vec<EntityId> = remaining
             .iter()
@@ -1674,7 +1822,7 @@ fn delete_level_cascade(ctx: &mut Ctx<'_>, level: EntityId) -> Result<(), VimSta
             remaining.remove(&id);
         }
     }
-    Ok(())
+    sweep_orphans_now(ctx, sweep_candidates)
 }
 
 fn delete_cylinder(ctx: &mut Ctx<'_>, extrusion: EntityId) -> Result<(), VimStatus> {

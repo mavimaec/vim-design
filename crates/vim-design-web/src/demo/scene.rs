@@ -188,12 +188,14 @@ fn assign_material(
     Ok(material)
 }
 
-/// Wrap a solid producer in an element and place one instance of it.
+/// Wrap a solid producer in an element (associated with `level` —
+/// association is mandatory) and place one instance of it.
 /// Returns the element id.
 fn place(
     doc: &mut Document,
     name: &str,
     member: EntityId,
+    level: EntityId,
     translate: [f64; 3],
 ) -> Result<EntityId, String> {
     let element = one(
@@ -201,6 +203,7 @@ fn place(
         Command::CreateElement {
             name: name.to_owned(),
             members: vec![member],
+            level,
         },
     )?;
     let [x, y, z] = translate;
@@ -238,12 +241,6 @@ fn attach_all(doc: &mut Document, plane: EntityId, cps: &[EntityId]) -> Result<(
             },
         )?;
     }
-    Ok(())
-}
-
-/// Associate an element with a level (data-only, docs/AUTHORING.md §4).
-fn associate(doc: &mut Document, element: EntityId, level: EntityId) -> Result<(), String> {
-    ok(doc, Command::UpdateElementLevel { element, level: Some(level) })?;
     Ok(())
 }
 
@@ -310,8 +307,7 @@ pub fn build_scene(doc: &mut Document) -> Result<SceneIds, String> {
     assign_material(doc, plate_face, "concrete", [0.62, 0.61, 0.58], 0.9)?;
     attach_all(doc, ground, &outer.cps)?;
     attach_all(doc, ground, &hole.cps)?;
-    let plate_element = place(doc, "floor plate", plate_extrusion, [0.0, 0.0, 0.0])?;
-    associate(doc, plate_element, ground)?;
+    let plate_element = place(doc, "floor plate", plate_extrusion, ground, [0.0, 0.0, 0.0])?;
 
     // --- Cube (base square centered on its local origin) ---------------
     let s = DEFAULT_CUBE_SIZE / 2.0;
@@ -333,8 +329,7 @@ pub fn build_scene(doc: &mut Document) -> Result<SceneIds, String> {
     )?;
     assign_material(doc, cube_face, "brick", [0.72, 0.26, 0.20], 0.8)?;
     attach_all(doc, ground, &cube_loop.cps)?;
-    let cube_element = place(doc, "cube", cube_extrusion, [-1.9, -1.0, 0.0])?;
-    associate(doc, cube_element, ground)?;
+    let cube_element = place(doc, "cube", cube_extrusion, ground, [-1.9, -1.0, 0.0])?;
     let cube_base_cps: [EntityId; 4] = cube_loop
         .cps
         .try_into()
@@ -383,8 +378,7 @@ pub fn build_scene(doc: &mut Document) -> Result<SceneIds, String> {
     // the path start, so attaching only the center would change the path
     // vector (and thus the height) when the level moves.
     attach_all(doc, ground, &[cyl_center_cp, cyl_top_cp])?;
-    let cyl_element = place(doc, "cylinder", cyl_extrusion, [1.9, -1.0, 0.0])?;
-    associate(doc, cyl_element, ground)?;
+    let cyl_element = place(doc, "cylinder", cyl_extrusion, ground, [1.9, -1.0, 0.0])?;
 
     // --- Cone (right-triangle profile revolved 2π about the Z axis) ----
     let base_cp = one(doc, Command::CreateControlPoint { position: [0.0, 0.0, 0.0] })?;
@@ -437,8 +431,7 @@ pub fn build_scene(doc: &mut Document) -> Result<SceneIds, String> {
     attach_all(doc, ground, &[base_cp, cone_rim_cp, cone_apex_cp])?;
     // Back-right, clear of the cube's line of sight from the default
     // camera even when the cube is at its maximum size.
-    let cone_element = place(doc, "cone", cone_revolve, [1.2, 1.4, 0.0])?;
-    associate(doc, cone_element, ground)?;
+    let cone_element = place(doc, "cone", cone_revolve, ground, [1.2, 1.4, 0.0])?;
 
     Ok(SceneIds {
         cube_base_cps,

@@ -166,7 +166,15 @@ fn delete_undo_restores_same_id_and_wiring() {
     // Delete a whole leaf-first chain, then undo in reverse order.
     ok(&mut doc, Command::DeleteInstance { id: chain.instances[1] });
     ok(&mut doc, Command::DeleteInstance { id: chain.instances[0] });
-    ok(&mut doc, Command::DeleteElement { id: chain.element });
+    // sweep_orphans: false — this test exercises MANUAL leaf-first
+    // deletion; the sweep variant is covered in orphan_sweep.rs.
+    ok(
+        &mut doc,
+        Command::DeleteElement {
+            id: chain.element,
+            sweep_orphans: false,
+        },
+    );
     ok(&mut doc, Command::DeleteExtrusion { id: chain.extrusion });
     assert!(doc.entity(chain.extrusion).is_none());
     for _ in 0..4 {

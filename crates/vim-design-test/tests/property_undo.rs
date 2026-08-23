@@ -26,6 +26,8 @@ enum Op {
     // the cascade delete (a whole command group to invert).
     CreateSite(i16),
     CreateLevel(i16),
+    CreateElement { member: usize, level: usize },
+    DeleteElement { pick: usize, sweep: bool },
     UpdateLevelElevation { pick: usize, elevation: i16, coalesce: bool },
     AttachCp { cp: usize, level: usize, detach: bool },
     DeleteLevelCascade(usize),
@@ -56,6 +58,12 @@ fn op_strategy() -> impl Strategy<Value = Op> {
         2 => (any::<usize>(), any::<usize>(), any::<bool>())
             .prop_map(|(cp, level, detach)| Op::AttachCp { cp, level, detach }),
         1 => any::<usize>().prop_map(Op::DeleteLevelCascade),
+        2 => (any::<usize>(), any::<usize>())
+            .prop_map(|(member, level)| Op::CreateElement { member, level }),
+        // The orphan sweep is a whole reference-counted collection to
+        // invert mechanically — stress both flag values.
+        2 => (any::<usize>(), any::<bool>())
+            .prop_map(|(pick, sweep)| Op::DeleteElement { pick, sweep }),
     ]
 }
 
@@ -207,6 +215,30 @@ fn run_op(doc: &mut Document, op: &Op) {
                     position: None,
                 },
                 _ => fallback,
+            }
+        }
+        Op::CreateElement { member, level } => {
+            let mut producers = ids_of_kind(doc, EntityKind::Extrusion);
+            producers.extend(ids_of_kind(doc, EntityKind::Revolve));
+            producers.sort_unstable();
+            let levels = ids_of_kind(doc, EntityKind::Level);
+            match (pick(&producers, *member), pick(&levels, *level)) {
+                (Some(member), Some(level)) => Command::CreateElement {
+                    name: "e".to_owned(),
+                    members: vec![member],
+                    level,
+                },
+                _ => fallback,
+            }
+        }
+        Op::DeleteElement { pick: p, sweep } => {
+            let elements = ids_of_kind(doc, EntityKind::Element);
+            match pick(&elements, *p) {
+                Some(id) => Command::DeleteElement {
+                    id,
+                    sweep_orphans: *sweep,
+                },
+                None => fallback,
             }
         }
         // Deletes the whole dependent closure as ONE undo group — the

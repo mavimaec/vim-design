@@ -83,8 +83,11 @@ Plus two kinds from the authoring-tool direction (2026-08-23, see
 - **`Level`** — named elevation with `is_building_story`, display color/extent;
   evaluates to a **`Frame`** (origin + orthonormal basis) making it a *construction
   plane*: `ControlPoint` gains an optional `plane` input slot whose coordinates are
-  then interpreted as (u,v,w) in that frame, and `Element` gains an optional `level`
-  *association* slot (data-only, no geometric effect). Frame bases must follow the
+  then interpreted as (u,v,w) in that frame, and `Element` carries a **required**
+  `level` *association* slot (data-only, no geometric effect; mandatory since
+  2026-08-23 — element creation requires an existing Level, and a loaded document
+  with a level-less element is malformed). Element deletion sweeps its orphaned
+  construction inputs by default (AUTHORING.md §4). Frame bases must follow the
   deterministic basis-stability rule (AUTHORING.md §3 — the frame analog of §3.4).
 
 > Note: `Element`/`Instance` commands (`CreateElement`, `CreateInstance`, …) extend the
@@ -199,6 +202,12 @@ no predicate interpreter. Tier 2 is justified when a scenario genuinely needs
 current milestone does. The `Selection` entity kind, predicate AST, and
 `Ref { Entity | Sub }` types stay in the substrate (structurally validated,
 serialized, `NotYetImplemented` at evaluation) so adopting tier 2 later is additive.
+*Update 2026-08-23:* explicit selection scopes (`Entities(...)`/`Element(...)`) are
+now mirrored into a real `scope` slot (the `face_materials` mirror pattern), making
+scoped entities true dependents: they cannot be deleted from under a selection and
+the element orphan sweep leaves them alone by the ordinary rules. `Global` scopes
+remain edge-free (the sanctioned implicit dependency). Consequence: an explicit
+scope now participates in the structural cycle check.
 
 ## 4. Command system
 

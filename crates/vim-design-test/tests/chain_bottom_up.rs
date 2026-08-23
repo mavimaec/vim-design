@@ -103,12 +103,23 @@ fn bottom_up_chain_builds_with_monotonic_ids_and_valid_index() {
         "material wired into the face's material slot"
     );
 
-    // Element + instances.
+    // Element + instances (level association is mandatory).
+    let level = checked_one(
+        &mut doc,
+        Command::CreateLevel {
+            name: "Ground".to_owned(),
+            elevation_m: 0.0,
+            is_building_story: true,
+            color: [0.2, 0.5, 0.9, 0.35],
+            extent_m: 10.0,
+        },
+    );
     let element = checked_one(
         &mut doc,
         Command::CreateElement {
             name: "column".to_owned(),
             members: vec![extrusion],
+            level,
         },
     );
     let inst_a = checked_one(

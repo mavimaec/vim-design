@@ -262,6 +262,7 @@ pub mod slot {
     pub const ELEMENT_MEMBERS: usize = 0;
     pub const ELEMENT_LEVEL: usize = 1;
     pub const INSTANCE_ELEMENT: usize = 0;
+    pub const SELECTION_SCOPE: usize = 0;
 }
 
 const NO_SLOTS: &[SlotDecl] = &[];
@@ -451,10 +452,14 @@ const ELEMENT_SLOTS: &[SlotDecl] = &[
     // Association, not attachment (docs/AUTHORING.md §4): data-only
     // ("this wall belongs to Level 2") for organization and the deletion
     // cascade. Zero geometric effect — the element evaluator ignores it.
+    // REQUIRED (decision 2026-08-23): every element is associated with
+    // exactly one level, so element creation is structurally impossible
+    // in a document without levels, and a level cascade always pulls its
+    // elements into the dependent closure.
     SlotDecl {
         name: "level",
         accepted: &[EntityKind::Level],
-        required: false,
+        required: true,
         multi: false,
     },
 ];
@@ -466,6 +471,45 @@ const INSTANCE_SLOTS: &[SlotDecl] = &[SlotDecl {
     multi: false,
 }];
 
+/// Every entity kind — the acceptance list of the selection scope slot.
+const ANY_KIND: &[EntityKind] = &[
+    EntityKind::ControlPoint,
+    EntityKind::Plane,
+    EntityKind::Circle,
+    EntityKind::Line,
+    EntityKind::Spline,
+    EntityKind::Edge,
+    EntityKind::Wire,
+    EntityKind::Face,
+    EntityKind::Solid,
+    EntityKind::Material,
+    EntityKind::Extrusion,
+    EntityKind::Revolve,
+    EntityKind::Chamfer,
+    EntityKind::SectionBox,
+    EntityKind::Element,
+    EntityKind::Instance,
+    EntityKind::Selection,
+    EntityKind::Site,
+    EntityKind::Level,
+];
+
+// Mirror of the explicit scope ids in `Params::Selection::scope`
+// (`Entities(...)` / `Element(...)`; empty for `Global`), kept in sync by
+// the selection commands — the same mirror-slot pattern as
+// `face_materials`. Promoted to real graph edges 2026-08-23 so that a
+// selection scoped to an entity is a true *dependent*: scoped entities
+// cannot be deleted from under a selection (reject-if-dependents), and
+// the orphan sweep leaves them alone by the ordinary rules — no special
+// cases. Global scopes remain the one sanctioned implicit dependency
+// (docs/ARCHITECTURE.md §3.5).
+const SELECTION_SLOTS: &[SlotDecl] = &[SlotDecl {
+    name: "scope",
+    accepted: ANY_KIND,
+    required: false,
+    multi: true,
+}];
+
 /// The static slot table for an entity kind — the single source of truth
 /// for structural validation (docs/ARCHITECTURE.md §3.2).
 pub fn slots(kind: EntityKind) -> &'static [SlotDecl] {
@@ -473,9 +517,9 @@ pub fn slots(kind: EntityKind) -> &'static [SlotDecl] {
         EntityKind::Plane
         | EntityKind::Material
         | EntityKind::SectionBox
-        | EntityKind::Selection
         | EntityKind::Site
         | EntityKind::Level => NO_SLOTS,
+        EntityKind::Selection => SELECTION_SLOTS,
         EntityKind::ControlPoint => CONTROL_POINT_SLOTS,
         EntityKind::Circle => CIRCLE_SLOTS,
         EntityKind::Line => LINE_SLOTS,

@@ -66,6 +66,8 @@ pub fn assert_save_load_roundtrip(doc: &Document) {
 /// 2 instances.
 pub struct Chain {
     pub cps: [EntityId; 4],
+    /// The level the element is (mandatorily) associated with.
+    pub level: EntityId,
     pub spline: EntityId,
     pub edge: EntityId,
     pub wire: EntityId,
@@ -138,11 +140,22 @@ pub fn build_chain(doc: &mut Document) -> Chain {
             material: Some(material),
         },
     );
+    let level = one(
+        doc,
+        Command::CreateLevel {
+            name: "Ground".to_owned(),
+            elevation_m: 0.0,
+            is_building_story: true,
+            color: [0.2, 0.5, 0.9, 0.35],
+            extent_m: 10.0,
+        },
+    );
     let element = one(
         doc,
         Command::CreateElement {
             name: "wall".to_owned(),
             members: vec![extrusion],
+            level,
         },
     );
     let instances = [
@@ -163,6 +176,7 @@ pub fn build_chain(doc: &mut Document) -> Chain {
     ];
     Chain {
         cps,
+        level,
         spline,
         edge,
         wire,

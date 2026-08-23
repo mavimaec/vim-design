@@ -48,7 +48,10 @@ fn delete_with_dependents_is_rejected_and_dependents_are_queryable() {
 
     assert_rejected(
         &mut doc,
-        Command::DeleteElement { id: chain.element },
+        Command::DeleteElement {
+            id: chain.element,
+            sweep_orphans: true,
+        },
         VimStatus::HasDependents,
     );
     assert_eq!(

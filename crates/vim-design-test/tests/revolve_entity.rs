@@ -178,18 +178,36 @@ fn delete_revolve_and_undo_redo() {
     let cone = build_cone(&mut doc, [0.0, 0.0, 0.0], 1.5, 2.0);
 
     // Revolve is a valid element member (docs/ARCHITECTURE.md §3.1).
+    let level = one(
+        &mut doc,
+        Command::CreateLevel {
+            name: "Ground".to_owned(),
+            elevation_m: 0.0,
+            is_building_story: true,
+            color: [0.2, 0.5, 0.9, 0.35],
+            extent_m: 10.0,
+        },
+    );
     let element = one(
         &mut doc,
         Command::CreateElement {
             name: "cone".to_owned(),
             members: vec![cone.revolve],
+            level,
         },
     );
     assert_eq!(
         doc.submit(Command::DeleteRevolve { id: cone.revolve }).err(),
         Some(VimStatus::HasDependents)
     );
-    ok(&mut doc, Command::DeleteElement { id: element });
+    // Keep-geometry escape hatch: the revolve must survive the delete.
+    ok(
+        &mut doc,
+        Command::DeleteElement {
+            id: element,
+            sweep_orphans: false,
+        },
+    );
 
     let bytes_with_revolve = save(&doc);
     ok(&mut doc, Command::DeleteRevolve { id: cone.revolve });

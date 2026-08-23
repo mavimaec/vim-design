@@ -200,11 +200,22 @@ fn element_absorbs_standalone_mesh_and_materials_map_to_submeshes() {
 
     // Wrap it into an element with two instances: the standalone mesh is
     // tombstoned and the geometry re-delivered under the element id.
+    let level = one(
+        &mut doc,
+        Command::CreateLevel {
+            name: "Ground".to_owned(),
+            elevation_m: 0.0,
+            is_building_story: true,
+            color: [0.2, 0.5, 0.9, 0.35],
+            extent_m: 10.0,
+        },
+    );
     let element = one(
         &mut doc,
         Command::CreateElement {
             name: "cube".to_owned(),
             members: vec![cube.extrusion],
+            level,
         },
     );
     let instances = [

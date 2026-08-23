@@ -346,12 +346,14 @@ fn element_level_association_is_mesh_inert() {
     let mut doc = Document::new();
     let mut engine = Engine::new();
     let level = create_level(&mut doc, "L1", 0.0);
+    let level_2 = create_level(&mut doc, "L2", 3.0);
     let cube = build_cube(&mut doc, [0.0, 0.0, 0.0], 1.0, 1.0);
     let element = one(
         &mut doc,
         Command::CreateElement {
             name: "wall".to_owned(),
             members: vec![cube.extrusion],
+            level,
         },
     );
     engine.evaluate_pending(&mut doc);
@@ -364,15 +366,17 @@ fn element_level_association_is_mesh_inert() {
         .mesh
         .clone();
 
-    // Associate: data-only. The element re-evaluates (the rewire dirties
-    // it — params_changed reports it, correctly), but its output is
-    // independent of the level slot, so the re-tessellated mesh is
-    // byte-identical. That's the honest contract asserted here.
+    // Re-associate to another level: data-only. The element re-evaluates
+    // (the rewire dirties it — params_changed reports it, correctly),
+    // but its output is independent of the level slot, so the
+    // re-tessellated mesh is byte-identical. That's the honest contract
+    // asserted here. (Association is mandatory now — there is no
+    // dissociated state, only re-association.)
     ok(
         &mut doc,
         Command::UpdateElementLevel {
             element,
-            level: Some(level),
+            level: level_2,
         },
     );
     engine.evaluate_pending(&mut doc);
@@ -390,12 +394,12 @@ fn element_level_association_is_mesh_inert() {
     assert_eq!(after.indices, before.indices);
     assert_eq!(after.submeshes, before.submeshes);
 
-    // Dissociate: byte-identical again.
+    // Re-associate back: byte-identical again.
     ok(
         &mut doc,
         Command::UpdateElementLevel {
             element,
-            level: None,
+            level,
         },
     );
     engine.evaluate_pending(&mut doc);
@@ -424,13 +428,7 @@ fn delete_level_cascade_is_one_undo_group_and_restores_byte_exact() {
         Command::CreateElement {
             name: "box".to_owned(),
             members: vec![attached.extrusion],
-        },
-    );
-    ok(
-        &mut doc,
-        Command::UpdateElementLevel {
-            element,
-            level: Some(level),
+            level,
         },
     );
     let instance = one(
@@ -465,10 +463,11 @@ fn delete_level_cascade_is_one_undo_group_and_restores_byte_exact() {
     assert!(doc.entity(attached.extrusion).is_none());
     assert!(doc.entity(element).is_none(), "associated element cascaded");
     assert!(doc.entity(instance).is_none(), "instance cascaded");
-    // Non-dependents survive: the unattached path control points and the
-    // bystander cube.
-    assert!(doc.entity(attached.path_cps[0]).is_some());
-    assert!(doc.entity(attached.path_cps[1]).is_some());
+    // Zero-orphan semantics (2026-08-23): the cascaded element deletion
+    // SWEEPS its construction-input closure, so even the unattached path
+    // control points are collected. Only true bystanders survive.
+    assert!(doc.entity(attached.path_cps[0]).is_none(), "swept");
+    assert!(doc.entity(attached.path_cps[1]).is_none(), "swept");
     assert!(doc.entity(bystander.extrusion).is_some());
     doc.debug_validate().expect("consistent after cascade");
 

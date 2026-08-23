@@ -38,14 +38,16 @@ avoid known failures of existing tools (see the pitfall table, §7).
   **in one undo group** — so undoing a confirmed level deletion restores the level
   *and* every associated element atomically. (Contrast: Revit deletes hosted elements
   with a warning many users miss, and undo granularity is not guaranteed.)
-  *Library precision (Phase A, 2026-08-23)*: the cascade deletes exactly the level's
-  **transitive dependent closure** — attached control points and everything downstream
-  of them; associated elements and their instances. *Inputs* of cascaded entities that
-  are not themselves dependents of the level survive: an element that is merely
-  associated (not attached) loses its element wrapper and instances, but its member
-  geometry remains (and its solid producer resurfaces as a standalone mesh). Fully
-  removing such an element's geometry means attaching it (or deleting it explicitly);
-  the UI prompt should say which will happen.
+  *Library precision (updated 2026-08-23, orphan-sweep milestone)*: the cascade
+  deletes the level's **transitive dependent closure** (attached control points and
+  everything downstream; associated elements — association is mandatory, so every
+  element of the level is in the closure — and their instances), and every cascaded
+  element deletion additionally runs the **orphan sweep** over its construction-input
+  closure. Result: a level cascade leaves **zero orphaned geometry** — the earlier
+  "merely-associated elements keep their geometry" behavior is obsolete. Survivors are
+  only entities still referenced elsewhere (shared inputs, selection scopes) and the
+  never-swept kinds (Site, remaining Levels, Materials, Planes, Selections). The UI
+  confirmation dialog wording must be updated accordingly in the next demo milestone.
 
 ## 3. Construction planes
 
@@ -83,17 +85,29 @@ avoid known failures of existing tools (see the pitfall table, §7).
 ## 4. Association vs. attachment (two different relationships)
 
 - **Attachment** (geometric): control point → construction plane. Moves geometry.
-- **Association** (data): `Element` gains an optional `level` slot — "this wall belongs
-  to Level 2" for organization, filtering, schedules, and the deletion cascade. It has
+- **Association** (data): `Element` has a **required** `level` slot (decision
+  2026-08-23: every element is associated with exactly one level; element creation is
+  structurally impossible in a document with no levels). "This wall belongs to
+  Level 2" — for organization, filtering, schedules, and the deletion cascade. It has
   **no geometric effect** (*library precision*: the rewire dirties the element
   parametrically — the pump reports it, and the mesh is re-delivered byte-identical;
-  the element evaluator ignores the slot. Association commands are the additive
-  `UpdateElementLevel { element, level: Option }` — `Create/UpdateElement` keep their
-  frozen shapes for existing callers, and the app sets the active-level association
-  right after create); an element associated with a level whose geometry is
+  the element evaluator ignores the slot. `CreateElement` takes the level id;
+  `UpdateElementLevel { element, level }` re-associates — there is no dissociated
+  state. Pre-1.0 serialization note: a loaded document containing an element without
+  a level is malformed and rejected with the typed load error); an element associated with a level whose geometry is
   attached to a different plane is legal (useful for e.g. a roof associated with the
   top story but modeled from a sloped plane).
 - Every new element is associated with the **active level** at creation time.
+- **Element deletion sweeps orphans** (2026-08-23): `DeleteElement { sweep_orphans }`
+  defaults to sweeping — after the element goes, its construction-input closure is
+  reference-count-collected leaf-first in the same undo group, so deleting an element
+  removes its private geometry completely while shared inputs (party-wall points,
+  selection-scoped entities) survive by the ordinary dependent rules.
+  `sweep_orphans: false` is the keep-geometry escape hatch for re-grouping. Flagged
+  decisions: the sweep touches only construction kinds — **`Plane` is excluded as
+  authored reference geometry**, along with Site/Level/Material/Selection/Element/
+  Instance; and **`DeleteInstance` never sweeps** — deleting the last placement must
+  not destroy the reusable element definition.
 
 ## 5. Active level and active construction plane (session state, not document state)
 
