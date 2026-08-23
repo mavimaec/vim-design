@@ -338,6 +338,170 @@ fn paint_and_chamfer_survive_a_factored_drag() {
     assert_eq!(mesh_after.submeshes, mesh_before.submeshes, "paint intact");
 }
 
+/// Wrap each producer in an Element ASSOCIATED WITH `level` (the demo's
+/// exact shape: association target == the dragged attach level) plus one
+/// instance each. Returns the element ids (the new mesh owners).
+fn wrap_in_elements(
+    doc: &mut Document,
+    level: EntityId,
+    producers: &[EntityId],
+) -> Vec<EntityId> {
+    producers
+        .iter()
+        .enumerate()
+        .map(|(index, member)| {
+            let element = one(
+                doc,
+                Command::CreateElement {
+                    name: format!("e{index}"),
+                    members: vec![*member],
+                    level,
+                },
+            );
+            one(
+                doc,
+                Command::CreateInstance {
+                    element,
+                    transform: vim_design_test::IDENTITY_XFORM,
+                },
+            );
+            element
+        })
+        .collect()
+}
+
+#[test]
+fn element_wrapped_attached_scene_drag_is_transform_only() {
+    // THE demo shape: four fully-attached objects, each wrapped in an
+    // element associated with the SAME level being dragged. The
+    // data-only association edge must not break the transform-only path.
+    let mut doc = Document::new();
+    let mut engine = factored_engine();
+    let level = create_level(&mut doc, 0.5);
+    let scene = build_fully_attached_scene(&mut doc, level);
+    let elements = wrap_in_elements(&mut doc, level, &scene.owners);
+    engine.evaluate_pending(&mut doc);
+    let updates = engine.poll_updates(&doc);
+    assert!(updates.errors.is_empty(), "{:?}", updates.errors);
+    assert_eq!(updates.meshes.len(), 4, "owners are the elements now");
+    for update in &updates.meshes {
+        assert!(elements.contains(&update.id));
+        assert_eq!(translation_of(update.base_transform), [0.0, 0.0, 0.5]);
+    }
+    let tess_before: Vec<u64> = elements
+        .iter()
+        .map(|e| engine.tessellation_count(*e))
+        .collect();
+    let element_evals_before: Vec<u64> =
+        elements.iter().map(|e| engine.eval_count(*e)).collect();
+
+    ok(
+        &mut doc,
+        Command::UpdateLevel {
+            id: level,
+            name: None,
+            elevation_m: Some(2.0),
+            is_building_story: None,
+            color: None,
+            extent_m: None,
+            coalesce: true,
+        },
+    );
+    engine.evaluate_pending(&mut doc);
+    let updates = engine.poll_updates(&doc);
+
+    assert!(
+        updates.meshes.is_empty(),
+        "transform-only despite the association edge: {:?}",
+        updates.meshes.iter().map(|m| m.id).collect::<Vec<_>>()
+    );
+    assert!(updates.errors.is_empty());
+    let mut moved: Vec<EntityId> =
+        updates.base_transforms.iter().map(|t| t.id).collect();
+    moved.sort();
+    let mut expected = elements.clone();
+    expected.sort();
+    assert_eq!(moved, expected, "exactly one base transform per element owner");
+    for update in &updates.base_transforms {
+        assert_eq!(translation_of(update.transform), [0.0, 0.0, 2.0]);
+    }
+    // Eval-count evidence: the elements were SKIPPED (the association
+    // edge is exempt from value-change propagation), and nothing was
+    // re-tessellated.
+    assert_eq!(
+        elements
+            .iter()
+            .map(|e| engine.eval_count(*e))
+            .collect::<Vec<_>>(),
+        element_evals_before,
+        "elements did not re-evaluate through the association edge"
+    );
+    assert_eq!(
+        elements
+            .iter()
+            .map(|e| engine.tessellation_count(*e))
+            .collect::<Vec<_>>(),
+        tess_before,
+        "zero re-tessellation"
+    );
+    assert_eq!(updates.committed_generation, updates.evaluated_generation);
+}
+
+#[test]
+fn association_rewire_still_redelivers_byte_identical() {
+    // The mesh-inert contract survives the exemption: REWIRING the
+    // association (a commit-gate root) still re-evaluates the element
+    // and re-delivers a byte-identical mesh, and the pump reports it.
+    let mut doc = Document::new();
+    let mut engine = factored_engine();
+    let level = create_level(&mut doc, 0.5);
+    let other = one(
+        &mut doc,
+        Command::CreateLevel {
+            name: "L2".to_owned(),
+            elevation_m: 3.0,
+            is_building_story: true,
+            color: [0.2, 0.5, 0.9, 0.35],
+            extent_m: 10.0,
+        },
+    );
+    let cube = build_cube(&mut doc, [0.0, 0.0, 0.0], 1.0, 1.0);
+    let mut cps = cube.base.cps.clone();
+    cps.extend(cube.path_cps);
+    attach_all(&mut doc, level, &cps);
+    let element = one(
+        &mut doc,
+        Command::CreateElement {
+            name: "cube".to_owned(),
+            members: vec![cube.extrusion],
+            level,
+        },
+    );
+    engine.evaluate_pending(&mut doc);
+    let updates = engine.poll_updates(&doc);
+    let before = updates.meshes[0].mesh.clone();
+    let base_before = updates.meshes[0].base_transform;
+
+    ok(
+        &mut doc,
+        Command::UpdateElementLevel {
+            element,
+            level: other,
+        },
+    );
+    engine.evaluate_pending(&mut doc);
+    let updates = engine.poll_updates(&doc);
+    assert!(updates.errors.is_empty());
+    assert!(updates.params_changed.contains(&element), "pump reports the rewire");
+    assert_eq!(updates.meshes.len(), 1, "root rewire re-delivers");
+    assert_eq!(updates.meshes[0].mesh.positions, before.positions);
+    assert_eq!(updates.meshes[0].mesh.indices, before.indices);
+    assert_eq!(updates.meshes[0].mesh.submeshes, before.submeshes);
+    // The base still follows the ATTACH level (association is data-only:
+    // members are attached to `level`, not `other`).
+    assert_eq!(updates.meshes[0].base_transform, base_before);
+}
+
 #[test]
 fn mixed_owner_keeps_the_full_reeval_path() {
     let mut doc = Document::new();

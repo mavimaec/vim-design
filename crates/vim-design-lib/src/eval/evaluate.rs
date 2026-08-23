@@ -337,6 +337,25 @@ fn value_equal(a: &Evaluated, b: &Evaluated) -> bool {
     }
 }
 
+/// The inputs an entity's evaluator actually READS — the change-driven
+/// re-evaluation trigger set. Data-only association edges are exempt:
+/// an `Element`'s level slot has zero geometric effect (docs/AUTHORING.md
+/// §4 — the element evaluator ignores it), so a level *value* change
+/// (elevation drag) must never re-evaluate the element through that
+/// edge. Rewiring the association still re-evaluates (the element is a
+/// commit-gate root then), and cascade/dependent semantics are
+/// structural, not evaluation — both unaffected by this exemption.
+fn evaluation_inputs(record: &EntityRecord) -> Vec<EntityId> {
+    match record.kind() {
+        EntityKind::Element => record
+            .inputs
+            .get(slot::ELEMENT_MEMBERS)
+            .map(|s| s.referenced().collect())
+            .unwrap_or_default(),
+        _ => record.referenced().collect(),
+    }
+}
+
 /// Result of one wave-batch evaluation.
 pub(crate) struct WaveResult {
     /// Outcomes for the entities that actually evaluated (skipped
@@ -383,7 +402,7 @@ pub(crate) fn evaluate_waves(
                     return true;
                 }
                 let own_space = space_of(**id);
-                record.referenced().any(|input| {
+                evaluation_inputs(record).into_iter().any(|input| {
                     if changed.contains(&input) {
                         return true;
                     }

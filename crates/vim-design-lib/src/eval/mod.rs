@@ -85,7 +85,13 @@
 //! square is a renderer overlay the app draws directly from
 //! `Params::Level` (elevation, color, extent) — model/view separation, a
 //! level has no volume. An element's `level` association slot is
-//! data-only: rewiring it re-delivers a byte-identical mesh.
+//! data-only: rewiring it re-delivers a byte-identical mesh, and level
+//! *value* changes (an elevation drag) never re-evaluate the element
+//! through that edge — the association is exempt from change-driven
+//! propagation because the element evaluator does not read it
+//! (docs/AUTHORING.md §4; cascade/dependent semantics are structural
+//! and unaffected). Element-wrapped attached owners therefore get the
+//! same transform-only elevation drags as standalone ones.
 //!
 //! # Evaluation performance: early cutoff and translation factoring
 //!
