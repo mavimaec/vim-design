@@ -106,6 +106,13 @@ test("demo scene renders and all six sliders re-mesh the scene", async ({ page }
     );
   }
 
+  // Feedback-loop guard: a normal slider drag must leave the slider at
+  // the dragged value — the dirty-pump-triggered resync (which fires on
+  // the drag's own params_changed) skips the active slider and never
+  // rewrites equal values.
+  await expect(page.locator("#cyl-height")).toHaveValue("2.8");
+  await expect(page.locator("#cyl-height-val")).toHaveText("2.80 m");
+
   // --- Wireframe toggle: off changes pixels, back on changes again ----
   const wireOnHash = prevHash;
   await page.locator("#wireframe").uncheck();

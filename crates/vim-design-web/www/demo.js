@@ -32,12 +32,24 @@ function showStatus(stats) {
   $("redo").disabled = !stats.canRedo;
 }
 
-function refresh(app, op) {
+// Reaction to the parametric dirty pump; assigned in main() once the
+// sliders exist. Receives the id of the slider being actively dragged
+// (if any) so the resync never fights the drag.
+let onParamsDirty = null;
+
+function refresh(app, op, activeSliderId) {
   const stats = JSON.parse(app.stats_json());
   if (op) {
     (window.__latencyLog[op] ??= []).push(stats.lastLatencyMs);
   }
   showStatus(stats);
+  // The dirty pump is the ONE trigger for slider DOM synchronization:
+  // Updates.params_changed (watched ids, from submit/undo/redo alike)
+  // sets a flag we drain here. No mutation path carries its own
+  // hand-placed resync call.
+  if (onParamsDirty && app.take_params_dirty()) {
+    onParamsDirty(activeSliderId);
+  }
   return stats;
 }
 
@@ -109,21 +121,33 @@ async function main() {
       const v = parseFloat(input.value);
       label.textContent = `${v.toFixed(2)} m`;
       apply(v);
-      refresh(app, op);
+      // The drag itself lands in params_changed too (unidirectional
+      // data flow); pass our id so the pump-triggered resync skips the
+      // slider that is actively being dragged.
+      refresh(app, op, id);
     });
   }
 
-  // Resynchronize every slider position + label from the document (the
-  // single source of truth) — at startup and after undo/redo, when the
-  // model changes without the sliders being touched.
-  const syncSlidersFromDocument = () => {
+  // Resynchronize the slider DOM from the document (the single source
+  // of truth). Triggered ONLY by the dirty pump via refresh(); the pump
+  // reports per-entity ids, but the reaction deliberately resyncs the
+  // whole panel — with seven sliders the win is what *triggers* the
+  // sync, not per-slider granularity. Feedback-loop guards: the actively
+  // dragged slider is skipped entirely, and other sliders' DOM values
+  // are only written when they actually differ.
+  const syncSlidersFromDocument = (skipId) => {
     const params = JSON.parse(app.params_json());
     for (const [id, , key] of sliders) {
+      if (id === skipId) continue;
+      const input = $(id);
       const v = params[key];
-      $(id).value = String(v);
+      if (parseFloat(input.value) !== v) {
+        input.value = String(v);
+      }
       $(`${id}-val`).textContent = `${v.toFixed(2)} m`;
     }
   };
+  onParamsDirty = syncSlidersFromDocument;
 
   // -- Display options ---------------------------------------------------
   $("wireframe").addEventListener("change", (e) => {
@@ -131,18 +155,13 @@ async function main() {
     refresh(app);
   });
 
-  // -- Undo / redo -------------------------------------------------------
+  // -- Undo / redo: submit + poll only — slider resync arrives through
+  // the dirty pump inside refresh(), same as every other mutation.
   $("undo").addEventListener("click", () => {
-    if (app.undo()) {
-      refresh(app, "undo");
-      syncSlidersFromDocument();
-    }
+    if (app.undo()) refresh(app, "undo");
   });
   $("redo").addEventListener("click", () => {
-    if (app.redo()) {
-      refresh(app, "redo");
-      syncSlidersFromDocument();
-    }
+    if (app.redo()) refresh(app, "redo");
   });
 
   // -- Frame loop --------------------------------------------------------
@@ -163,8 +182,10 @@ async function main() {
     requestAnimationFrame(frame);
   };
 
+  // Initial slider state flows through the same pump path: the scene
+  // build dirtied every watched entity, so this first poll-processing
+  // refresh() fires the resync — no hand-placed startup sync.
   refresh(app, "initial scene");
-  syncSlidersFromDocument();
   requestAnimationFrame(frame);
 }
 

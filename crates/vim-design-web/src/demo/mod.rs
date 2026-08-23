@@ -7,7 +7,7 @@
 mod renderer;
 mod scene;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use glam::{Mat4, Vec3};
 use vim_design_lib::eval::Engine;
@@ -115,6 +115,20 @@ pub struct DemoApp {
     camera: Camera,
     gestures: Gestures,
     errors: BTreeMap<EntityId, String>,
+    /// The dirty pump's interest filter (docs/ARCHITECTURE.md §6.3):
+    /// exactly the entities the sliders derive their values from.
+    ///
+    /// Watch-set decision: *grow-only dynamic set*. The static slider
+    /// sources are registered at startup; the chamfer entity — created
+    /// and deleted at runtime — is added the moment it is created and
+    /// never removed. A watched-but-dead id costs nothing (ids are not
+    /// reused), and keeping it covers undo/redo replays, which
+    /// re-create the same entity id behind the app's back.
+    watch: BTreeSet<EntityId>,
+    /// Set when a poll reported a non-empty `params_changed`; drained by
+    /// [`DemoApp::take_params_dirty`] — the page's trigger to resync the
+    /// slider DOM from the document.
+    params_dirty: bool,
     last_op: String,
     /// Commit -> mesh-ready latency of the last operation, milliseconds
     /// (evaluate_pending + poll_updates + GPU upload).
@@ -149,9 +163,31 @@ impl DemoApp {
         let mut doc = Document::new();
         let ids = scene::build_scene(&mut doc).map_err(|e| JsValue::from_str(&e))?;
 
+        // Interest filter for the parametric dirty pump: the entities the
+        // sliders read their values from (see the `watch` field docs).
+        // Registered BEFORE the first poll so the scene-creation dirt for
+        // these ids is reported, not discarded at drain time — the
+        // initial slider sync then flows through the same pump path as
+        // every later change.
+        let mut engine = Engine::new();
+        let watch: BTreeSet<EntityId> = ids
+            .cube_base_cps
+            .iter()
+            .copied()
+            .chain([
+                ids.cube_top_cp,
+                ids.plate_bottom_cp,
+                ids.cyl_circle,
+                ids.cyl_top_cp,
+                ids.cone_rim_cp,
+                ids.cone_apex_cp,
+            ])
+            .collect();
+        engine.set_params_watch(Some(watch.clone()));
+
         let mut app = DemoApp {
             doc,
-            engine: Engine::new(),
+            engine,
             ids,
             renderer,
             camera: Camera {
@@ -162,6 +198,8 @@ impl DemoApp {
             },
             gestures: Gestures::default(),
             errors: BTreeMap::new(),
+            watch,
+            params_dirty: false,
             last_op: "initial scene".to_owned(),
             last_latency_ms: 0.0,
             committed: 0,
@@ -265,6 +303,13 @@ impl DemoApp {
                 match output {
                     Ok(out) => {
                         if let [chamfer] = out.created_ids.as_slice() {
+                            // Grow the pump's interest filter before the
+                            // drain in sync() so this creation (and every
+                            // later update/delete/undo replay of the same
+                            // id) reports through params_changed.
+                            if self.watch.insert(*chamfer) {
+                                self.engine.set_params_watch(Some(self.watch.clone()));
+                            }
                             self.submit(Command::UpdateElement {
                                 id: self.ids.cube_element,
                                 name: None,
@@ -347,9 +392,17 @@ impl DemoApp {
         self.gestures.can_redo()
     }
 
-    /// The six slider parameters as currently stored in the document —
-    /// the single source of truth the page resynchronizes its sliders
-    /// from (at startup and after undo/redo).
+    /// True (drained on read) when a poll reported watched parametric
+    /// changes since the last call — the page's one trigger to resync
+    /// slider DOM from the document. Fired by every mutation path alike:
+    /// slider submits, undo, redo (the dirty pump is the single gate).
+    pub fn take_params_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.params_dirty)
+    }
+
+    /// The slider parameters as currently stored in the document — the
+    /// single source of truth the page resynchronizes its sliders from
+    /// whenever [`DemoApp::take_params_dirty`] fires.
     pub fn params_json(&self) -> String {
         let p = scene::current_params(&self.doc, &self.ids);
         serde_json::json!({
@@ -433,6 +486,13 @@ impl DemoApp {
         }
         for id in &updates.errors_cleared {
             self.errors.remove(id);
+        }
+
+        // Parametric dirty pump: any watched target changed (by submit,
+        // undo, or redo — one gate) flags the page to resync its slider
+        // DOM from the document.
+        if !updates.params_changed.is_empty() {
+            self.params_dirty = true;
         }
 
         self.committed = updates.committed_generation;
