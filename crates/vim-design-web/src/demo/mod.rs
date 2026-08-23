@@ -9,7 +9,7 @@ mod scene;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use glam::{Mat4, Vec3};
+use glam::{Mat4, Vec3, Vec4};
 use vim_design_lib::eval::Engine;
 use vim_design_lib::{Command, Document, EntityId, Params, VimStatus};
 use wasm_bindgen::prelude::*;
@@ -117,6 +117,32 @@ impl Gestures {
     }
 }
 
+/// Which outline the draw tool is sketching.
+enum DrawTool {
+    /// New floor plate, extruded down by `thickness` meters on commit.
+    Plate { thickness: f64 },
+    /// Hole appended to `face`'s holes slot on commit.
+    Hole { face: EntityId },
+}
+
+/// In-progress interactive outline (view-only: nothing enters the
+/// document until the loop closes, so Escape simply discards it).
+struct DrawState {
+    tool: DrawTool,
+    /// The construction plane: the active level at tool start.
+    level: EntityId,
+    /// The plane's elevation at tool start (clicks intersect z = this).
+    elevation: f64,
+    /// Placed vertices, level-frame (u, v) == world (x, y).
+    points: Vec<[f64; 2]>,
+    /// Current mouse position on the plane (rubber band endpoint).
+    hover: Option<[f64; 2]>,
+}
+
+/// Screen-space snap radius for closing the loop on the first vertex
+/// (device pixels).
+const CLOSE_SNAP_PX: f32 = 14.0;
+
 #[wasm_bindgen]
 pub struct DemoApp {
     doc: Document,
@@ -155,6 +181,14 @@ pub struct DemoApp {
     /// mesh upserts vs transform-only re-placements.
     last_mesh_upserts: usize,
     last_base_transforms: usize,
+    /// In-progress draw-tool outline (None when the tool is idle).
+    draw: Option<DrawState>,
+    /// Plates authored by the draw tool, oldest first. Grow-only;
+    /// entries whose face was undone away are filtered at read time
+    /// (redo restores the same ids, so records stay valid).
+    plates: Vec<scene::AuthoredPlate>,
+    /// Naming counter for "Floor plate N".
+    plate_counter: usize,
     committed: u64,
     evaluated: u64,
     pending: usize,
@@ -241,6 +275,9 @@ impl DemoApp {
             last_latency_ms: 0.0,
             last_mesh_upserts: 0,
             last_base_transforms: 0,
+            draw: None,
+            plates: Vec::new(),
+            plate_counter: 0,
             committed: 0,
             evaluated: 0,
             pending: 0,
@@ -587,6 +624,152 @@ impl DemoApp {
         }
     }
 
+    // -- Phase C: interactive floor-plate / hole drawing ------------------
+
+    /// Project a world point to canvas device pixels: `[px, py]` JSON,
+    /// or `null` when behind the camera. Exposed as the Playwright
+    /// helper too — the specs compute click coordinates from world
+    /// positions instead of hardcoding pixels, so they survive camera
+    /// changes (documented choice).
+    pub fn world_to_screen(&self, x: f64, y: f64, z: f64) -> String {
+        match self.project(Vec3::new(x as f32, y as f32, z as f32)) {
+            Some((px, py)) => format!("[{px},{py}]"),
+            None => "null".to_owned(),
+        }
+    }
+
+    /// True when the hole tool has a target (a live tool-authored plate).
+    pub fn has_hole_target(&self) -> bool {
+        self.live_plate().is_some()
+    }
+
+    /// Arm the floor-plate tool on the ACTIVE construction plane (= the
+    /// active level's plane, v1 — docs/AUTHORING.md §5). Gated on
+    /// `can_author()` — the first real consumer.
+    pub fn begin_draw_plate(&mut self, thickness: f64) -> bool {
+        if self.draw.is_some() {
+            return false;
+        }
+        let Some(level) = self.active_level.filter(|_| self.can_author()) else {
+            return false;
+        };
+        self.draw = Some(DrawState {
+            tool: DrawTool::Plate {
+                thickness: thickness.max(0.01),
+            },
+            level,
+            elevation: self.active_elevation,
+            points: Vec::new(),
+            hover: None,
+        });
+        self.refresh_preview();
+        true
+    }
+
+    /// Arm the hole tool on the MOST RECENT tool-authored plate (v1
+    /// limitation: no plate picking yet — documented). Sketching happens
+    /// on the plate's top-surface plane (= its level's plane).
+    pub fn begin_draw_hole(&mut self) -> bool {
+        if self.draw.is_some() {
+            return false;
+        }
+        let Some(plate) = self.live_plate() else {
+            return false;
+        };
+        let (level, face) = (plate.level, plate.face);
+        let elevation = scene::levels_sorted(&self.doc)
+            .iter()
+            .find(|l| l.id == level)
+            .map_or(0.0, |l| l.elevation_m);
+        self.draw = Some(DrawState {
+            tool: DrawTool::Hole { face },
+            level,
+            elevation,
+            points: Vec::new(),
+            hover: None,
+        });
+        self.refresh_preview();
+        true
+    }
+
+    /// Place a vertex at the canvas position (device pixels). Clicking
+    /// within the snap radius of the FIRST vertex (with >= 3 placed)
+    /// closes the loop and commits. Returns
+    /// `{"result": "added"|"closed"|"ignored", "points": n}`.
+    pub fn draw_click(&mut self, px: f32, py: f32) -> String {
+        let Some(state) = &self.draw else {
+            return r#"{"result":"ignored","points":0}"#.to_owned();
+        };
+        // Close on first-vertex snap?
+        if state.points.len() >= 3 {
+            let [u0, v0] = state.points[0];
+            if let Some((fx, fy)) =
+                self.project(Vec3::new(u0 as f32, v0 as f32, state.elevation as f32))
+            {
+                if (fx - px).hypot(fy - py) <= CLOSE_SNAP_PX {
+                    let n = state.points.len();
+                    self.commit_draw();
+                    return format!(r#"{{"result":"closed","points":{n}}}"#);
+                }
+            }
+        }
+        let elevation = state.elevation;
+        let Some(uv) = self.unproject_to_plane(px, py, elevation) else {
+            let n = self.draw.as_ref().map_or(0, |s| s.points.len());
+            return format!(r#"{{"result":"ignored","points":{n}}}"#);
+        };
+        let state = self.draw.as_mut().expect("checked above");
+        state.points.push(uv);
+        let n = state.points.len();
+        self.refresh_preview();
+        format!(r#"{{"result":"added","points":{n}}}"#)
+    }
+
+    /// Update the rubber-band endpoint (mouse move, device pixels).
+    pub fn draw_move(&mut self, px: f32, py: f32) {
+        let Some(state) = &self.draw else { return };
+        let hover = self.unproject_to_plane(px, py, state.elevation);
+        if let Some(state) = self.draw.as_mut() {
+            state.hover = hover;
+        }
+        self.refresh_preview();
+    }
+
+    /// Commit via Enter (>= 3 points). Returns false if not enough.
+    pub fn draw_commit(&mut self) -> bool {
+        match &self.draw {
+            Some(state) if state.points.len() >= 3 => {
+                self.commit_draw();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Escape: discard the in-progress outline — nothing was submitted,
+    /// so the document is untouched.
+    pub fn draw_cancel(&mut self) {
+        self.draw = None;
+        self.refresh_preview();
+    }
+
+    /// Tool state for the page: `{"active": bool, "tool": ..., "points": n}`.
+    pub fn draw_state_json(&self) -> String {
+        match &self.draw {
+            Some(state) => {
+                let tool = match state.tool {
+                    DrawTool::Plate { .. } => "plate",
+                    DrawTool::Hole { .. } => "hole",
+                };
+                format!(
+                    r#"{{"active":true,"tool":"{tool}","points":{}}}"#,
+                    state.points.len()
+                )
+            }
+            None => r#"{"active":false,"tool":null,"points":0}"#.to_owned(),
+        }
+    }
+
     // -- Undo / redo ------------------------------------------------------
 
     pub fn undo(&mut self) -> bool {
@@ -661,6 +844,8 @@ impl DemoApp {
             "lastLatencyMs": self.last_latency_ms,
             "lastMeshUpserts": self.last_mesh_upserts,
             "lastBaseTransforms": self.last_base_transforms,
+            "canAuthor": self.can_author(),
+            "canAddHole": self.live_plate().is_some(),
             "wireframe": self.renderer.wireframe,
             "canUndo": self.can_undo(),
             "canRedo": self.can_redo(),
@@ -671,6 +856,160 @@ impl DemoApp {
 }
 
 impl DemoApp {
+    fn view_proj(&self) -> Mat4 {
+        self.camera.view_proj(self.renderer.aspect())
+    }
+
+    /// World -> canvas device pixels (None behind the camera).
+    fn project(&self, world: Vec3) -> Option<(f32, f32)> {
+        let clip = self.view_proj() * Vec4::new(world.x, world.y, world.z, 1.0);
+        if clip.w <= 1e-6 {
+            return None;
+        }
+        let ndc = clip / clip.w;
+        let (w, h) = self.renderer.size();
+        Some((
+            (ndc.x * 0.5 + 0.5) * w as f32,
+            (0.5 - ndc.y * 0.5) * h as f32,
+        ))
+    }
+
+    /// Canvas device pixels -> intersection with the horizontal plane
+    /// z = `plane_z` (None when the ray is parallel or hits behind).
+    fn unproject_to_plane(&self, px: f32, py: f32, plane_z: f64) -> Option<[f64; 2]> {
+        let (w, h) = self.renderer.size();
+        let ndc_x = px / w as f32 * 2.0 - 1.0;
+        let ndc_y = 1.0 - py / h as f32 * 2.0;
+        let inv = self.view_proj().inverse();
+        let near = inv * Vec4::new(ndc_x, ndc_y, 0.0, 1.0);
+        let far = inv * Vec4::new(ndc_x, ndc_y, 1.0, 1.0);
+        if near.w.abs() <= 1e-9 || far.w.abs() <= 1e-9 {
+            return None;
+        }
+        let a = near.truncate() / near.w;
+        let b = far.truncate() / far.w;
+        let dz = b.z - a.z;
+        if dz.abs() <= 1e-9 {
+            return None;
+        }
+        let t = (plane_z as f32 - a.z) / dz;
+        if !(0.0..=1.0).contains(&t) {
+            return None;
+        }
+        let hit = a + (b - a) * t;
+        Some([f64::from(hit.x), f64::from(hit.y)])
+    }
+
+    /// Most recent tool-authored plate whose face still exists (undo may
+    /// have removed newer ones; redo restores the same ids).
+    fn live_plate(&self) -> Option<&scene::AuthoredPlate> {
+        self.plates
+            .iter()
+            .rev()
+            .find(|p| self.doc.entity(p.face).is_some())
+    }
+
+    /// Rebuild the renderer's preview geometry from the draw state.
+    fn refresh_preview(&mut self) {
+        let Some(state) = &self.draw else {
+            self.renderer.set_preview(&[], &[]);
+            return;
+        };
+        let z = state.elevation as f32 + 0.02; // nudge off the overlay plane
+        let mut tris: Vec<f32> = Vec::new();
+        let mut lines: Vec<f32> = Vec::new();
+        let quad = |tris: &mut Vec<f32>, u: f32, v: f32, r: f32, color: [f32; 4]| {
+            let corners = [
+                [u - r, v - r], [u + r, v - r], [u + r, v + r],
+                [u - r, v - r], [u + r, v + r], [u - r, v + r],
+            ];
+            for [x, y] in corners {
+                tris.extend_from_slice(&[x, y, z]);
+                tris.extend_from_slice(&color);
+            }
+        };
+        let closable = state.points.len() >= 3;
+        for (i, [u, v]) in state.points.iter().enumerate() {
+            // First vertex doubles as the close target: green when the
+            // loop can be closed.
+            let (r, color) = if i == 0 && closable {
+                (0.09, [0.35, 0.95, 0.45, 1.0])
+            } else {
+                (0.06, [0.95, 0.95, 0.98, 0.95])
+            };
+            quad(&mut tris, *u as f32, *v as f32, r, color);
+        }
+        let mut push_line = |a: [f64; 2], b: [f64; 2], color: [f32; 4]| {
+            lines.extend_from_slice(&[a[0] as f32, a[1] as f32, z]);
+            lines.extend_from_slice(&color);
+            lines.extend_from_slice(&[b[0] as f32, b[1] as f32, z]);
+            lines.extend_from_slice(&color);
+        };
+        let solid = [0.95, 0.95, 0.98, 0.9];
+        let faint = [0.95, 0.95, 0.98, 0.35];
+        for pair in state.points.windows(2) {
+            push_line(pair[0], pair[1], solid);
+        }
+        if let (Some(hover), Some(last)) = (state.hover, state.points.last()) {
+            push_line(*last, hover, solid); // rubber band
+            if state.points.len() >= 2 {
+                push_line(hover, state.points[0], faint); // closing hint
+            }
+        }
+        self.renderer.set_preview(&tris, &lines);
+    }
+
+    /// Close the loop: submit the whole plate/hole as ONE gesture group
+    /// (a single Undo click removes everything the commit created).
+    fn commit_draw(&mut self) {
+        let Some(state) = self.draw.take() else { return };
+        self.refresh_preview(); // clears
+        let depth = self.doc.undo_depth();
+        match state.tool {
+            DrawTool::Plate { thickness } => {
+                self.plate_counter += 1;
+                let name = format!("Floor plate {}", self.plate_counter);
+                match scene::commit_plate(
+                    &mut self.doc,
+                    state.level,
+                    &state.points,
+                    thickness,
+                    &name,
+                ) {
+                    Ok(plate) => {
+                        self.gestures.one_shot(depth);
+                        self.plates.push(plate);
+                        self.sync("draw plate");
+                    }
+                    Err(e) => {
+                        // Roll back any partial commands so a failed
+                        // commit leaves the document clean.
+                        while self.doc.undo_depth() > depth {
+                            let _ = self.doc.undo();
+                        }
+                        web_sys::console::error_1(&JsValue::from_str(&e));
+                        self.sync("draw plate (failed)");
+                    }
+                }
+            }
+            DrawTool::Hole { face } => {
+                match scene::commit_hole(&mut self.doc, state.level, face, &state.points) {
+                    Ok(()) => {
+                        self.gestures.one_shot(depth);
+                        self.sync("add hole");
+                    }
+                    Err(e) => {
+                        while self.doc.undo_depth() > depth {
+                            let _ = self.doc.undo();
+                        }
+                        web_sys::console::error_1(&JsValue::from_str(&e));
+                        self.sync("add hole (failed)");
+                    }
+                }
+            }
+        }
+    }
+
     /// Shared body of the level-field updates: one gesture per
     /// (field, level), coalesced document-side per entity. Note the
     /// document's coalesce key is (label, id), so consecutive edits to
@@ -749,6 +1088,9 @@ impl DemoApp {
         for id in &updates.errors_cleared {
             self.errors.remove(id);
         }
+        // Entities deleted while in error emit no errors_cleared; prune
+        // stale entries so undoing a bad outline clears the status line.
+        self.errors.retain(|id, _| self.doc.entity(*id).is_some());
 
         // Parametric dirty pump: any watched target changed (by submit,
         // undo, or redo — one gate) flags the page to resync its slider

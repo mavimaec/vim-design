@@ -104,7 +104,12 @@ test("level-based authoring: site, level manager, ground drag, cascade delete, u
   await expect(page.locator("#cyl-height")).toHaveValue("1.2");
   let stats = await page.evaluate(() => window.__vimStats);
   expect(stats.errors).toEqual([]);
-  console.log(`ground drag: commit→mesh ${stats.lastLatencyMs.toFixed(1)} ms (whole scene)`);
+  // Translation factoring (lib ea32467): the drag is TRANSFORM-ONLY —
+  // zero mesh re-uploads, one base-transform re-placement per mesh
+  // owner (plate, cube, cylinder, cone).
+  expect(stats.lastMeshUpserts, "elevation drag re-uploads no meshes").toBe(0);
+  expect(stats.lastBaseTransforms, "one re-placement per owner").toBe(4);
+  console.log(`ground drag: commit→transforms ${stats.lastLatencyMs.toFixed(2)} ms (transform-only)`);
 
   // --- Dragging an empty level moves nothing ---------------------------
   await setField(page, rowFor(page, level2).locator(".lvl-elev"), 4.0);

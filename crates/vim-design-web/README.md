@@ -28,6 +28,15 @@ WASM browser test app. Two pages, served by
   one-undo restore); level overlays are translucent squares drawn from
   Level params (never meshes); the active level is session state with
   nearest-elevation fallback.
+  Phase C adds the interactive floor-plate tool: "draw floor plate"
+  (gated on `can_author()`) sketches a view-only outline on the active
+  level's plane (unprojected clicks, rubber-band preview via the overlay
+  pipelines; Esc discards, closing commits ONE gesture group: attached
+  outline → face → downward extrusion → element + instance), and "add
+  hole" appends outlines to the most recent tool-authored plate's face
+  (v1 limitation: no plate picking). Translation factoring is enabled —
+  level-elevation drags over the fully-attached scene are transform-only
+  (`Updates.base_transforms`, `world = instance ∘ base`).
 - **`www/probe.html` — the wasm threading probe**: measures whether
   rayon-on-wasm achieves true parallelism in the browser.
 

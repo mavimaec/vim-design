@@ -22,6 +22,11 @@ function showStatus(stats) {
   const err = stats.errors.length
     ? ` | <span class="err">errors: ${stats.errors.join("; ")}</span>`
     : "";
+  // Authoring gates (Phase C): plate drawing needs a level to associate
+  // with (can_author); the hole tool additionally needs a live
+  // tool-authored plate.
+  $("draw-plate").disabled = !stats.canAuthor;
+  $("draw-hole").disabled = !stats.canAuthor || !stats.canAddHole;
   statusbar.innerHTML =
     `${stats.backend}` +
     ` | gen ${stats.evaluated}/${stats.committed}${stats.settled ? "" : " (pending)"}` +
@@ -84,15 +89,50 @@ async function main() {
     app.resize(canvas.width, canvas.height);
   });
 
-  // -- Camera: drag to orbit, wheel to zoom ---------------------------
+  // -- Draw tool state (Phase C) ----------------------------------------
+  // While a tool is armed, canvas clicks place vertices instead of
+  // orbiting; Esc cancels, Enter (>= 3 points) or clicking the first
+  // vertex closes and commits.
+  let armedTool = null; // null | "plate" | "hole"
+  const devicePx = (e) => {
+    const sx = canvas.width / canvas.clientWidth;
+    const sy = canvas.height / canvas.clientHeight;
+    return [e.offsetX * sx, e.offsetY * sy];
+  };
+  const setArmed = (tool) => {
+    armedTool = tool;
+    $("draw-plate").classList.toggle("armed", tool === "plate");
+    $("draw-hole").classList.toggle("armed", tool === "hole");
+    $("draw-hint").style.display = tool ? "" : "none";
+    canvas.style.cursor = tool ? "crosshair" : "";
+  };
+  const finishDraw = (committed) => {
+    const label = armedTool === "hole" ? "add hole" : "draw plate";
+    setArmed(null);
+    if (committed) refresh(app, label);
+  };
+
+  // -- Camera: drag to orbit, wheel to zoom (orbit suspended while a
+  // draw tool is armed) --------------------------------------------------
   let dragging = false, lastX = 0, lastY = 0;
   canvas.addEventListener("pointerdown", (e) => {
+    if (armedTool) {
+      const [px, py] = devicePx(e);
+      const res = JSON.parse(app.draw_click(px, py));
+      if (res.result === "closed") finishDraw(true);
+      return;
+    }
     dragging = true;
     lastX = e.clientX;
     lastY = e.clientY;
     canvas.setPointerCapture(e.pointerId);
   });
   canvas.addEventListener("pointermove", (e) => {
+    if (armedTool) {
+      const [px, py] = devicePx(e);
+      app.draw_move(px, py);
+      return;
+    }
     if (!dragging) return;
     app.orbit(e.clientX - lastX, e.clientY - lastY);
     lastX = e.clientX;
@@ -103,6 +143,34 @@ async function main() {
     e.preventDefault();
     app.zoom(e.deltaY);
   }, { passive: false });
+
+  window.addEventListener("keydown", (e) => {
+    if (!armedTool) return;
+    if (e.key === "Escape") {
+      app.draw_cancel();
+      finishDraw(false);
+    } else if (e.key === "Enter") {
+      if (app.draw_commit()) finishDraw(true);
+    }
+  });
+
+  $("draw-plate").addEventListener("click", () => {
+    if (armedTool === "plate") {
+      app.draw_cancel();
+      finishDraw(false);
+      return;
+    }
+    const thickness = parseFloat($("draw-thickness").value) || 0.3;
+    if (app.begin_draw_plate(thickness)) setArmed("plate");
+  });
+  $("draw-hole").addEventListener("click", () => {
+    if (armedTool === "hole") {
+      app.draw_cancel();
+      finishDraw(false);
+      return;
+    }
+    if (app.begin_draw_hole()) setArmed("hole");
+  });
 
   // -- Sliders ---------------------------------------------------------
   const sliders = [
@@ -324,6 +392,15 @@ async function main() {
     levels: () => JSON.parse(app.levels_json()),
     site: () => JSON.parse(app.site_json()),
     canAuthor: () => app.can_author(),
+    drawState: () => JSON.parse(app.draw_state_json()),
+    // World -> CSS pixel coordinates (specs compute click targets from
+    // world positions instead of hardcoding pixels).
+    worldToScreen: (x, y, z) => {
+      const p = JSON.parse(app.world_to_screen(x, y, z));
+      if (!p) return null;
+      return [p[0] * (canvas.clientWidth / canvas.width),
+              p[1] * (canvas.clientHeight / canvas.height)];
+    },
   };
 
   // -- Display options ---------------------------------------------------

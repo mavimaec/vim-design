@@ -165,6 +165,14 @@ pub struct Renderer {
     overlay_pipeline: wgpu::RenderPipeline,
     overlay_buf: Option<wgpu::Buffer>,
     overlay_vertex_count: u32,
+    /// Draw-tool preview (view-only, never document entities): triangle
+    /// markers + rubber-band lines, drawn on top of everything.
+    preview_tri_pipeline: wgpu::RenderPipeline,
+    preview_line_pipeline: wgpu::RenderPipeline,
+    preview_tri_buf: Option<wgpu::Buffer>,
+    preview_tri_count: u32,
+    preview_line_buf: Option<wgpu::Buffer>,
+    preview_line_count: u32,
     globals_buf: wgpu::Buffer,
     globals_bind: wgpu::BindGroup,
     model_layout: wgpu::BindGroupLayout,
@@ -424,8 +432,11 @@ impl Renderer {
             Some(wgpu::BlendState::ALPHA_BLENDING),
         );
 
-        // Level overlays: own pipeline (pos + rgba vertices, no model
-        // matrix — world coordinates directly; globals only).
+        // Overlay-family pipelines (pos + rgba vertices in world
+        // coordinates, no model matrix — globals only): the level
+        // overlays (depth-tested), and the draw-tool preview markers +
+        // rubber-band lines (depth Always: the preview must stay visible
+        // over everything while sketching).
         let overlay_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("overlay pipeline layout"),
             bind_group_layouts: &[&globals_layout],
@@ -436,43 +447,61 @@ impl Renderer {
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4],
         };
-        let overlay_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("overlay"),
-            layout: Some(&overlay_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_overlay"),
-                compilation_options: Default::default(),
-                buffers: std::slice::from_ref(&overlay_vertex),
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                cull_mode: None,
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: DEPTH_FORMAT,
-                // Depth-tested (occluded by geometry in front) but never
-                // written, so the scene stays visible through the plane.
-                depth_write_enabled: false,
-                depth_compare: wgpu::CompareFunction::Less,
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
-            multisample: Default::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_overlay"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            multiview: None,
-            cache: None,
-        });
+        let make_overlay_pipeline = |label: &str,
+                                     topology: wgpu::PrimitiveTopology,
+                                     depth_compare: wgpu::CompareFunction| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&overlay_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_overlay"),
+                    compilation_options: Default::default(),
+                    buffers: std::slice::from_ref(&overlay_vertex),
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology,
+                    cull_mode: None,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    // Never depth-written, so the scene stays visible.
+                    depth_write_enabled: false,
+                    depth_compare,
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_overlay"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview: None,
+                cache: None,
+            })
+        };
+        let overlay_pipeline = make_overlay_pipeline(
+            "overlay",
+            wgpu::PrimitiveTopology::TriangleList,
+            wgpu::CompareFunction::Less,
+        );
+        let preview_tri_pipeline = make_overlay_pipeline(
+            "preview tris",
+            wgpu::PrimitiveTopology::TriangleList,
+            wgpu::CompareFunction::Always,
+        );
+        let preview_line_pipeline = make_overlay_pipeline(
+            "preview lines",
+            wgpu::PrimitiveTopology::LineList,
+            wgpu::CompareFunction::Always,
+        );
 
         Ok(Renderer {
             surface,
@@ -485,6 +514,12 @@ impl Renderer {
             overlay_pipeline,
             overlay_buf: None,
             overlay_vertex_count: 0,
+            preview_tri_pipeline,
+            preview_line_pipeline,
+            preview_tri_buf: None,
+            preview_tri_count: 0,
+            preview_line_buf: None,
+            preview_line_count: 0,
             globals_buf,
             globals_bind,
             model_layout,
@@ -515,6 +550,11 @@ impl Renderer {
 
     pub fn aspect(&self) -> f32 {
         self.config.width as f32 / self.config.height as f32
+    }
+
+    /// Current surface size in device pixels.
+    pub fn size(&self) -> (u32, u32) {
+        (self.config.width, self.config.height)
     }
 
     pub fn remove_mesh(&mut self, id: EntityId) {
@@ -656,6 +696,25 @@ impl Renderer {
                     usage: wgpu::BufferUsages::VERTEX,
                 })
         });
+    }
+
+    /// Replace the draw-tool preview geometry (interleaved pos3+rgba4
+    /// vertices in world coordinates; empty slices clear it). Triangles
+    /// are point markers; lines are the rubber-band polyline.
+    pub fn set_preview(&mut self, tris: &[f32], lines: &[f32]) {
+        let mk = |data: &[f32], label: &str, device: &wgpu::Device| {
+            (!data.is_empty()).then(|| {
+                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some(label),
+                    contents: &f32s_to_bytes(data),
+                    usage: wgpu::BufferUsages::VERTEX,
+                })
+            })
+        };
+        self.preview_tri_buf = mk(tris, "preview tris", &self.device);
+        self.preview_tri_count = (tris.len() / 7) as u32;
+        self.preview_line_buf = mk(lines, "preview lines", &self.device);
+        self.preview_line_count = (lines.len() / 7) as u32;
     }
 
     /// World-space AABB of the drawn scene (meshes x instance
@@ -813,6 +872,20 @@ impl Renderer {
                 pass.set_bind_group(0, &self.globals_bind, &[]);
                 pass.set_vertex_buffer(0, buf.slice(..));
                 pass.draw(0..self.overlay_vertex_count, 0..1);
+            }
+
+            // Draw-tool preview on top of everything (depth Always).
+            if let Some(buf) = &self.preview_line_buf {
+                pass.set_pipeline(&self.preview_line_pipeline);
+                pass.set_bind_group(0, &self.globals_bind, &[]);
+                pass.set_vertex_buffer(0, buf.slice(..));
+                pass.draw(0..self.preview_line_count, 0..1);
+            }
+            if let Some(buf) = &self.preview_tri_buf {
+                pass.set_pipeline(&self.preview_tri_pipeline);
+                pass.set_bind_group(0, &self.globals_bind, &[]);
+                pass.set_vertex_buffer(0, buf.slice(..));
+                pass.draw(0..self.preview_tri_count, 0..1);
             }
         }
         self.queue.submit([encoder.finish()]);

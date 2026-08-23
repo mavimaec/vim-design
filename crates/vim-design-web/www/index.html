@@ -57,11 +57,15 @@
       width: 110px; background: #0d1117; color: #e6edf3; border: 1px solid #30363d;
       border-radius: 4px; padding: 2px 6px; font-variant-numeric: tabular-nums;
     }
-    #add-level {
+    #add-level, #author-buttons button {
       background: #21262d; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px;
       padding: 2px 10px; font-size: 0.75rem; cursor: pointer;
     }
-    #add-level:hover { background: #30363d; }
+    #add-level:hover, #author-buttons button:enabled:hover { background: #30363d; }
+    #author-buttons { display: flex; gap: 8px; margin: 6px 0 2px; }
+    #author-buttons button { flex: 1; padding: 5px 0; }
+    #author-buttons button:disabled { opacity: 0.4; cursor: default; }
+    #author-buttons button.armed { border-color: #3b82f6; color: #79c0ff; }
     .level-row {
       display: flex; align-items: center; gap: 6px; margin: 4px 0;
       padding: 4px 6px; border: 1px solid #30363d; border-radius: 6px;
@@ -148,6 +152,18 @@
       <input type="number" id="site-lon" step="0.0001" min="-180" max="180" /></div>
     <div class="field-row"><label for="site-elev">elevation m</label>
       <input type="number" id="site-elev" step="0.5" min="-500" max="9000" /></div>
+
+    <h1>Authoring</h1>
+    <div class="field-row"><label for="draw-thickness">plate thickness m</label>
+      <input type="number" id="draw-thickness" step="0.05" min="0.05" max="2" value="0.3" /></div>
+    <div id="author-buttons">
+      <button id="draw-plate">draw floor plate</button>
+      <button id="draw-hole">add hole</button>
+    </div>
+    <div id="draw-hint" style="display: none; color: #79c0ff; font-size: 0.72rem; padding: 4px 2px;">
+      click on the active level plane to place vertices ·
+      click the first vertex (or Enter) to close · Esc cancels
+    </div>
 
     <h1>Levels <button id="add-level">+ add level</button></h1>
     <div id="no-levels-hint" style="display: none; color: #8b949e; font-size: 0.75rem; padding: 6px 2px;">
