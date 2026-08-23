@@ -29,11 +29,38 @@
 //!   the document's chordal tolerance (default 1 mm).
 //! - [`Engine::poll_updates`] returns the changed-set since the previous
 //!   poll ([`Updates`]): coalesced latest-state upserts keyed by stable
-//!   ids, explicit tombstones, per-entity error transitions, and the
-//!   settledness counters (`evaluated == committed` and
-//!   `pending_count == 0` means quiescent). Apply removals before
-//!   upserts; a delete + recreate between polls arrives as a plain
-//!   upsert.
+//!   ids, explicit tombstones, per-entity error transitions, the
+//!   parametric changed-set, and the settledness counters
+//!   (`evaluated == committed` and `pending_count == 0` means
+//!   quiescent). Apply removals before upserts; a delete + recreate
+//!   between polls arrives as a plain upsert.
+//!
+//! # The dirty pump: `params_changed` (docs/ARCHITECTURE.md §6.3)
+//!
+//! [`Updates::params_changed`] reports the entity ids **directly
+//! touched** by committed deltas — the delta targets, never the
+//! downstream dirty closure — recorded at the document's single commit
+//! gate, so user edits, undo, redo, composites, and scripts all report
+//! through one path (undo is not a special case in UI code) and a
+//! rejected command's rolled-back deltas never appear. Semantics:
+//! - Accumulation is a **set**: an entity touched 500 times between
+//!   polls appears once; the widget reads current state from the
+//!   document at poll time.
+//! - **Deleted ids are reported**: the deletion touched the id, and the
+//!   bound widget needs to hear it went away. Reported once per drain;
+//!   distinguish update vs removal via `Document::entity(id)`. A
+//!   delete + undo between polls reports the id once, entity alive.
+//! - **Single consumer**: draining clears; the report means "since
+//!   *your* last poll".
+//! - **Interest filter**: [`Engine::set_params_watch`] trims
+//!   `params_changed` to the ids the UI displays; `None` (default)
+//!   reports everything. The filter applies at drain time against the
+//!   current watch set and never touches mesh/instance/error reporting;
+//!   dirt accumulated before a watch change is filtered by the new set,
+//!   and non-matching accumulated ids are discarded by the drain.
+//! - Ids reach the engine's accumulator via [`Engine::evaluate_pending`]
+//!   (the same stroke that pumps geometry), matching the eager
+//!   submit → evaluate → poll cycle.
 //!
 //! # Mesh ownership (the standalone-solid + chamfer rule)
 //!

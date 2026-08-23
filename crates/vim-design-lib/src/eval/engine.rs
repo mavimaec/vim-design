@@ -52,6 +52,14 @@ pub struct Engine {
     /// Entities whose error state transitioned (set, cleared, or diag
     /// changed); the poll reports the *current* state.
     error_transitions: BTreeSet<EntityId>,
+    /// Parametric changed-set: directly-touched entity ids pumped from
+    /// the document's commit gate (docs/ARCHITECTURE.md §6.3). Deleted
+    /// ids stay in here deliberately — the widget bound to the entity
+    /// needs to hear that it went away.
+    params_touched: BTreeSet<EntityId>,
+    /// Interest filter for `params_changed` (never for meshes/instances/
+    /// errors). `None` = report all touched ids.
+    params_watch: Option<BTreeSet<EntityId>>,
     // -- instrumentation --------------------------------------------------
     eval_counts: BTreeMap<EntityId, u64>,
     tess_counts: BTreeMap<EntityId, u64>,
@@ -99,6 +107,21 @@ impl Engine {
     /// Total evaluations performed since engine creation.
     pub fn total_eval_count(&self) -> u64 {
         self.eval_counts.values().sum()
+    }
+
+    /// Register (or clear, with `None`) the interest filter for
+    /// [`Updates::params_changed`]: with `Some(watch)`, only watched ids
+    /// are reported. The filter applies **only** to `params_changed` —
+    /// mesh, instance, and error reporting are never filtered.
+    ///
+    /// The filter is applied at drain time against the *current* watch
+    /// set; accumulation is unconditional. Documented edge case: dirt
+    /// accumulated before a watch change is filtered by the NEW set at
+    /// the next poll, and every drain clears the whole accumulator — so
+    /// narrowing the watch set discards the non-matching ids already
+    /// accumulated (they are not retained for a later unwatch).
+    pub fn set_params_watch(&mut self, watch: Option<BTreeSet<EntityId>>) {
+        self.params_watch = watch;
     }
 
     /// Resolve a provenance-named subelement reference against its
@@ -199,6 +222,9 @@ impl Engine {
     /// is a pure function of a snapshot, so the async/background wrapper
     /// can be added without restructuring.
     pub fn evaluate_pending(&mut self, doc: &mut Document) {
+        // Pump the parametric changed-set (delta targets recorded at the
+        // document's commit gate — §6.3) into the poll accumulator.
+        self.params_touched.extend(doc.take_params_touched());
         let mut dirty = doc.take_dirty();
         if !self.initialized {
             self.initialized = true;
@@ -482,6 +508,22 @@ impl Engine {
                 None => {}
             }
         }
+
+        // Parametric changed-set: drain (single-consumer — the drain
+        // clears), filtered by the current watch set. Ids are reported
+        // whether or not the entity still exists: a deleted id appears
+        // exactly once (its Remove delta targeted it) so the bound
+        // widget can react, and never again unless re-touched (undo of
+        // the delete re-inserts and re-reports it, alive). BTreeSet
+        // drain = sorted + deduplicated.
+        let drained = std::mem::take(&mut self.params_touched);
+        updates.params_changed = match &self.params_watch {
+            None => drained.into_iter().collect(),
+            Some(watch) => drained
+                .into_iter()
+                .filter(|id| watch.contains(id))
+                .collect(),
+        };
 
         updates
     }

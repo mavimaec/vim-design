@@ -75,6 +75,13 @@ pub struct Document {
     /// Dirty closure accumulated since the last `take_dirty` — the ids
     /// whose derived geometry the evaluation layer must recompute.
     pending_dirty: BTreeSet<EntityId>,
+    /// Directly-touched entity ids (delta *targets*, not the downstream
+    /// closure) accumulated since the last `take_params_touched` — the
+    /// parametric changed-set feeding the dirty pump
+    /// (docs/ARCHITECTURE.md §6.3). Recorded at the commit gate, so
+    /// submit, undo, and redo all feed it through one code path and a
+    /// rejected command's rolled-back deltas never appear.
+    pending_params_touched: BTreeSet<EntityId>,
 }
 
 impl Default for Document {
@@ -94,6 +101,7 @@ impl Document {
             redo_stack: Vec::new(),
             committed_generation: 0,
             pending_dirty: BTreeSet::new(),
+            pending_params_touched: BTreeSet::new(),
         }
     }
 
@@ -118,6 +126,7 @@ impl Document {
             redo_stack: Vec::new(),
             committed_generation: 0,
             pending_dirty: BTreeSet::new(),
+            pending_params_touched: BTreeSet::new(),
         }
     }
 
@@ -180,6 +189,19 @@ impl Document {
     /// this once per evaluation kickoff).
     pub fn take_dirty(&mut self) -> BTreeSet<EntityId> {
         std::mem::take(&mut self.pending_dirty)
+    }
+
+    /// The pending parametric changed-set: entity ids directly touched
+    /// by committed deltas (targets only, never the downstream closure)
+    /// since the last `take_params_touched`.
+    pub fn params_touched(&self) -> &BTreeSet<EntityId> {
+        &self.pending_params_touched
+    }
+
+    /// Drain the pending parametric changed-set (the evaluation engine
+    /// pumps this into its poll accumulator — docs/ARCHITECTURE.md §6.3).
+    pub fn take_params_touched(&mut self) -> BTreeSet<EntityId> {
+        std::mem::take(&mut self.pending_params_touched)
     }
 
     // -- Command submission (docs/ARCHITECTURE.md §4) ---------------------
@@ -247,10 +269,19 @@ impl Document {
     }
 
     /// Extend the dirty closure with every entity touched by `deltas`
-    /// plus its downstream transitive closure (docs/ARCHITECTURE.md §6.1).
+    /// plus its downstream transitive closure (docs/ARCHITECTURE.md §6.1),
+    /// and the parametric changed-set with the delta *targets* alone.
     /// Removed entities appear as roots (tombstones for the evaluation
     /// layer); they have no downstream by construction (reject-if-dependents).
+    ///
+    /// This is the single recording gate of the dirty pump (§6.3):
+    /// `submit`, `undo`, and `redo` all pass their committed delta lists
+    /// through here, so all three feed the same accumulators with no
+    /// special-casing, and speculative deltas rolled back by a rejected
+    /// command are never recorded.
     fn mark_dirty(&mut self, deltas: &[Delta]) {
+        self.pending_params_touched
+            .extend(deltas.iter().map(|delta| delta.target()));
         let closure = self
             .graph
             .dirty_closure(deltas.iter().map(|delta| delta.target()));

@@ -334,6 +334,40 @@ The caller-facing output contract:
   renderer bookkeeping is two upsert maps: `element_id → GPU mesh` and
   `instance_id → (element_id, transform)`. Polling suits both game-loop C++ hosts and the
   requestAnimationFrame loop in the browser; no callbacks across FFI.
+- **The "dirty pump" (project term, decided 2026-08-22).** The changed-set is not
+  computed by diffing states — it is *recorded at the moment of mutation*. Every
+  mutation flows through one gate (delta application for the parametric layer; the
+  evaluation engine for the derived layer), and each gate appends the touched entity id
+  to pending accumulator **sets**: `params_touched`, `meshes_touched`, `removed`,
+  `errors_changed`. Sets, not queues: an entity touched 500 times between polls appears
+  once, and payloads are read from *current* state at poll time (coalescing is
+  structural, not implemented). A poll is the pump stroke: reconcile (delete+recreate
+  between polls = upsert, never a tombstone for a live id), read current state for the
+  accumulated ids, emit, clear, stamp the cursor. Cost is proportional to what changed,
+  never to scene size; an empty pump is a generation-counter comparison. The sole-writer
+  property makes the record exact — there is no unmonitored mutation path.
+  **Single-consumer by construction:** draining clears the sets, so the report is
+  "since *your* last poll"; one cursor per document handle. Multi-cursor (per-cursor
+  pending sets or a bounded sequence-numbered change log) is an additive extension,
+  deferred until a real second consumer exists.
+- **Parametric changed-set (`params_changed`).** The pump reports directly-touched
+  entity ids from delta application (the delta *targets*, not the downstream dirty
+  closure — widgets bind to specific entities). This makes UI synchronization
+  unidirectional: widgets post commands, then repaint from the poll report — so user
+  edits, undo, redo, scripts, and future collaboration all repair the display through
+  one code path; undo is not a special case anywhere in UI code. An optional
+  **interest filter** (a caller-registered watch set of entity ids) trims
+  `params_changed` to the ids the UI actually displays; mesh/instance reporting is
+  never filtered.
+- **No wake-up callback (decided 2026-08-22).** Pure poll: poll after submitting, poll
+  per frame while animating, timer-poll when idle if render-on-demand. An empty poll is
+  near-free, and today nothing changes behind the caller's back (evaluation is
+  synchronous). A dataless `vim_set_wakeup(cb)` ("notify, then poll") is purely
+  additive and will be introduced only if background evaluation makes idle latency a
+  measured problem. Per-entity data-carrying observer callbacks are rejected outright:
+  reentrancy hazards, threading contracts, lifetime bugs, and CEF's process boundary
+  (function pointers cannot cross processes) mean they would degenerate into a queue
+  drained later — a poll with extra steps.
 - **Settledness:** each poll reports `committed_generation` (latest command commit),
   `evaluated_generation` (everything ≤ it is fully meshed), and a pending-entity count.
   `evaluated == committed` ⇒ quiescent — the predicate test harnesses and progress UIs
@@ -393,9 +427,30 @@ undo is the escape hatch.
   the C++ test builds a thin RAII wrapper on top.
 - **Handles:** `VimDesignHandle` (opaque pointer) from `vim_create()` / `vim_destroy()`.
   Multiple documents = multiple handles.
+- **Commands stay in the library (decided 2026-08-22).** Embedders do NOT implement
+  their own command/undo systems: undo correctness (mechanical inverses, atomicity,
+  id restoration, coalescing) is proven once in the delta kernel; validation and the
+  never-crash guarantee live inside `submit`; the document format is defined by the
+  lib-side command/params types. What lives in the caller is the *intent layer*:
+  widget→command mapping, interaction state machines, and view-only state (camera,
+  hover, selection highlights — which must never route through the undoable command
+  system). Precedent: Revit transactions, OCCT OCAF — the document owns undo.
 - **Commands:** one `extern "C"` function per command with a plain-C params struct, e.g.
   `VimStatus vim_create_control_point(VimDesignHandle, const VimControlPointParams*, VimEntityId* out_id);`
   Composite commands likewise. (A batched binary command buffer is deferred — open question.)
+- **JSON command channel (for CEF/HTML embedders):** `vim_submit_json(handle, cmd_json, out_result_json)`
+  — commands are a closed serde enum, so this falls out for free and makes the C++
+  layer a thin pipe between the HTML UI and the library (no per-command marshalling
+  code to drift). Typed C functions remain for hot paths (e.g. 60 Hz control-point
+  drags) and typed param readback (`vim_get_params` + JSON mirror). The JSON encoding
+  becomes a public contract and follows the same versioning discipline as the document
+  format.
+- **Gestures/transactions:** `vim_begin_group(label)` / `vim_end_group()` — the caller
+  composes any primitives inside; the document guarantees one undo step (lesson lifted
+  from the web demo's hand-rolled undo-depth marks). `vim_undo_label()`/`vim_redo_label()`
+  provide menu text ("Undo Create Cylinder").
+- **Interest filter:** `vim_set_params_watch(handle, ids, count)` — optional; trims the
+  poll's `params_changed` list to watched ids (see §6.3). Unset = report all.
 - **Errors:** every function returns `VimStatus` (0 = Ok). `vim_last_error(handle)` returns
   a UTF-8 message for the most recent failure on that handle (stored per-handle, valid
   until the next call on that handle).

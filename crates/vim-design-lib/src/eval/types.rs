@@ -239,6 +239,17 @@ pub struct Updates {
     pub errors: Vec<(EntityId, EvalDiag)>,
     /// Entities whose error state cleared since the last poll.
     pub errors_cleared: Vec<EntityId>,
+    /// Parametric changed-set (docs/ARCHITECTURE.md §6.3): entity ids
+    /// **directly touched** by committed deltas since the last poll —
+    /// the delta targets, never the downstream dirty closure. Sorted and
+    /// deduplicated; user edits, undo, redo, and composites all report
+    /// through this one field (undo is not a UI special case). An id is
+    /// reported even if its entity no longer exists at poll time (the
+    /// deletion touched it — widgets check `Document::entity(id)` to
+    /// distinguish update from removal) and is reported once per drain.
+    /// Subject to the optional interest filter
+    /// (`Engine::set_params_watch`); meshes/instances/errors never are.
+    pub params_changed: Vec<EntityId>,
     /// Latest committed command generation (`Document`).
     pub committed_generation: u64,
     /// Everything at or below this generation is fully evaluated and
@@ -258,6 +269,7 @@ impl Updates {
             && self.instances_removed.is_empty()
             && self.errors.is_empty()
             && self.errors_cleared.is_empty()
+            && self.params_changed.is_empty()
             && self.pending_count == 0
             && self.committed_generation == self.evaluated_generation
     }
