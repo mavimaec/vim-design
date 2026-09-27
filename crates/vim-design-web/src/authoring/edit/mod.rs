@@ -17,6 +17,7 @@
 //! one construction plane and faces are simple polygons.
 
 pub mod interact;
+pub mod presets;
 pub mod profile;
 pub mod session;
 

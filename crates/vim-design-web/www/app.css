@@ -605,3 +605,71 @@ body.editing #wall-settings, body.editing #window-done { display: none !importan
   }
   body.drawing #edit-panel { display: block; }
 }
+
+/* ---- Model tree ---------------------------------------------------------------------------- */
+/* Desktop: a panel beside the tool dock (the canvas centre stays free).
+   Phones: the same tree inside the bottom sheet. */
+#tree-panel {
+  position: fixed; z-index: 18;
+  top: calc(var(--gap) + var(--st) + var(--top-h) + 10px);
+  bottom: var(--gap);
+  left: calc(var(--gap) + var(--sl) + 80px + 10px);
+  width: 284px;
+  display: flex; flex-direction: column;
+  background: var(--surface);
+  border-radius: 16px;
+  box-shadow: var(--shadow);
+  backdrop-filter: saturate(1.4) blur(10px); -webkit-backdrop-filter: saturate(1.4) blur(10px);
+  animation: tree-in 0.18s ease-out;
+}
+@keyframes tree-in { from { transform: translateX(-12px); opacity: 0.4; } to { transform: none; opacity: 1; } }
+@media (max-width: 759px) { #tree-panel { display: none !important; } }
+body.editing #tree-panel { display: none !important; }
+.tree-head { display: flex; align-items: center; justify-content: space-between; padding: 8px 6px 4px 14px; }
+.tree-head h2 { margin: 0; font-size: 15px; font-weight: 650; }
+.tree-body { overflow-y: auto; padding: 2px 8px 10px; overscroll-behavior: contain; }
+#tree-btn.on { color: var(--accent); background: var(--accent-soft); }
+
+.tree-level { margin: 4px 0 8px; }
+.tree-row {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  min-height: 40px; padding: 4px 6px;
+  border: 0; background: transparent; border-radius: 10px; text-align: left;
+  color: var(--text);
+}
+.tree-row:hover { background: var(--surface-2); }
+.tree-row.level { font-weight: 650; min-height: 44px; }
+.tree-row.level.active { background: var(--accent-soft); }
+.tree-row.plane { padding-left: calc(6px + var(--depth, 1) * 16px); }
+.tree-row.item { padding-left: 30px; min-height: 42px; }
+.tree-row.item.selected { background: var(--accent-soft); box-shadow: inset 3px 0 0 var(--accent); }
+.tree-row .twist { width: 20px; height: 20px; flex: none; color: var(--faint); transition: transform 0.15s; }
+.tree-row .twist.collapsed { transform: rotate(-90deg); }
+.tree-row .swatch { width: 11px; height: 11px; border-radius: 3px; flex: none; }
+/* The name wins the space: the meta shrinks (ellipsis) before the name does. */
+.tree-row .tree-name { flex: 1 1 auto; min-width: 6em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tree-row .tree-meta { flex: 0 100 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; text-align: right; }
+.tree-row .tree-kind { color: var(--muted); flex: none; }
+.tree-row .tree-tag { font-size: 11px; font-weight: 700; color: var(--accent); background: var(--accent-soft); border-radius: 999px; padding: 2px 7px; }
+.tree-group { font-size: 11.5px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em;
+  display: flex; align-items: center; gap: 6px; padding: 8px 6px 2px 14px; border: 0; background: transparent; width: 100%; text-align: left; }
+.tree-group .count { font-weight: 600; color: var(--faint); }
+.tree-edit { width: 34px; height: 34px; flex: none; border: 0; border-radius: 9px; background: transparent; color: var(--muted); display: inline-grid; place-items: center; }
+.tree-edit:hover { background: var(--surface-solid); color: var(--accent); box-shadow: var(--shadow-sm); }
+.tree-empty { color: var(--faint); font-size: 13px; padding: 2px 6px 6px 30px; }
+
+/* ---- Wall height mode + wall Edit Mode --------------------------------------------------- */
+.plane-picker {
+  height: 40px; min-width: 0; flex: 1; max-width: 190px;
+  border: 1px solid var(--line); border-radius: 10px; background: var(--surface-solid);
+  padding: 0 8px; font: inherit; font-size: 14px; color: var(--text);
+}
+#wall-height-mode { flex-wrap: wrap; }
+.wall-only { display: none !important; }
+body.edit-wall .wall-only { display: flex !important; }
+@media (max-width: 520px) {
+  /* Phones: a wall's dock trades Solid/Split for Window/Door. */
+  body.edit-wall .floor-extra { display: none !important; }
+  #wall-height-mode .stepper-label { display: none; }
+  .plane-picker { max-width: 150px; }
+}

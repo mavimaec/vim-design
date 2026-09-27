@@ -27,6 +27,7 @@ use vim_design_lib::Command;
 use vim_design_lib::sketch::Sketch as Profile;
 
 use crate::authoring::edit::interact::{self, Hit, SelectMode};
+use crate::authoring::edit::presets::{Opening, preset_outline};
 use crate::authoring::edit::session::{EditSession, Marquee};
 use crate::authoring::edit::{Edit, EditError, FaceKind, ProfileModel, ProfileView};
 use crate::authoring::geom::P2;
@@ -41,6 +42,11 @@ pub type EditProfile = Profile;
 /// Limits for face thickness and void depth (meters).
 const MIN_FACE_THICKNESS_M: f64 = 0.01;
 const MAX_FACE_THICKNESS_M: f64 = 5.0;
+/// Wall Edit Mode on a landscape screen: the edit panel covers the top
+/// right, so the elevation zooms out by this factor and the wall moves
+/// left by this fraction of its length.
+const WALL_EDIT_LANDSCAPE_ZOOM_OUT: f32 = 1.2;
+const WALL_EDIT_LANDSCAPE_SHIFT: f32 = 0.12;
 
 /// What a pointer gesture in Edit Mode is doing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -51,6 +57,9 @@ pub enum EditTool {
     Solid,
     Void,
     Split,
+    /// Walls: tap to place a window / door preset void.
+    Window,
+    Door,
 }
 
 impl EditTool {
@@ -60,8 +69,30 @@ impl EditTool {
             EditTool::Solid => "solid",
             EditTool::Void => "void",
             EditTool::Split => "split",
+            EditTool::Window => "window",
+            EditTool::Door => "door",
         }
     }
+}
+
+/// What Edit Mode is editing, which fixes its frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EditTarget {
+    /// A floor plate: the profile lies on its construction plane.
+    #[default]
+    Plane,
+    /// A wall: the profile is the wall's elevation (u along the wall from
+    /// its start, v up from its base), seen in an elevation view.
+    Wall(vim_design_lib::EntityId),
+}
+
+/// A session whose edits live only in memory (history kept here), until
+/// the profile can be stored in the document.
+#[derive(Debug, Clone, Default)]
+pub struct MemoryHistory {
+    undo: Vec<EditProfile>,
+    redo: Vec<EditProfile>,
+    last_key: Option<String>,
 }
 
 /// Pointer state of a move drag: where it was pressed on the plane, and
@@ -121,18 +152,86 @@ impl AuthorApp {
     /// Floor tool): an empty profile with the solid-face tool armed. The
     /// plate is created with its first face.
     pub fn edit_begin_new(&mut self) -> bool {
-        let Some(level) = self.active_level.filter(|_| self.can_author() && self.edit.is_none()) else {
+        let Some(plane) = self.plane().filter(|_| self.can_author() && self.edit.is_none()) else {
             return false;
         };
         let name = ops::next_element_name(&self.doc, "Floor plate");
         self.gestures.begin_transaction(&self.doc);
         self.edit_sketch = None;
         self.edit_entry_element = None;
-        let mut session = EditSession::new(Profile::default(), level, None, name);
+        let mut session = EditSession::new(Profile::default(), plane, None, name);
         session.new_thickness = self.plate_thickness;
         self.start_edit(session);
         self.edit_set_tool("solid");
         true
+    }
+
+    /// Enter Edit Mode on a wall: an orthographic elevation facing it and
+    /// its profile (u along the wall, v up) — the wall body a solid face,
+    /// its windows through voids, the top corners anchored to the top.
+    /// The session is kept in memory: the edits are not written to the
+    /// wall until walls are profile-based in the document.
+    pub fn edit_begin_wall(&mut self, wall: f64) -> bool {
+        let id = eid(wall);
+        if self.edit.is_some() {
+            return false;
+        }
+        let Some(w) = self.wall(id).cloned() else { return false };
+        let mut faces = vec![(w.profile.clone(), FaceKind::Solid { thickness: w.thickness })];
+        faces.extend(
+            w.windows.iter().filter(|h| h.outline.len() >= 3).map(|h| (h.outline.clone(), FaceKind::Void { depth: None })),
+        );
+        let Ok(profile) = crate::authoring::edit::profile::sketch_from_faces(&faces) else {
+            return false;
+        };
+        let top: std::collections::BTreeSet<u32> = profile
+            .points
+            .iter()
+            .filter(|p| (p.uv[1] - w.height).abs() < 1e-6)
+            .map(|p| p.id)
+            .collect();
+        if self.prev_camera.is_none() {
+            self.prev_camera = Some(self.camera.clone());
+        }
+        let (frame, length, height) = self.elevation_frame(&w);
+        let (vw, vh) = self.size_f();
+        self.camera.enter_elevation(frame, length, height, vw / vh);
+        if vw > vh {
+            self.camera.elevation_half_h *= WALL_EDIT_LANDSCAPE_ZOOM_OUT;
+            self.camera.target += frame.u * (length * WALL_EDIT_LANDSCAPE_SHIFT);
+        }
+        self.edit_target = EditTarget::Wall(id);
+        self.edit_memory = Some(MemoryHistory::default());
+        let mut session = EditSession::new(profile, w.plane_level, Some(id), w.name.clone());
+        session.top_points = top;
+        session.new_thickness = w.thickness;
+        self.edit_sketch = None;
+        self.edit_entry_element = Some(id);
+        self.start_edit(session);
+        self.grid_key = None;
+        true
+    }
+
+    /// Window / Door tool: place the preset opening centred where the
+    /// wall was tapped.
+    pub fn edit_place_preset(&mut self, px: f32, py: f32) -> String {
+        let kind = match self.edit_tool {
+            EditTool::Window => Opening::Window,
+            EditTool::Door => Opening::Door,
+            _ => return r#"{"result":"none"}"#.to_owned(),
+        };
+        let Some(uv) = self.edit_cursor_uv(px, py) else { return r#"{"result":"none"}"#.to_owned() };
+        let edit = Edit::AddFace { outline: preset_outline(kind, uv[0]), kind: FaceKind::Void { depth: None } };
+        self.edit_apply(&edit, None, "committed")
+    }
+
+    /// Anchor the selected points to the wall's top (they follow its
+    /// height) or bottom. Returns how many points changed.
+    pub fn edit_set_anchor(&mut self, top: bool) -> u32 {
+        if !matches!(self.edit_target, EditTarget::Wall(_)) {
+            return 0;
+        }
+        self.edit.as_mut().map_or(0, |s| s.set_anchor(top) as u32)
     }
 
     pub fn edit_active(&self) -> bool {
@@ -147,6 +246,14 @@ impl AuthorApp {
         let Some(session) = self.edit.take() else {
             return r#"{"result":"none"}"#.to_owned();
         };
+        if let Some(mem) = self.edit_memory.take() {
+            // In-memory session: nothing is written to the document.
+            self.leave_edit();
+            return serde_json::json!({
+                "result": "confirmed", "changed": !mem.undo.is_empty(), "name": session.name, "memory": true,
+            })
+            .to_string();
+        }
         let empty = session.model.faces.is_empty();
         let mut deleted = false;
         if empty && self.edit_entry_element.is_none() {
@@ -182,6 +289,11 @@ impl AuthorApp {
     /// Leave Edit Mode discarding the changes: the document returns to
     /// its state at entry.
     pub fn edit_cancel(&mut self) {
+        if self.edit.is_some() && self.edit_memory.take().is_some() {
+            self.edit = None;
+            self.leave_edit();
+            return;
+        }
         if self.edit.take().is_some() {
             self.gestures.rollback_transaction(&mut self.doc);
             self.leave_edit();
@@ -207,16 +319,20 @@ impl AuthorApp {
         let Some(level) = self.edit.as_ref().map(|s| s.level) else {
             return false;
         };
+        let wall = matches!(self.edit_target, EditTarget::Wall(_));
         self.edit_tool = match tool {
             "solid" => EditTool::Solid,
             "void" => EditTool::Void,
             "split" => EditTool::Split,
+            "window" if wall => EditTool::Window,
+            "door" if wall => EditTool::Door,
             _ => EditTool::Select,
         };
         self.sketch = match self.edit_tool {
             EditTool::Select => None,
             EditTool::Solid | EditTool::Void => Some(Sketch::new(SketchTool::Profile, self.shape, level)),
             EditTool::Split => Some(Sketch::new(SketchTool::Split, Shape::Polygon, level)),
+            EditTool::Window | EditTool::Door => None,
         };
         if let Some(s) = self.edit.as_mut() {
             s.drag = None;
@@ -386,6 +502,13 @@ impl AuthorApp {
     }
 
     pub fn edit_undo(&mut self) -> bool {
+        if let (Some(mem), Some(s)) = (self.edit_memory.as_mut(), self.edit.as_mut()) {
+            let Some(prev) = mem.undo.pop() else { return false };
+            mem.redo.push(std::mem::replace(&mut s.model, prev.clone()));
+            mem.last_key = None;
+            s.set_model(prev);
+            return true;
+        }
         if self.edit.is_none() || !self.gestures.undo(&mut self.doc) {
             return false;
         }
@@ -395,6 +518,13 @@ impl AuthorApp {
     }
 
     pub fn edit_redo(&mut self) -> bool {
+        if let (Some(mem), Some(s)) = (self.edit_memory.as_mut(), self.edit.as_mut()) {
+            let Some(next) = mem.redo.pop() else { return false };
+            mem.undo.push(std::mem::replace(&mut s.model, next.clone()));
+            mem.last_key = None;
+            s.set_model(next);
+            return true;
+        }
         if self.edit.is_none() || !self.gestures.redo(&mut self.doc) {
             return false;
         }
@@ -517,8 +647,14 @@ impl AuthorApp {
             "tool": self.edit_tool.name(),
             "selection": s.selection.len(),
             "canDelete": !s.selection.is_empty(),
-            "canUndo": self.gestures.can_undo(),
-            "canRedo": self.gestures.can_redo(),
+            "canUndo": self.edit_can_undo(),
+            "canRedo": self.edit_can_redo(),
+            "target": if matches!(self.edit_target, EditTarget::Wall(_)) { "wall" } else { "floor" },
+            "memory": self.edit_memory.is_some(),
+            "anchor": {
+                "selected": s.selected_points().len(),
+                "top": s.selected_points().iter().filter(|id| s.top_points.contains(id)).count(),
+            },
             "faces": s.model.view().faces.len(),
             "panel": { "target": target, "solid": solid, "void": void },
         })
@@ -587,6 +723,7 @@ impl AuthorApp {
                     "p": xy,
                     "sel": s.selection.points.contains(&p.id),
                     "hover": hover == Some(Hit::Point(p.id)),
+                    "top": s.top_points.contains(&p.id),
                 }))
             })
             .collect();
@@ -651,6 +788,20 @@ fn profile_json(view: &ProfileView) -> String {
 }
 
 impl AuthorApp {
+    pub(super) fn edit_can_undo(&self) -> bool {
+        match &self.edit_memory {
+            Some(m) => !m.undo.is_empty(),
+            None => self.gestures.can_undo(),
+        }
+    }
+
+    pub(super) fn edit_can_redo(&self) -> bool {
+        match &self.edit_memory {
+            Some(m) => !m.redo.is_empty(),
+            None => self.gestures.can_redo(),
+        }
+    }
+
     fn start_edit(&mut self, session: EditSession<EditProfile>) {
         if self.window_host.is_some() {
             self.end_window();
@@ -665,6 +816,16 @@ impl AuthorApp {
     }
 
     fn leave_edit(&mut self) {
+        if matches!(self.edit_target, EditTarget::Wall(_)) {
+            if let Some(c) = self.prev_camera.take() {
+                self.camera = c;
+            }
+            self.camera.elevation = None;
+            self.camera.plane_z = self.active_elevation as f32;
+            self.grid_key = None;
+        }
+        self.edit_target = EditTarget::Plane;
+        self.edit_memory = None;
         self.sketch = None;
         self.edit_tool = EditTool::Select;
         self.edit_pointer = EditPointer::default();
@@ -693,12 +854,21 @@ impl AuthorApp {
 
     /// The plane the edited profile lives on.
     pub(super) fn edit_frame(&self) -> SketchFrame {
-        let level = self.edit.as_ref().map_or(vim_design_lib::EntityId::INVALID, |s| s.level);
+        if let Some((f, _, _)) = self.edit_wall_frame() {
+            return SketchFrame { origin: f.origin, u: f.u, v: Vec3::Z };
+        }
+        let plane = self.edit.as_ref().map_or(vim_design_lib::EntityId::INVALID, |s| s.level);
         SketchFrame {
-            origin: Vec3::new(0.0, 0.0, self.level_elevation(level) as f32),
+            origin: Vec3::new(0.0, 0.0, self.plane_elevation(plane) as f32),
             u: Vec3::X,
             v: Vec3::Y,
         }
+    }
+
+    /// The elevation frame of the wall being edited (wall sessions only).
+    pub(super) fn edit_wall_frame(&self) -> Option<(super::ElevationFrame, f32, f32)> {
+        let EditTarget::Wall(id) = self.edit_target else { return None };
+        self.wall(id).map(|w| self.elevation_frame(w))
     }
 
     fn edit_cursor_uv(&self, px: f32, py: f32) -> Option<P2> {
@@ -731,7 +901,20 @@ impl AuthorApp {
             Ok(next) => next,
             Err(e) => return json_err(&e),
         };
-        let (level, name) = (s.level, s.name.clone());
+        if let Some(mem) = self.edit_memory.as_mut() {
+            let continuing = key.is_some() && key == mem.last_key.as_deref();
+            if !continuing {
+                mem.undo.push(s.model.clone());
+            }
+            mem.redo.clear();
+            mem.last_key = key.map(str::to_owned);
+            if let Some(s) = self.edit.as_mut() {
+                s.set_model(next);
+            }
+            return serde_json::json!({ "result": ok }).to_string();
+        }
+        let (plane, name) = (s.level, s.name.clone());
+        let level = self.root_level(plane).unwrap_or(plane);
         let depth = self.doc.undo_depth();
         let stored = self.edit_sketch.filter(|id| self.doc.entity(*id).is_some());
         let result = match stored {
@@ -752,7 +935,7 @@ impl AuthorApp {
                 }
                 return serde_json::json!({ "result": ok }).to_string();
             }
-            None => ops::create_sketch_element(&mut self.doc, level, &next, &name).map(|(element, sketch)| {
+            None => ops::create_sketch_element(&mut self.doc, plane, level, &next, &name).map(|(element, sketch)| {
                 self.edit_sketch = Some(sketch);
                 if let Some(s) = self.edit.as_mut() {
                     s.element = Some(element);

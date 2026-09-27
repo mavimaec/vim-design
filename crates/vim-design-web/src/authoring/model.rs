@@ -589,7 +589,7 @@ mod tests {
         let ground = ops::seed_new_project(&mut doc).expect("seed");
         let square = [[0.0, 0.0], [4.0, 0.0], [4.0, 3.0], [0.0, 3.0]];
         let segs = walls::wall_segments(&square, true, 0.2, false).expect("segments");
-        let ids = ops::commit_walls(&mut doc, ground, &segs, 2.7, 0.2).expect("walls");
+        let ids = ops::commit_walls(&mut doc, ground, ground, &segs, 2.7, 0.2).expect("walls");
         assert_eq!(ids.len(), 4);
         let model = derive(&doc);
         let walls: Vec<&WallModel> = model

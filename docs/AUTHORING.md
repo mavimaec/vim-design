@@ -311,3 +311,110 @@ panic; every result is structurally valid and has no unused points):
 **Compatibility.** `Sketch` was added by appending variants at the end of the
 serialized enums, so documents saved before it load and resave byte-identically (a
 saved authoring project is kept as a regression fixture).
+
+## 10. Walls and workplanes data model
+
+### Workplanes
+
+A **`Workplane`** is a construction plane nested under a level or another workplane —
+a ceiling plane, a sill plane, a parapet base. Levels stay the stories; workplanes are
+the non-story planes the user nests inside a story.
+
+```rust
+// Params::Workplane { name: String, offset_m: f64, color: [f32; 4], extent_m: f64 }
+// slot 0 = parent (required): Level | Workplane
+```
+
+- It evaluates to the parent's frame moved `offset_m` along the parent's normal (world
+  axes, so the basis is trivial). Moving the parent moves the workplane and everything
+  on it. The graph's cycle check keeps parent chains acyclic.
+- Every construction-plane slot accepts it: control point `plane`, sketch `plane`,
+  wall `base` and `top`.
+- **Association stays level-only**: an element drawn on a workplane is associated with
+  the workplane's **root level** (`workplane::root_level(doc, plane)`).
+- `workplane::plane_elevation(doc, plane)` is a plane's height above the scene origin
+  from params only (the root elevation plus the chain's offsets, added in the same
+  order as evaluation, so it matches the evaluated frame exactly).
+- Deleting a level that has workplanes is rejected (dependents); the cascade form
+  deletes the workplanes and everything on them, in one undo step. `DeleteWorkplane`
+  itself is the plain reject-if-dependents delete.
+- Translation factoring: geometry on a workplane lives in its **root level's** local
+  space with the workplane offset baked into local z. Dragging the root level is a
+  transform-only update; editing the workplane offset re-evaluates what is on it.
+
+Commands: `CreateWorkplane { parent, name, offset_m, color, extent_m }`,
+`UpdateWorkplane { id, parent, name, offset_m, color, extent_m (all Option), coalesce }`,
+`DeleteWorkplane { id }`. A non-finite offset is rejected (`InvalidCommand`).
+
+### Walls
+
+A **`Wall`** is a reference line on a construction plane plus an editable elevation
+profile — the same Edit Mode model as floor plates, turned upright.
+
+```rust
+// Params::Wall {
+//     start: [f64; 2], end: [f64; 2],  // reference line in the base plane's (u, v)
+//     height_m: f64,                   // the top reference when `top` is unwired
+//     top_offset_m: f64,               // added to the top plane when `top` is wired
+//     profile: Sketch,                 // elevation: u along the wall from start, v up
+//     top_points: Vec<u32>,            // profile points whose v is measured from the top
+// }
+// slot 0 = base (required): Level | Workplane;  slot 1 = top (optional): Level | Workplane
+```
+
+- **Frame.** The profile's u runs along `start -> end` from `start`, v runs up from the
+  base plane (its normal). Material grows to the **left** of `start -> end` (the drawn
+  line is one face of the wall, as in the wall tool).
+- **Top reference H.** With `top` unwired, `H = height_m`. With `top` wired,
+  `H = (top plane height - base plane height) + top_offset_m` — the wall height follows
+  the top plane (connect a wall to the story above, or to a ceiling workplane).
+  `wall::wall_top_height(doc, wall)` gives H from params, exactly as evaluation
+  computes it.
+- **Top anchors.** A point in `top_points` stores its v relative to H; other points
+  store v relative to the base. The **effective** profile (anchored v + H) is what
+  evaluates and what the user sees and edits. Changing H moves the anchored points and
+  nothing else: the top edge follows, windows keep their sill height.
+- **Faces.** Solid faces are wall material, each with its own thickness (a thicker
+  pilaster face is legal). Void faces are openings: `depth: None` goes through (a
+  window); a depth under the thickness is a niche. A **door** is a void that crosses
+  the bottom edge — ordinary subtractive shaping, no special case. Evaluation is the
+  layered sketch algorithm (§9) in the wall's vertical frame; provenance is
+  `SketchSide`/`SketchCap` with the wall as owner. A wall is an `Element` member (or a
+  standalone mesh owner); the orphan sweep and the level cascade collect it (the base
+  and the top plane are both dependencies, so either one's cascade takes the wall).
+- **Validity.** The commands reject (`InvalidWall`) a zero-length or non-finite line, a
+  height that is not finite and positive, a non-finite top offset, a structurally
+  invalid profile, or an anchored id that is not a profile point
+  (`wall::validate_structure` names the problem). H at or below zero and a
+  self-crossing effective profile are per-entity evaluation errors; the previous mesh
+  stays.
+- **Factoring.** A wall with only a base on root level l lives in l's local space:
+  dragging l is transform-only. A wall with a top constraint depends on two planes and
+  is evaluated in world space (a drag of either plane re-evaluates it).
+
+Commands: `CreateWall { base, top: Option, start, end, height_m, top_offset_m, profile,
+top_points }`, `UpdateWall { id, base, top: Option<Option>, start, end, height_m,
+top_offset_m, profile, top_points (all Option), coalesce }` (the merged result is
+validated like a create), `DeleteWall { id }`.
+
+**Default profile.** `wall::default_profile(length, thickness) -> (Sketch, Vec<u32>)`:
+points 0 `(0, 0)`, 1 `(length, 0)`, 2 `(length, 0*)`, 3 `(0, 0*)` where `*` marks the
+top-anchored corners (v = 0 from the top), one solid face (id 0) with `thickness`, and
+anchors `[2, 3]`. The default wall is exactly H high in both height modes.
+
+**Editing** (`wall::ops`, pure, typed `SketchError`): the sketch operations of §9 —
+`add_face`, `move_points`, `set_point`, `move_edges`, `move_faces`,
+`insert_point_on_edge`, `split_faces`, `delete_faces`, `delete_edges`, `delete_points`
+— each taking `(profile, top_points, H, ...)` in **effective** coordinates and
+returning the stored `(profile, top_points)` for one `UpdateWall`. Anchor rules: a
+surviving point keeps its anchor (moved or not); a removed point loses it (a merged
+edge keeps the kept point's anchor); a point an operation creates is anchored exactly
+when it lies on an edge between two anchored points (a point inserted on the top edge
+follows the top). `set_anchor(profile, top_points, H, ids, top)` re-anchors points
+without moving them. A point whose effective position an operation does not change
+keeps its stored coordinates bit for bit. `wall::effective_profile(profile, top_points,
+H)` and `wall::stored_profile(effective, top_points, H)` convert between the two forms.
+
+**Compatibility.** Workplanes and walls were added by appending variants at the end
+of the serialized enums; documents saved before (including Sketch floor plates) load
+and resave byte-identically (kept as regression fixtures).

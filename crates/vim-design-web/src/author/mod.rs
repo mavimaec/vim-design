@@ -46,7 +46,7 @@ use crate::gestures::Gestures;
 use crate::render::{LineLayer, MeshStyle, Renderer, RendererOptions};
 
 use camera::{Camera, ElevationFrame, ViewMode};
-use edit::{EditPointer, EditProfile, EditTool};
+use edit::{EditPointer, EditProfile, EditTarget, EditTool, MemoryHistory};
 use crate::authoring::edit::ProfileModel;
 use crate::authoring::edit::session::EditSession;
 use pick::PickScene;
@@ -191,6 +191,9 @@ pub struct AuthorApp {
     /// Session state: never in the document, never undoable.
     active_level: Option<EntityId>,
     active_elevation: f64,
+    /// The active construction plane when it is not the active level
+    /// itself (a workplane); `None` means "draw on the active level".
+    active_plane: Option<EntityId>,
     selection: Option<EntityId>,
     tool: Tool,
     /// Outline shape per drawing tool family.
@@ -202,6 +205,10 @@ pub struct AuthorApp {
     wall_height: f64,
     wall_thickness: f64,
     wall_flip: bool,
+    /// Height mode of new walls: `None` = a fixed height; `Some(plane)` =
+    /// up to that plane, plus `wall_top_offset`.
+    wall_top: Option<EntityId>,
+    wall_top_offset: f64,
     /// Window tool: the wall whose face is being drawn on (elevation
     /// view), and the camera to return to when done.
     window_host: Option<EntityId>,
@@ -216,6 +223,10 @@ pub struct AuthorApp {
     /// for a new plate).
     edit_sketch: Option<EntityId>,
     edit_entry_element: Option<EntityId>,
+    /// Floor plane or wall elevation; and, for sessions not stored in the
+    /// document yet, their in-memory history.
+    edit_target: EditTarget,
+    edit_memory: Option<MemoryHistory>,
     snap_enabled: bool,
     snap_step: f64,
     plate_thickness: f64,
@@ -265,6 +276,7 @@ impl AuthorApp {
             params_dirty: true,
             active_level: None,
             active_elevation: 0.0,
+            active_plane: None,
             selection: None,
             tool: Tool::Select,
             shape: Shape::Polygon,
@@ -274,6 +286,8 @@ impl AuthorApp {
             wall_height: DEFAULT_WALL_HEIGHT_M,
             wall_thickness: DEFAULT_WALL_THICKNESS_M,
             wall_flip: false,
+            wall_top: None,
+            wall_top_offset: 0.0,
             window_host: None,
             prev_camera: None,
             edit: None,
@@ -281,6 +295,8 @@ impl AuthorApp {
             edit_pointer: EditPointer::default(),
             edit_sketch: None,
             edit_entry_element: None,
+            edit_target: EditTarget::Plane,
+            edit_memory: None,
             snap_enabled: true,
             snap_step: 0.25,
             plate_thickness: 0.3,
@@ -365,6 +381,16 @@ impl AuthorApp {
     /// "plan" or "3d". Leaving an elevation view (window drawing) this way
     /// ends it first.
     pub fn set_view_mode(&mut self, mode: &str) {
+        // A wall being edited can be seen head-on again.
+        if mode == "elevation" {
+            if let Some((frame, length, height)) = self.edit_wall_frame() {
+                let (w, h) = self.size_f();
+                self.camera.enter_elevation(frame, length, height, w / h);
+                self.grid_key = None;
+                self.refresh_styles();
+            }
+            return;
+        }
         if self.window_host.is_some() {
             self.end_window();
         }
@@ -402,7 +428,7 @@ impl AuthorApp {
     pub fn zoom_fit(&mut self) {
         let (w, h) = self.size_f();
         let aspect = w / h;
-        if let Some((frame, length, height)) = self.host_elevation_frame() {
+        if let (ViewMode::Elevation, Some((frame, length, height))) = (self.camera.mode, self.faced_frame()) {
             self.camera.enter_elevation(frame, length, height, aspect);
             return;
         }
@@ -492,7 +518,7 @@ impl AuthorApp {
             self.end_window();
         }
         self.tool = tool;
-        self.sketch = match (tool, self.active_level) {
+        self.sketch = match (tool, self.plane()) {
             (Tool::Plate, Some(level)) => Some(Sketch::new(SketchTool::Plate, self.shape, level)),
             (Tool::Wall, Some(level)) => Some(Sketch::new(SketchTool::Wall, self.wall_shape, level)),
             _ => None,
@@ -789,6 +815,87 @@ impl AuthorApp {
             .0 as f64
     }
 
+    /// The Model tree: story levels, top first, each with its nested
+    /// construction planes and its elements grouped by category (Floors,
+    /// Walls, Other). Rows carry what the page shows (name, meta) and
+    /// whether the element opens in Edit Mode.
+    pub fn tree_json(&self) -> String {
+        let mut levels = ops::levels_sorted(&self.doc);
+        levels.reverse();
+        let groups_of = |level: EntityId| -> Vec<serde_json::Value> {
+            let mut floors = Vec::new();
+            let mut walls = Vec::new();
+            let mut other = Vec::new();
+            for e in self.model.iter().filter(|e| e.level() == Some(level)) {
+                let (bucket, meta, edit) = match e {
+                    ElementModel::SketchPlate(p) => {
+                        let area = self.pick.owner_stats(p.element).map_or(0.0, |s| s.top_area);
+                        let faces = p.sketch.faces.len();
+                        let meta = format!("{:.1} m² · {} face{}", area, faces, if faces == 1 { "" } else { "s" });
+                        (&mut floors, meta, true)
+                    }
+                    ElementModel::Plate(p) => (&mut floors, format!("{:.1} m² · {:.2} m", p.area, p.thickness), true),
+                    ElementModel::Wall(w) => {
+                        let meta = format!("{:.2} m · h {:.2} m", w.length(), w.height);
+                        (&mut walls, meta, true)
+                    }
+                    ElementModel::Other(_) => (&mut other, String::new(), false),
+                };
+                bucket.push(serde_json::json!({
+                    "id": e.element().0 as f64,
+                    "name": e.name(),
+                    "kind": e.kind_name(),
+                    "meta": meta,
+                    "editable": edit,
+                    "selected": self.selection == Some(e.element()),
+                }));
+            }
+            [("floors", "Floors", floors), ("walls", "Walls", walls), ("other", "Other", other)]
+                .into_iter()
+                .filter(|(_, _, items)| !items.is_empty())
+                .map(|(key, label, items)| serde_json::json!({ "key": key, "label": label, "items": items }))
+                .collect()
+        };
+        let rows: Vec<serde_json::Value> = levels
+            .iter()
+            .map(|l| {
+                serde_json::json!({
+                    "id": l.id.0 as f64,
+                    "name": l.name,
+                    "elevation": l.elevation_m,
+                    "isStory": l.is_building_story,
+                    "color": l.color,
+                    "active": self.plane() == Some(l.id),
+                    // Nested construction planes (workplanes), recursive.
+                    "planes": Vec::<serde_json::Value>::new(),
+                    "groups": groups_of(l.id),
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "activeLevel": self.active_level.map(|id| id.0 as f64),
+            "activePlane": self.plane().map(|id| id.0 as f64),
+            "levels": rows,
+        })
+        .to_string()
+    }
+
+    /// Reveal an element: make its level active and frame its geometry.
+    pub fn frame_element(&mut self, id: f64) -> bool {
+        let id = eid(id);
+        let Some(level) = self.model.iter().find(|e| e.element() == id).and_then(|e| e.level()) else {
+            return false;
+        };
+        if self.plane().and_then(|p| self.root_level(p)) != Some(level) {
+            self.set_active_plane(level.0 as f64);
+        }
+        let Some(stats) = self.pick.owner_stats(id) else { return false };
+        let (w, h) = self.size_f();
+        let [min, max] = stats.bbox;
+        self.camera.fit(Vec3::from_array(min), Vec3::from_array(max), w / h);
+        true
+    }
+
     /// Select an element (-1 clears). Session state: no document change.
     pub fn select(&mut self, id: f64) {
         let id = eid(id);
@@ -943,6 +1050,7 @@ impl AuthorApp {
             .collect();
         serde_json::json!({
             "activeId": self.active_level.map(|id| id.0 as f64),
+            "activePlane": self.plane().map(|p| self.plane_json(p)),
             "levels": levels,
         })
         .to_string()
@@ -951,14 +1059,22 @@ impl AuthorApp {
     /// Select the active level — SESSION state only (no document change,
     /// no undo step). A sketch in progress moves to the new plane.
     pub fn set_active_level(&mut self, id: f64) -> bool {
+        self.set_active_plane(id)
+    }
+
+    /// Make a construction plane active — SESSION state only. A story
+    /// level becomes the active level itself; the active level is always
+    /// the plane's root level (the association target of new elements).
+    pub fn set_active_plane(&mut self, id: f64) -> bool {
         let id = eid(id);
-        if !matches!(self.doc.entity(id).map(|e| e.kind()), Some(EntityKind::Level)) {
+        let Some(level) = self.root_level(id) else {
             return false;
-        }
+        };
         if self.window_host.is_some() {
             self.end_window();
         }
-        self.active_level = Some(id);
+        self.active_level = Some(level);
+        self.active_plane = (id != level).then_some(id);
         self.refresh_session_and_overlays();
         true
     }
@@ -1080,11 +1196,11 @@ impl AuthorApp {
 
     /// Inside Edit Mode these are bounded by the session's transaction.
     pub fn can_undo(&self) -> bool {
-        self.gestures.can_undo()
+        if self.edit.is_some() { self.edit_can_undo() } else { self.gestures.can_undo() }
     }
 
     pub fn can_redo(&self) -> bool {
-        self.gestures.can_redo()
+        if self.edit.is_some() { self.edit_can_redo() } else { self.gestures.can_redo() }
     }
 
     // -- Status ---------------------------------------------------------------
@@ -1235,6 +1351,41 @@ impl AuthorApp {
         }
     }
 
+    /// The active construction plane: a workplane when one is active,
+    /// otherwise the active level.
+    fn plane(&self) -> Option<EntityId> {
+        self.active_plane.or(self.active_level)
+    }
+
+    /// Elevation of a construction plane (a level; workplanes add their
+    /// offset chain here).
+    fn plane_elevation(&self, plane: EntityId) -> f64 {
+        self.level_elevation(plane)
+    }
+
+    /// The story level a construction plane belongs to (a level is its
+    /// own root). Elements drawn on the plane are associated with it.
+    fn root_level(&self, plane: EntityId) -> Option<EntityId> {
+        match self.doc.entity(plane).map(|e| e.kind()) {
+            Some(EntityKind::Level) => Some(plane),
+            _ => None,
+        }
+    }
+
+    /// Display data of a plane: name, "Level › Plane" path, elevation.
+    fn plane_json(&self, plane: EntityId) -> serde_json::Value {
+        let name = self.level_name(Some(plane)).unwrap_or_default();
+        let root = self.root_level(plane).and_then(|l| self.level_name(Some(l))).unwrap_or_default();
+        let path = if root == name { name.clone() } else { format!("{root} › {name}") };
+        serde_json::json!({
+            "id": plane.0 as f64,
+            "name": name,
+            "path": path,
+            "elevation": self.plane_elevation(plane),
+            "isLevel": self.root_level(plane) == Some(plane),
+        })
+    }
+
     fn wall(&self, element: EntityId) -> Option<&WallModel> {
         self.model.iter().find_map(|e| match e {
             ElementModel::Wall(w) if w.element == element => Some(w),
@@ -1268,9 +1419,18 @@ impl AuthorApp {
         self.host_wall().map(|w| self.elevation_frame(w))
     }
 
+    /// The wall an elevation view faces: the window tool's host, or the
+    /// wall being edited.
+    fn faced_frame(&self) -> Option<(ElevationFrame, f32, f32)> {
+        self.host_elevation_frame().or_else(|| self.edit_wall_frame())
+    }
+
     /// The plane the current sketch lives on.
     fn sketch_frame(&self) -> Option<SketchFrame> {
         let sk = self.sketch.as_ref()?;
+        if matches!(sk.tool, SketchTool::Profile | SketchTool::Split) {
+            return Some(self.edit_frame());
+        }
         if sk.tool == SketchTool::Window {
             let (f, _, _) = self.host_elevation_frame()?;
             return Some(SketchFrame { origin: f.origin, u: f.u, v: Vec3::Z });
@@ -1511,13 +1671,20 @@ impl AuthorApp {
                     Err(invalid) => Err(invalid.message().to_owned()),
                 }
             }
-            SketchTool::Wall => ops::commit_walls(
-                &mut self.doc,
-                sketch.level,
-                &segments,
-                self.wall_height,
-                self.wall_thickness,
-            )
+            SketchTool::Wall => {
+                let level = self.root_level(sketch.level).unwrap_or(sketch.level);
+                match self.new_wall_height(sketch.level) {
+                    Ok(height) => ops::commit_walls(
+                        &mut self.doc,
+                        sketch.level,
+                        level,
+                        &segments,
+                        height,
+                        self.wall_thickness,
+                    ),
+                    Err(e) => Err(e),
+                }
+            }
             .map(|ids| {
                 let msg = if ids.len() == 1 {
                     "Wall created".to_owned()
@@ -1692,6 +1859,7 @@ impl AuthorApp {
             self.camera = c;
         }
         self.active_level = None;
+        self.active_plane = None;
         self.active_elevation = 0.0;
         self.last_committed = 0;
         // A loaded document reports no params_changed (nothing was
@@ -1841,11 +2009,12 @@ impl AuthorApp {
                 })
                 .map(|l| l.id)
         });
-        if let Some(info) = self
-            .active_level
-            .and_then(|a| levels.iter().find(|l| l.id == a))
-        {
-            self.active_elevation = info.elevation_m;
+        // A plane that vanished falls back to its level.
+        if self.active_plane.is_some_and(|p| self.doc.entity(p).is_none()) {
+            self.active_plane = None;
+        }
+        if let Some(plane) = self.plane() {
+            self.active_elevation = self.plane_elevation(plane);
         }
         // The camera orbits / looks down onto the active plane.
         self.camera.plane_z = self.active_elevation as f32;
@@ -1856,7 +2025,7 @@ impl AuthorApp {
         }
         // Every other sketch lives on the active plane.
         let plane_sketch = self.sketch.as_ref().filter(|s| s.tool != SketchTool::Window);
-        match (self.active_level, plane_sketch.map(|s| s.level)) {
+        match (self.plane(), plane_sketch.map(|s| s.level)) {
             (Some(active), Some(level)) if active != level => {
                 if let Some(s) = self.sketch.as_mut() {
                     s.level = active;
@@ -1938,7 +2107,7 @@ impl AuthorApp {
     /// shows on plate tops), or the faced wall in an elevation view
     /// (just in front of the face, wall-local u along / v up).
     fn grid_frame(&self) -> SketchFrame {
-        match (self.camera.mode, self.host_elevation_frame()) {
+        match (self.camera.mode, self.faced_frame()) {
             (ViewMode::Elevation, Some((f, _, _))) => SketchFrame {
                 origin: f.origin + f.n * (f.near_offset - GRID_LIFT_M * 2.0),
                 u: f.u,

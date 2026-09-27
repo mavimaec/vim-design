@@ -44,14 +44,47 @@ impl AuthorApp {
     }
 
     pub fn wall_settings_json(&self) -> String {
+        let base = self.plane();
         serde_json::json!({
             "height": self.wall_height,
             "thickness": self.wall_thickness,
             "flip": self.wall_flip,
+            "mode": if self.wall_top.is_some() { "upto" } else { "fixed" },
+            "topPlane": self.wall_top.map(|p| p.0 as f64),
+            "topOffset": self.wall_top_offset,
+            "effectiveHeight": base.and_then(|b| self.new_wall_height(b).ok()),
+            "planes": self.top_plane_candidates(),
         })
         .to_string()
     }
 
+    /// Height mode for new walls: "fixed" (the height setting) or "upto"
+    /// (up to `plane` plus `offset`).
+    pub fn set_wall_height_mode(&mut self, mode: &str, plane: f64, offset: f64) {
+        self.wall_top = (mode == "upto").then(|| eid(plane)).filter(|p| self.root_level(*p).is_some());
+        if offset.is_finite() {
+            self.wall_top_offset = offset.clamp(-MAX_WALL_HEIGHT_M, MAX_WALL_HEIGHT_M);
+        }
+    }
+
+    /// Up-to height for an existing wall: its height becomes the distance
+    /// from its base to `plane` plus `offset`. Returns the new height, or
+    /// -1 when the plane is not above the base.
+    pub fn set_wall_height_up_to(&mut self, id: f64, plane: f64, offset: f64) -> f64 {
+        let Some(wall) = self.wall(eid(id)).cloned() else { return -1.0 };
+        match self.height_up_to(wall.plane_level, eid(plane), offset) {
+            Ok(h) => {
+                self.set_wall_height(id, h);
+                self.gestures.end();
+                h
+            }
+            Err(_) => -1.0,
+        }
+    }
+}
+
+#[wasm_bindgen]
+impl AuthorApp {
     /// The wall under (or near) a canvas point: a ray hit on a wall, or
     /// else the wall whose base or top line passes within `tol_px`
     /// device pixels. In plan, only walls on the active level count.
@@ -181,6 +214,31 @@ impl AuthorApp {
 }
 
 impl AuthorApp {
+    /// Planes a wall top can reach: every construction plane, grouped by
+    /// story level (top first), with its path and elevation.
+    fn top_plane_candidates(&self) -> Vec<serde_json::Value> {
+        let mut levels = crate::authoring::ops::levels_sorted(&self.doc);
+        levels.reverse();
+        levels.iter().map(|l| self.plane_json(l.id)).collect()
+    }
+
+    /// Height from a wall's base plane up to `top` plus `offset`.
+    fn height_up_to(&self, base: EntityId, top: EntityId, offset: f64) -> Result<f64, String> {
+        let h = self.plane_elevation(top) + offset - self.plane_elevation(base);
+        if h < MIN_WALL_HEIGHT_M {
+            return Err("The wall top must be above its base: pick a higher plane".to_owned());
+        }
+        Ok(h.min(MAX_WALL_HEIGHT_M))
+    }
+
+    /// The height a new wall on `base` gets from the height mode.
+    pub(super) fn new_wall_height(&self, base: EntityId) -> Result<f64, String> {
+        match self.wall_top {
+            Some(top) => self.height_up_to(base, top, self.wall_top_offset),
+            None => Ok(self.wall_height),
+        }
+    }
+
     /// Lowest height a wall may take: above its highest window by the
     /// window margin.
     pub(super) fn min_wall_height(&self, wall: &WallModel) -> f64 {

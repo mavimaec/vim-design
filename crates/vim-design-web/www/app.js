@@ -49,6 +49,16 @@ const EDIT_PICK_PX = { mouse: 10, pen: 14, touch: 22 };
 // Edit Mode stepper increments (meters).
 const FACE_THICKNESS_STEP_M = 0.05;
 const VOID_DEPTH_STEP_M = 0.05;
+// Wall height modes and wall Edit Mode ship behind this page flag until
+// walls are profile-based in the document (?m4preview).
+const M4_PREVIEW = new URLSearchParams(location.search).has("m4preview");
+/** Edit HUD: a top-anchored point is a square this much wider than a
+ *  round handle, with an up tick of this length (CSS px). */
+const TOP_ANCHOR_HANDLE_SCALE = 1.05;
+const TOP_ANCHOR_TICK_PX = 7;
+const WALL_TOP_OFFSET_STEP_M = 0.05;
+// Desktop: the Model tree panel opens by default at this width and up.
+const TREE_DEFAULT_OPEN_MIN_PX = 760;
 const COARSE = matchMedia("(pointer: coarse)").matches;
 
 const $ = (id) => document.getElementById(id);
@@ -253,11 +263,16 @@ async function main() {
           shape: app.shape(),
           wall: JSON.parse(app.wall_settings_json()),
           camera: app.camera_json(),
+          treeOpen,
+          treeCollapsed: [...treeCollapsed],
         }));
       }, SESSION_SAVE_DEBOUNCE_MS);
     };
   })();
 
+  // Model tree: open on desktop by default; collapsed rows by key.
+  let treeOpen = typeof session.treeOpen === "boolean" ? session.treeOpen : innerWidth >= TREE_DEFAULT_OPEN_MIN_PX;
+  const treeCollapsed = new Set(Array.isArray(session.treeCollapsed) ? session.treeCollapsed : []);
   let snapEnabled = session.snapEnabled ?? true;
   let snapStep = SNAP_STEPS.includes(session.snapStep) ? session.snapStep : (COARSE ? 0.5 : 0.25);
   app.set_snap(snapEnabled, snapStep);
@@ -294,6 +309,9 @@ async function main() {
     }
   }
   if (typeof session.activeLevel === "number") app.set_active_level(session.activeLevel);
+  if (M4_PREVIEW && session.wall?.mode === "upto" && typeof session.wall.topPlane === "number") {
+    app.set_wall_height_mode("upto", session.wall.topPlane, Number(session.wall.topOffset) || 0);
+  }
   if (restored && session.camera) {
     app.set_camera_json(session.camera);
   } else {
@@ -408,7 +426,7 @@ async function main() {
   const editing = () => editState.active === true;
   const isDrawing = () =>
     stats.tool === "wall" || inElevation() ||
-    (editing() && editState.tool !== "select");
+    (editing() && ["solid", "void", "split"].includes(editState.tool));
 
   const pointers = new Map(); // id -> {x, y, type} (client px)
   let mode = "none"; // none | press | nav | pan | place | pinch | pinch-rest
@@ -593,6 +611,9 @@ async function main() {
       clearTimeout(longPressTimer);
       if (cancelled) {
         app.edit_gesture_cancel();
+      } else if (mode === "edit-press" && !press.consumed && ["window", "door"].includes(editState.tool)) {
+        const res = JSON.parse(app.edit_place_preset(press.dev[0], press.dev[1]));
+        if (res.result === "rejected") toast(res.reason, { kind: "error" });
       } else if (mode === "edit-press" && !press.consumed) {
         app.edit_tap(press.dev[0], press.dev[1], editPickPx(press.type), press.additive);
       } else if (mode === "edit-move") {
@@ -963,13 +984,28 @@ async function main() {
     const r = (facesMode ? 3 : h.mode === "edges" ? 3.5 : 6) * dpr;
     for (const p of h.points) {
       const [x, y] = p.p;
+      const pr = p.hover && !p.sel ? r * 1.35 : r;
       ctx.beginPath();
-      ctx.arc(x, y, p.hover && !p.sel ? r * 1.35 : r, 0, Math.PI * 2);
+      if (p.top) {
+        // Top-anchored (a wall point that follows the wall height): a
+        // square handle with a tick pointing up.
+        const q = pr * TOP_ANCHOR_HANDLE_SCALE;
+        ctx.rect(x - q, y - q, 2 * q, 2 * q);
+      } else {
+        ctx.arc(x, y, pr, 0, Math.PI * 2);
+      }
       ctx.fillStyle = p.sel ? accent : "#fff";
       ctx.fill();
       ctx.lineWidth = 2 * dpr;
       ctx.strokeStyle = accent;
       ctx.stroke();
+      if (p.top) {
+        const q = pr * TOP_ANCHOR_HANDLE_SCALE;
+        ctx.beginPath();
+        ctx.moveTo(x, y - q);
+        ctx.lineTo(x, y - q - TOP_ANCHOR_TICK_PX * dpr);
+        ctx.stroke();
+      }
     }
     for (const [x1, y1, x2, y2] of h.guides ?? []) {
       ctx.beginPath();
@@ -1028,11 +1064,21 @@ async function main() {
     levelsState = JSON.parse(app.levels_json());
     const lvl = activeLevelInfo();
     const chip = $("level-chip");
-    chip.querySelector(".chip-name").textContent = lvl ? lvl.name : "No level";
-    chip.querySelector(".chip-elev").textContent = lvl ? fmtM(lvl.elevation) : "add one in Levels";
+    // The active construction plane: "Level 2 › Ceiling" for a workplane.
+    const plane = levelsState.activePlane;
+    chip.querySelector(".chip-name").textContent = plane ? plane.path : lvl ? lvl.name : "No level";
+    chip.querySelector(".chip-elev").textContent = plane ? fmtM(plane.elevation) : lvl ? fmtM(lvl.elevation) : "add one in Levels";
     chip.querySelector(".swatch").style.background = lvl ? cssColor(lvl.color) : "#98a2b3";
   }
 
+  function wallHint(tap, n) {
+    if (stats.shape === "rect") {
+      return n === 0 ? `Drag, or ${tap.toLowerCase()} two opposite corners of the room` : `${tap} the opposite corner`;
+    }
+    if (n === 0) return `${tap} where the wall starts — thickness grows to the left`;
+    if (n < 3) return `${tap} the next corner, or Finish`;
+    return `${tap} the first point to close the loop, or Finish`;
+  }
   function hintText() {
     if (!stats.canAuthor) return "Add a level to start drawing (Menu → Levels)";
     const tap = COARSE ? "Tap" : "Click";
@@ -1046,6 +1092,12 @@ async function main() {
       }
       const hold = editState.mode === "points" ? " · hold an edge to add a point" : "";
       return `${tap} ${noun} to select · drag to move · drag empty space to box-select${hold}`;
+    }
+    if (editing() && editState.tool === "window") {
+      return `${tap} the wall to place a window (1.2 × 1.2 m, sill 0.9 m)`;
+    }
+    if (editing() && editState.tool === "door") {
+      return `${tap} the wall to place a door (0.9 × 2.1 m)`;
     }
     if (editing() && editState.tool === "split") {
       return `${tap} two points: a line across the faces to split`;
@@ -1062,12 +1114,12 @@ async function main() {
     const h = lastHud.active ? lastHud : JSON.parse(app.hud_json());
     const n = h.count ?? 0;
     if (stats.tool === "wall") {
-      if (stats.shape === "rect") {
-        return n === 0 ? `Drag, or ${tap.toLowerCase()} two opposite corners of the room` : `${tap} the opposite corner`;
-      }
-      if (n === 0) return `${tap} where the wall starts — thickness grows to the left`;
-      if (n < 3) return `${tap} the next corner, or Finish`;
-      return `${tap} the first point to close the loop, or Finish`;
+      const base = wallHint(tap, n);
+      if (!M4_PREVIEW) return base;
+      // Up to: say how high the new walls come out.
+      const ws = JSON.parse(app.wall_settings_json());
+      if (ws.mode !== "upto") return base;
+      return ws.effectiveHeight == null ? "The wall top must be above its base: pick a higher plane" : `${base} · ${fmtM(ws.effectiveHeight)} high`;
     }
     const what = { hole: "hole", window: "window" }[stats.tool] ?? "floor plate";
     if (stats.shape === "rect") {
@@ -1117,6 +1169,7 @@ async function main() {
       $("flip-toggle").setAttribute("aria-pressed", String(stats.wall.flip));
       $("window-done").hidden = !inElevation();
       $("wall-settings").hidden = !wall;
+      renderWallHeightMode(wall);
       for (const [id, v] of [["wall-height-input", stats.wall.height], ["wall-thickness-input", stats.wall.thickness]]) {
         if (document.activeElement !== $(id)) $(id).value = v.toFixed(2);
       }
@@ -1188,6 +1241,7 @@ async function main() {
   });
 
   function setActiveLevel(id) {
+    queueMicrotask(() => renderTreePanel());
     // Session state: no document change, so the panels repaint by hand.
     app.set_active_level(id);
     stats = JSON.parse(app.stats_json());
@@ -1311,18 +1365,76 @@ async function main() {
   });
   $("flip-toggle").addEventListener("click", () => setWallSettings({ flip: !stats.wall.flip }));
 
+  // Wall height mode for new walls (preview): Fixed uses the height
+  // stepper; Up to uses a plane picker and an offset from that plane.
+  function renderWallHeightMode(wall) {
+    const row = $("wall-height-mode");
+    row.hidden = !(M4_PREVIEW && wall);
+    if (row.hidden) { $("wall-height-stepper").hidden = false; return; }
+    const ws = JSON.parse(app.wall_settings_json());
+    const upto = ws.mode === "upto";
+    for (const b of document.querySelectorAll("#wall-mode-toggle button")) {
+      b.classList.toggle("on", b.dataset.wallMode === ws.mode);
+    }
+    const picker = $("wall-top-plane");
+    const key = `${innerWidth < TREE_DEFAULT_OPEN_MIN_PX}|` + ws.planes.map((p) => `${p.id}:${p.path}:${p.elevation}`).join("|");
+    if (picker.dataset.key !== key) {
+      picker.dataset.key = key;
+      planeOptions(picker, ws.planes, ws.topPlane);
+    }
+    if (ws.topPlane != null) picker.value = String(ws.topPlane);
+    picker.hidden = !upto;
+    $("wall-top-offset-stepper").hidden = !upto;
+    if (document.activeElement !== $("wall-top-offset")) $("wall-top-offset").value = ws.topOffset.toFixed(2);
+    // Up to: the plane decides the height, so the fixed stepper hides.
+    $("wall-height-stepper").hidden = upto;
+    row.classList.toggle("bad", upto && ws.effectiveHeight == null);
+    row.title = upto
+      ? (ws.effectiveHeight == null ? "The wall top must be above its base: pick a higher plane" : `New walls: ${fmtM(ws.effectiveHeight)} high`)
+      : "";
+  }
+  const setWallHeightMode = ({ mode, plane, offset }) => {
+    const ws = JSON.parse(app.wall_settings_json());
+    const m = mode ?? ws.mode;
+    let p = plane ?? ws.topPlane;
+    if (m === "upto" && p == null) {
+      const base = JSON.parse(app.levels_json()).activePlane?.elevation ?? 0;
+      p = planeAbove(ws.planes, base);
+    }
+    app.set_wall_height_mode(m, p ?? -1, offset ?? ws.topOffset);
+    renderChrome();
+    sessionSave();
+  };
+  for (const b of document.querySelectorAll("#wall-mode-toggle button")) {
+    b.addEventListener("click", (e) => { e.preventDefault(); setWallHeightMode({ mode: b.dataset.wallMode }); });
+  }
+  $("wall-top-plane").addEventListener("change", (e) => setWallHeightMode({ plane: Number(e.target.value) }));
+  for (const b of document.querySelectorAll("#wall-top-offset-stepper button")) {
+    b.addEventListener("click", (e) => {
+      e.preventDefault();
+      const ws = JSON.parse(app.wall_settings_json());
+      setWallHeightMode({ offset: Math.round((ws.topOffset + Number(b.dataset.topOffset) * WALL_TOP_OFFSET_STEP_M) * 100) / 100 });
+    });
+  }
+  $("wall-top-offset").addEventListener("change", (e) => {
+    const v = parseNum(e.target.value);
+    if (Number.isFinite(v)) setWallHeightMode({ offset: v });
+  });
+
   // Window flow: tap a wall -> elevation view -> Done.
   function beginWindow(wall) {
     if (!app.begin_window(wall)) return;
     if (sheetPage === "properties") closeSheet(false);
     stats = JSON.parse(app.stats_json());
     renderChrome();
+    renderTreePanel();
     requestRender();
   }
   function endWindow() {
     app.end_window();
     stats = JSON.parse(app.stats_json());
     renderChrome();
+    renderTreePanel();
     requestRender();
   }
   $("window-done").addEventListener("click", () => endWindow());
@@ -1335,6 +1447,14 @@ async function main() {
     stats = JSON.parse(app.stats_json());
     renderChrome();
     requestRender();
+  }
+  /** Enter Edit Mode on a wall: its elevation profile, openings, anchors. */
+  function beginWallEdit(id) {
+    if (!app.edit_begin_wall(id)) {
+      toast("This wall cannot be edited as a shape", { kind: "error" });
+      return;
+    }
+    enterEditChrome();
   }
   /** Enter Edit Mode on a floor plate (a legacy plate is converted). */
   function beginEdit(id, tool = null) {
@@ -1353,6 +1473,7 @@ async function main() {
   }
   function exitEditChrome() {
     refreshEdit();
+    renderTreePanel();
     refresh();
     saveNow();
   }
@@ -1362,8 +1483,20 @@ async function main() {
     $("edit-bar").hidden = !on;
     $("edit-dock").hidden = !on;
     $("edit-panel").hidden = !on;
+    const wallEdit = on && editState.target === "wall";
+    document.body.classList.toggle("edit-wall", wallEdit);
     if (!on) return;
     $("edit-name").textContent = editState.name;
+    // A wall is edited in its elevation: the first view is "Wall".
+    const first = $("edit-view-toggle").firstElementChild;
+    const [view, label] = wallEdit ? ["elevation", "Wall"] : ["plan", "Plan"];
+    if (first.dataset.view !== view) { first.dataset.view = view; first.textContent = label; }
+    const anchor = editState.anchor ?? { selected: 0, top: 0 };
+    $("edit-anchor-row").hidden = !(wallEdit && anchor.selected > 0);
+    for (const b of document.querySelectorAll("#edit-anchor button")) {
+      const all = b.dataset.anchor === "top" ? anchor.top === anchor.selected : anchor.top === 0;
+      b.classList.toggle("on", anchor.selected > 0 && all);
+    }
     $("edit-undo").disabled = !editState.canUndo;
     $("edit-redo").disabled = !editState.canRedo;
     for (const b of document.querySelectorAll("#edit-view-toggle button")) {
@@ -1380,10 +1513,11 @@ async function main() {
     const panel = editState.panel;
     const sel = panel.target === "selection";
     $("edit-panel").classList.toggle("target-new", !sel);
+    const pts = wallEdit && !sel ? anchor.selected : 0;
     $("edit-panel-title").textContent = sel
       ? `${editState.selection} face${editState.selection === 1 ? "" : "s"} selected`
-      : "New faces";
-    $("edit-panel-note").textContent = sel ? "" : "select faces to change them";
+      : pts ? `${pts} point${pts === 1 ? "" : "s"} selected` : "New faces";
+    $("edit-panel-note").textContent = sel ? "" : pts ? "thickness: for new faces" : "select faces to change them";
     const solid = panel.solid, voidP = panel.void;
     $("edit-solid-row").hidden = !solid;
     $("edit-void-row").hidden = !voidP;
@@ -1412,6 +1546,9 @@ async function main() {
     exitEditChrome();
     if (res.deleted) {
       toast(`${res.name} deleted — it had no faces left`, { action: { label: "Undo", fn: () => { if (app.undo()) refresh(); } } });
+    } else if (res.memory) {
+      // Preview: wall shapes are not in the document yet.
+      toast("Preview: wall edits are not saved yet", { ms: 2400 });
     } else if (res.changed) {
       toast(`${res.name} saved`, { kind: "ok", ms: 1600 });
     }
@@ -1448,6 +1585,12 @@ async function main() {
     b.addEventListener("click", () => {
       const tool = editState.tool === b.dataset.editTool ? "select" : b.dataset.editTool;
       app.edit_set_tool(tool);
+      refreshEdit();
+    });
+  }
+  for (const b of document.querySelectorAll("#edit-anchor button")) {
+    b.addEventListener("click", () => {
+      app.edit_set_anchor(b.dataset.anchor === "top");
       refreshEdit();
     });
   }
@@ -1567,6 +1710,7 @@ async function main() {
       revealSelection();
     }
     else if (sheetPage === "properties") closeSheet(false);
+    renderTreePanel();
     requestRender();
   }
 
@@ -1620,7 +1764,7 @@ async function main() {
   let sheetStack = [];
   const PAGE_TITLES = {
     menu: "Menu", levels: "Levels", project: "Project location", about: "About",
-    properties: "Properties",
+    properties: "Properties", model: "Model",
   };
   function openSheet(page, { root = false } = {}) {
     if (root) sheetStack = [];
@@ -1640,6 +1784,7 @@ async function main() {
       app.select(-1);
       requestRender();
     }
+    renderTreePanel();
   }
   $("sheet-close").addEventListener("click", () => closeSheet());
   $("sheet-back").addEventListener("click", () => {
@@ -1668,13 +1813,18 @@ async function main() {
     if (!sheetPage) return;
     $("sheet-title").textContent = PAGE_TITLES[sheetPage] ?? "";
     $("sheet-back").hidden = sheetStack.length === 0;
-    const pages = { menu: pageMenu, levels: pageLevels, project: pageProject, about: pageAbout, properties: pageProperties };
+    const pages = {
+      menu: pageMenu, levels: pageLevels, project: pageProject, about: pageAbout, properties: pageProperties,
+      model: () => renderTree(sheetBody),
+    };
     (pages[sheetPage] ?? (() => {}))();
   }
 
   /** Repaint document-bound UI: triggered only by the dirty pump. */
   function renderDocPanels() {
     renderLevelChip();
+    renderTreePanel();
+    if (sheetPage === "model") renderTree(sheetBody);
     if (!popover.hidden) openPopover();
     if (sheetPage === "properties") {
       if (app.selection() < 0) closeSheet(false); else updateProperties();
@@ -1700,6 +1850,157 @@ async function main() {
     if (document.activeElement === input) return;
     if (input[prop] !== value) input[prop] = value;
   };
+
+  // -- Model tree ------------------------------------------------------------------------
+  // Levels first (top story first), each with its nested construction
+  // planes, then its elements by category. Tapping an element selects and
+  // frames it; tapping a level or plane makes it the active plane.
+  const TREE_ICON = {
+    floor_plate: '<path d="M2.5 10.5L12 5.5l9.5 5-9.5 5z"/><path d="M2.5 10.5v3l9.5 5 9.5-5v-3"/>',
+    wall: '<path d="M3 20V9l5-3v11z"/><path d="M8 17l13-4V4L8 6"/>',
+    element: '<path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/>',
+    pencil: '<path d="M4 20h4L19 9l-4-4L4 16z"/><path d="M13.5 6.5l4 4"/>',
+    twist: '<path d="M7 10l5 5 5-5"/>',
+    plane: '<path d="M3 15l9-5 9 5-9 5z"/>',
+  };
+  const svg = (paths, cls = "ico sm") => `<svg class="${cls}" viewBox="0 0 24 24">${paths}</svg>`;
+  function toggleCollapsed(key) {
+    if (treeCollapsed.has(key)) treeCollapsed.delete(key); else treeCollapsed.add(key);
+    sessionSave();
+  }
+  function renderTree(container) {
+    let tree;
+    try { tree = JSON.parse(app.tree_json()); } catch { return; }
+    const scroll = container.scrollTop;
+    const nodes = [];
+    for (const lvl of tree.levels) {
+      const key = `level:${lvl.id}`;
+      const collapsed = treeCollapsed.has(key);
+      const count = lvl.groups.reduce((n, g) => n + g.items.length, 0);
+      const head = el("button", {
+        type: "button", class: `tree-row level${lvl.active ? " active" : ""}`, "data-tree-level": String(lvl.id),
+        title: "Make this the active level",
+        html: `<span class="twist${collapsed ? " collapsed" : ""}" data-twist>${svg(TREE_ICON.twist, "ico sm")}</span>` +
+          `<i class="swatch"></i><span class="tree-name"></span>` +
+          (lvl.active ? `<span class="tree-tag">Active</span>` : "") +
+          `<span class="tree-meta">${fmtM(lvl.elevation)}</span>`,
+      });
+      head.querySelector(".swatch").style.background = cssColor(lvl.color);
+      head.querySelector(".tree-name").textContent = lvl.name;
+      head.addEventListener("click", (e) => {
+        if (e.target.closest("[data-twist]")) {
+          toggleCollapsed(key);
+          renderTree(container);
+          return;
+        }
+        activatePlane(lvl.id);
+      });
+      const block = el("div", { class: "tree-level" }, head);
+      if (!collapsed) {
+        const addPlanes = (planes, depth) => {
+          for (const pl of planes) {
+            const r = el("button", {
+              type: "button", class: `tree-row plane${pl.active ? " active" : ""}`, "data-tree-plane": String(pl.id),
+              style: `--depth:${depth}`,
+              html: `${svg(TREE_ICON.plane)}<span class="tree-name"></span><span class="tree-meta"></span>`,
+            });
+            r.querySelector(".tree-name").textContent = pl.name;
+            r.querySelector(".tree-meta").textContent = `${pl.offset >= 0 ? "+" : "−"}${Math.abs(pl.offset).toFixed(2)} m`;
+            r.addEventListener("click", () => activatePlane(pl.id));
+            block.append(r);
+            addPlanes(pl.planes ?? [], depth + 1);
+          }
+        };
+        addPlanes(lvl.planes ?? [], 1);
+        if (count === 0) block.append(el("div", { class: "tree-empty", text: "No elements yet" }));
+        for (const g of lvl.groups) {
+          const gkey = `group:${lvl.id}:${g.key}`;
+          const gcollapsed = treeCollapsed.has(gkey);
+          const gh = el("button", {
+            type: "button", class: "tree-group", "data-tree-group": g.key,
+            html: `<span class="twist${gcollapsed ? " collapsed" : ""}">${svg(TREE_ICON.twist, "ico sm")}</span>` +
+              `<span></span><span class="count">${g.items.length}</span>`,
+          });
+          gh.children[1].textContent = g.label;
+          gh.addEventListener("click", () => { toggleCollapsed(gkey); renderTree(container); });
+          block.append(gh);
+          if (gcollapsed) continue;
+          for (const it of g.items) {
+            const canEdit = it.editable && (it.kind !== "wall" || M4_PREVIEW);
+            const r = el("div", {
+              class: `tree-row item${it.selected ? " selected" : ""}`, role: "button", tabindex: "0",
+              "data-tree-item": String(it.id),
+              html: `<span class="tree-kind">${svg(TREE_ICON[it.kind] ?? TREE_ICON.element)}</span>` +
+                `<span class="tree-name"></span><span class="tree-meta"></span>` +
+                (canEdit ? `<button type="button" class="tree-edit" data-tree-edit title="Edit shape" aria-label="Edit shape">${svg(TREE_ICON.pencil)}</button>` : ""),
+            });
+            r.querySelector(".tree-name").textContent = it.name;
+            r.querySelector(".tree-meta").textContent = it.meta;
+            r.addEventListener("click", (e) => {
+              if (e.target.closest("[data-tree-edit]")) {
+                if (sheetPage === "model") closeSheet(false);
+                if (it.kind === "wall") beginWallEdit(it.id); else beginEdit(it.id);
+                return;
+              }
+              pickFromTree(it.id);
+            });
+            block.append(r);
+          }
+        }
+      }
+      nodes.push(block);
+    }
+    if (tree.levels.length === 0) nodes.push(el("div", { class: "tree-empty", text: "No levels — add one in Menu → Levels" }));
+    container.replaceChildren(...nodes);
+    container.scrollTop = scroll;
+  }
+  function renderTreePanel() {
+    const panel = $("tree-panel");
+    // Hidden in the focused flows (Edit Mode, a wall's elevation for windows).
+    const show = treeOpen && innerWidth >= TREE_DEFAULT_OPEN_MIN_PX && !editing() && !inElevation();
+    panel.hidden = !show;
+    $("tree-btn").classList.toggle("on", show || sheetPage === "model");
+    $("tree-btn").setAttribute("aria-pressed", String(show || sheetPage === "model"));
+    if (show) renderTree($("tree-body"));
+  }
+  /** Select an element from the tree: select, frame, show properties. */
+  function pickFromTree(id) {
+    if (sheetPage === "model") closeSheet(false);
+    app.frame_element(id);
+    selectElement(id);
+    renderLevelChip();
+    renderTreePanel();
+    sessionSave();
+  }
+  function activatePlane(id) {
+    app.set_active_plane(id);
+    stats = JSON.parse(app.stats_json());
+    renderLevelChip();
+    renderChrome();
+    renderTreePanel();
+    if (sheetPage === "model") renderTree(sheetBody);
+    requestRender();
+    sessionSave();
+  }
+  $("tree-btn").addEventListener("click", () => {
+    if (innerWidth >= TREE_DEFAULT_OPEN_MIN_PX) {
+      treeOpen = !treeOpen;
+      renderTreePanel();
+      sessionSave();
+    } else if (sheetPage === "model") {
+      closeSheet(false);
+      renderTreePanel();
+    } else {
+      openSheet("model", { root: true });
+      renderTreePanel();
+    }
+  });
+  $("tree-close").addEventListener("click", () => {
+    treeOpen = false;
+    renderTreePanel();
+    sessionSave();
+  });
+  window.addEventListener("resize", () => renderTreePanel());
 
   // -- Menu --------------------------------------------------------------------------
   function pageMenu() {
@@ -1866,11 +2167,11 @@ async function main() {
         el("div", { class: "field" }, el("span", { class: "field-label", text: "Level" }), el("span", { class: "value", id: "prop-level", text: e.levelName ?? "—" })),
       ),
     ];
-    const editButton = (note) => el("button", {
+    const editButton = (note, onclick = () => beginEdit(e.id)) => el("button", {
       type: "button", class: "btn primary block", id: "prop-edit", style: "margin-bottom:10px",
       title: note ?? "Edit the shape: points, edges, faces, holes, thickness",
       html: `<svg class="ico sm" viewBox="0 0 24 24"><path d="M4 20h4L19 9l-4-4L4 16z"/><path d="M13.5 6.5l4 4"/></svg> Edit shape`,
-      onclick: () => beginEdit(e.id),
+      onclick,
     });
     if (e.kind === "floor_plate" && e.sketch) {
       const solids = e.faces.filter((f) => f.kind === "solid").length;
@@ -1895,12 +2196,21 @@ async function main() {
         el("div", { class: "group" }, el("div", { class: "group-title", text: "Holes" }), el("div", { class: "card", id: "prop-holes" })),
       );
     } else if (e.kind === "wall") {
+      if (M4_PREVIEW) {
+        children.push(
+          editButton("Edit the wall's shape: openings, doors, top anchors", () => beginWallEdit(e.id)),
+          wallHeightModeGroup(e),
+        );
+      }
+      const heightGroup = measureGroup({
+        title: "Height", label: "Above level", id: "prop-height", value: e.height,
+        min: 0.5, max: 6.0, step: WALL_HEIGHT_STEP_M,
+        apply: (v) => app.set_wall_height(e.id, v), current: () => selectedValue("height", 2.7),
+      });
+      // Up to: the plane sets the height, so the fixed stepper hides.
+      heightGroup.hidden = M4_PREVIEW && wallModes.get(e.id)?.mode === "upto";
       children.push(
-        measureGroup({
-          title: "Height", label: "Above level", id: "prop-height", value: e.height,
-          min: 0.5, max: 6.0, step: WALL_HEIGHT_STEP_M,
-          apply: (v) => app.set_wall_height(e.id, v), current: () => selectedValue("height", 2.7),
-        }),
+        heightGroup,
         measureGroup({
           title: "Thickness", label: "Into the wall", id: "prop-wall-thickness", value: e.thickness,
           min: 0.05, max: 0.6, step: WALL_THICKNESS_STEP_M,
@@ -1921,6 +2231,76 @@ async function main() {
     }));
     sheetBody.replaceChildren(...children);
     updateProperties();
+  }
+
+  // -- Wall height mode (preview) --------------------------------------------------------
+  // Fixed: the height stepper. Up to: a plane picker (levels, and their
+  // workplanes) plus an offset from that plane.
+  const wallModes = new Map(); // wall id -> {mode, plane, offset} (session)
+  function planeOptions(select, planes, selected) {
+    select.replaceChildren();
+    for (const p of planes) {
+      // Phones: the path only (the elevation is in the title).
+      const text = innerWidth < TREE_DEFAULT_OPEN_MIN_PX ? p.path : `${p.path} · ${fmtM(p.elevation)}`;
+      const o = el("option", { value: String(p.id), text, title: `${p.path} · ${fmtM(p.elevation)}` });
+      if (p.id === selected) o.selected = true;
+      select.append(o);
+    }
+  }
+  /** The first plane above `elevation`, else the highest. */
+  function planeAbove(planes, elevation) {
+    const above = planes.filter((p) => p.elevation > elevation + 1e-6);
+    return (above.length ? above[above.length - 1] : planes[0])?.id ?? null;
+  }
+  function wallHeightModeGroup(e) {
+    const planes = JSON.parse(app.wall_settings_json()).planes;
+    const base = JSON.parse(app.levels_json()).levels.find((l) => l.id === e.levelId)?.elevation ?? 0;
+    const st = wallModes.get(e.id) ?? { mode: "fixed", plane: planeAbove(planes, base), offset: 0 };
+    const seg = el("div", { class: "seg small", id: "prop-wall-mode" });
+    for (const [m, label] of [["fixed", "Fixed"], ["upto", "Up to"]]) {
+      seg.append(el("button", {
+        type: "button", text: label, "data-wall-mode": m, class: st.mode === m ? "on" : "",
+        onclick: () => { st.mode = m; wallModes.set(e.id, st); applyUpTo(); pageProperties(); },
+      }));
+    }
+    const picker = el("select", { class: "plane-picker", id: "prop-wall-top", "aria-label": "Wall top plane" });
+    planeOptions(picker, planes, st.plane);
+    const offset = el("input", { type: "text", inputmode: "decimal", id: "prop-wall-offset", value: st.offset.toFixed(2) });
+    const applyUpTo = () => {
+      if (st.mode !== "upto" || st.plane == null) return;
+      const h = app.set_wall_height_up_to(e.id, st.plane, st.offset);
+      if (h < 0) toast("The wall top must be above its base: pick a higher plane", { kind: "error" });
+      refresh();
+    };
+    picker.addEventListener("change", () => { st.plane = Number(picker.value); wallModes.set(e.id, st); applyUpTo(); });
+    offset.addEventListener("change", () => {
+      const v = parseNum(offset.value);
+      if (Number.isFinite(v)) { st.offset = v; wallModes.set(e.id, st); applyUpTo(); }
+      offset.value = st.offset.toFixed(2);
+    });
+    const bump = (d) => {
+      st.offset = Math.round((st.offset + d * WALL_TOP_OFFSET_STEP_M) * 100) / 100;
+      offset.value = st.offset.toFixed(2);
+      wallModes.set(e.id, st);
+      applyUpTo();
+    };
+    const rows = [el("div", { class: "field" }, el("span", { class: "field-label", text: "Height" }), seg)];
+    if (st.mode === "upto") {
+      rows.push(
+        el("div", { class: "field" }, el("span", { class: "field-label", text: "Top at" }), picker),
+        el("div", { class: "field" }, el("span", { class: "field-label", text: "Wall height" }),
+          el("span", { class: "value", id: "prop-wall-effective", text: fmtM(e.height) })),
+        el("div", { class: "field" }, el("span", { class: "field-label", text: "Offset" }),
+          el("div", { class: "stepper" },
+            el("button", { type: "button", text: "−", "aria-label": "Lower the top", onclick: () => bump(-1) }),
+            offset, el("span", { class: "unit", text: "m" }),
+            el("button", { type: "button", text: "+", "aria-label": "Raise the top", onclick: () => bump(1) }))),
+      );
+    }
+    const g = group("Height mode", ...rows);
+    g.id = "prop-wall-height-mode";
+    g.classList.toggle("upto", st.mode === "upto");
+    return g;
   }
 
   /** Rows of a plate's holes or a wall's windows, each deletable. */
@@ -1965,6 +2345,7 @@ async function main() {
     } else if (e.kind === "wall") {
       guardAssign($("prop-height"), e.height.toFixed(2));
       guardAssign($("prop-height-slider"), String(e.height));
+      if ($("prop-wall-effective")) $("prop-wall-effective").textContent = fmtM(e.height);
       $("prop-height-label").textContent = e.windows.length ? `Above level (min ${fmtM(e.minHeight)})` : "Above level";
       guardAssign($("prop-wall-thickness"), e.thickness.toFixed(2));
       guardAssign($("prop-wall-thickness-slider"), String(e.thickness));
@@ -2183,6 +2564,8 @@ async function main() {
     editState: () => JSON.parse(app.edit_state_json()),
     editProfile: () => JSON.parse(app.edit_profile_json()),
     editHud: () => JSON.parse(app.edit_hud_json()),
+    tree: () => JSON.parse(app.tree_json()),
+    wallSettings: () => JSON.parse(app.wall_settings_json()),
     hud: () => JSON.parse(app.hud_json()),
     selected: () => JSON.parse(app.selected_json()),
     toasts: toastLog,

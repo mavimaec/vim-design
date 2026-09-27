@@ -152,11 +152,12 @@ pub fn build_attached_loop(
 
 /// Commit a wall run: one element per segment, each a vertical profile
 /// rectangle (base line at `w = 0`, top at `w = height`) extruded along
-/// the segment normal by `thickness`. Every point is attached to
-/// `level`; every element is associated with it. Returns the element
-/// ids in run order.
+/// the segment normal by `thickness`. Every point is attached to the
+/// construction `plane`; every element is associated with `level` (the
+/// plane's root story level). Returns the element ids in run order.
 pub fn commit_walls(
     doc: &mut Document,
+    plane: EntityId,
     level: EntityId,
     segments: &[WallSeg],
     height: f64,
@@ -169,7 +170,7 @@ pub fn commit_walls(
         // Wire order A -> B -> C -> D: the first edge runs along the base
         // in the drawn direction (the model reads the wall axis from it).
         let profile = [[sx, sy, 0.0], [ex, ey, 0.0], [ex, ey, height], [sx, sy, height]];
-        let wire = build_attached_loop(doc, level, &profile)?;
+        let wire = build_attached_loop(doc, plane, &profile)?;
         let face = one(doc, Command::CreateFace { outer: wire, holes: vec![], plane: None })?;
         let start_cp = one(doc, Command::CreateControlPoint { position: [sx, sy, 0.0] })?;
         let end_cp = one(
@@ -180,7 +181,7 @@ pub fn commit_walls(
         )?;
         let path = one(doc, Command::CreateLine { start: start_cp, end: end_cp })?;
         let extrusion = one(doc, Command::CreateExtrusion { profile: face, path })?;
-        attach_all(doc, level, &[start_cp, end_cp])?;
+        attach_all(doc, plane, &[start_cp, end_cp])?;
         let name = next_element_name(doc, "Wall");
         let element = one(
             doc,
@@ -410,18 +411,19 @@ pub fn delete_element(doc: &mut Document, element: EntityId) -> Result<(), Strin
     ok(doc, Command::DeleteElement { id: element, sweep_orphans: true }).map(|_| ())
 }
 
-/// Create a floor plate from a sketch: the sketch hangs below `level`
-/// and one element (associated with `level`) owns it. Returns
-/// (element, sketch).
+/// Create a floor plate from a sketch: the sketch hangs below the
+/// construction `plane` and one element, associated with `level` (the
+/// plane's root story level), owns it. Returns (element, sketch).
 pub fn create_sketch_element(
     doc: &mut Document,
+    plane: EntityId,
     level: EntityId,
     sketch: &Sketch,
     name: &str,
 ) -> Result<(EntityId, EntityId), String> {
     let sketch_id = one(
         doc,
-        Command::CreateSketch { plane: level, sketch: sketch.clone(), direction: SketchDirection::Below },
+        Command::CreateSketch { plane, sketch: sketch.clone(), direction: SketchDirection::Below },
     )?;
     let element = one(
         doc,
