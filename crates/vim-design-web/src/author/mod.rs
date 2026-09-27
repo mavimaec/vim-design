@@ -1,0 +1,1532 @@
+//! The authoring app (wasm only) behind `www/app.html` — the GitHub
+//! Pages single-page application.
+//!
+//! Owns the `Document` + `Engine` pair per the facade contract
+//! (eval::mod.rs), the shared wgpu renderer, the plan/3D camera, CPU
+//! picking, and the sketch tools. JS owns the DOM and input decoding:
+//! it forwards canvas positions in DEVICE pixels, and repaints its
+//! panels when [`AuthorApp::take_params_dirty`] fires.
+//!
+//! Rules this module follows:
+//! - The document is the single source of truth. The element list is
+//!   DERIVED from it (`authoring::model::derive`) after every poll whose
+//!   `params_changed` is non-empty — undo, redo, reload, and import need
+//!   no special cases.
+//! - Every model-changing user action is ONE gesture group = one undo
+//!   step (`crate::gestures`).
+//! - Active level, tool, sketch, snap settings, camera, and selection
+//!   are SESSION state: never in the document, never undoable.
+//! - Interest filter: none (`set_params_watch(None)`). The derived
+//!   element list depends on arbitrary construction entities (a hole's
+//!   control points, a path end point), so the honest watch set is the
+//!   whole document; re-derivation is O(entities) and cheap at app
+//!   scale.
+
+mod camera;
+mod pick;
+
+use std::collections::{BTreeMap, HashMap};
+
+use glam::Vec3;
+use vim_design_lib::eval::Engine;
+use vim_design_lib::{Command, Document, EntityId, EntityKind, Params, VimStatus};
+use wasm_bindgen::prelude::*;
+
+use crate::authoring::geom::{P2, dist, signed_area};
+use crate::authoring::model::{self, ElementModel, PlateModel};
+use crate::authoring::ops;
+use crate::authoring::sketch::{self, PlaceOutcome, PlateOutline, Shape, Sketch, SketchTool};
+use crate::authoring::snap::{self, SnapInput};
+use crate::gestures::Gestures;
+use crate::render::{LineLayer, MeshStyle, Renderer, RendererOptions};
+
+use camera::{Camera, ViewMode};
+use pick::PickScene;
+
+/// sRGB hex component -> linear.
+fn lin(c: u8) -> f32 {
+    let c = f32::from(c) / 255.0;
+    if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+}
+
+fn rgb(hex: u32) -> [f32; 3] {
+    [lin((hex >> 16) as u8), lin((hex >> 8) as u8), lin(hex as u8)]
+}
+
+fn rgba(hex: u32, a: f32) -> [f32; 4] {
+    let [r, g, b] = rgb(hex);
+    [r, g, b, a]
+}
+
+// Palette (sRGB hex; linearized at use). Calm light theme.
+const CLEAR: u32 = 0xeef0f3;
+const CONCRETE: u32 = 0xdcd7ce;
+const OTHER_ELEMENT: u32 = 0xc2c8d0;
+const EDGE: u32 = 0x2b3340;
+const ACCENT: u32 = 0x2f6fed;
+const GRID: u32 = 0x1e293b;
+const AXIS_X: u32 = 0xe5484d;
+const AXIS_Y: u32 = 0x2fa36b;
+
+/// Grid lines float this far above the active plane so they stay
+/// visible on plate tops (which sit exactly on the plane).
+const GRID_LIFT_M: f32 = 0.002;
+const GRID_STEPS: [f64; 11] = [0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0];
+
+/// Cache key of the generated grid: (minor bits, major bits, x0, x1,
+/// y0, y1 in major units, plane z bits, plan flag).
+type GridKey = (u64, u64, i64, i64, i64, i64, u32, u8);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tool {
+    Select,
+    Plate,
+    Hole,
+}
+
+impl Tool {
+    fn name(self) -> &'static str {
+        match self {
+            Tool::Select => "select",
+            Tool::Plate => "plate",
+            Tool::Hole => "hole",
+        }
+    }
+}
+
+fn now_ms() -> f64 {
+    web_sys::window()
+        .and_then(|w| w.performance())
+        .map(|p| p.now())
+        .unwrap_or(0.0)
+}
+
+fn fmt_m(v: f64) -> String {
+    let s = format!("{v:.2}");
+    if s == "-0.00" { "0.00".to_owned() } else { s.replace('-', "\u{2212}") }
+}
+
+fn eid(id: f64) -> EntityId {
+    EntityId(if id.is_finite() && id > 0.0 { id as u64 } else { 0 })
+}
+
+#[wasm_bindgen]
+pub struct AuthorApp {
+    doc: Document,
+    engine: Engine,
+    renderer: Renderer,
+    camera: Camera,
+    gestures: Gestures,
+    pick: PickScene,
+    errors: BTreeMap<EntityId, String>,
+    /// Derived element model (never authoritative).
+    model: Vec<ElementModel>,
+    params_dirty: bool,
+    /// Session state: never in the document, never undoable.
+    active_level: Option<EntityId>,
+    active_elevation: f64,
+    selection: Option<EntityId>,
+    tool: Tool,
+    shape: Shape,
+    sketch: Option<Sketch>,
+    snap_enabled: bool,
+    snap_step: f64,
+    plate_thickness: f64,
+    /// Bumped on every committed document change and on replacement —
+    /// the page persists when it changes.
+    revision: u64,
+    last_committed: u64,
+    grid_key: Option<GridKey>,
+    last_op: String,
+    last_latency_ms: f64,
+    last_mesh_upserts: usize,
+    last_base_transforms: usize,
+    committed: u64,
+    evaluated: u64,
+    pending: usize,
+    notice: Option<String>,
+}
+
+#[wasm_bindgen]
+impl AuthorApp {
+    /// Initialize wgpu on the canvas and start a new project (Site =
+    /// Montreal, levels Ground + Level 2). The page then loads the
+    /// persisted document, if any, via [`AuthorApp::load_document`].
+    pub async fn create(canvas_id: String) -> Result<AuthorApp, JsValue> {
+        let document = web_sys::window()
+            .and_then(|w| w.document())
+            .ok_or_else(|| JsValue::from_str("no DOM document"))?;
+        let canvas = document
+            .get_element_by_id(&canvas_id)
+            .ok_or_else(|| JsValue::from_str("canvas not found"))?
+            .dyn_into::<web_sys::HtmlCanvasElement>()?;
+        let mut renderer = Renderer::with_options(canvas, RendererOptions { msaa: true })
+            .await
+            .map_err(|e| JsValue::from_str(&e))?;
+        renderer.wireframe = false;
+        let [r, g, b] = rgb(CLEAR);
+        renderer.set_clear_color([f64::from(r), f64::from(g), f64::from(b)]);
+        let mut app = AuthorApp {
+            doc: Document::new(),
+            engine: Engine::new(),
+            renderer,
+            camera: Camera::default(),
+            gestures: Gestures::default(),
+            pick: PickScene::default(),
+            errors: BTreeMap::new(),
+            model: Vec::new(),
+            params_dirty: true,
+            active_level: None,
+            active_elevation: 0.0,
+            selection: None,
+            tool: Tool::Select,
+            shape: Shape::Polygon,
+            sketch: None,
+            snap_enabled: true,
+            snap_step: 0.25,
+            plate_thickness: 0.3,
+            revision: 0,
+            last_committed: 0,
+            grid_key: None,
+            last_op: String::new(),
+            last_latency_ms: 0.0,
+            last_mesh_upserts: 0,
+            last_base_transforms: 0,
+            committed: 0,
+            evaluated: 0,
+            pending: 0,
+            notice: None,
+        };
+        app.new_project();
+        Ok(app)
+    }
+
+    // -- Document lifecycle ---------------------------------------------
+
+    /// Replace the document with a fresh project (Site + two levels).
+    pub fn new_project(&mut self) {
+        let mut doc = Document::new();
+        if let Err(e) = ops::seed_new_project(&mut doc) {
+            web_sys::console::error_1(&JsValue::from_str(&e));
+        }
+        self.replace_document(doc, "new project");
+        self.camera = Camera::default();
+    }
+
+    /// Validate bytes as a document without touching the current one.
+    /// Returns "" when loadable, else a short reason.
+    pub fn check_document(&self, bytes: &[u8]) -> String {
+        match Document::load(bytes) {
+            Ok(_) => String::new(),
+            Err(status) => describe_load_error(status),
+        }
+    }
+
+    /// Replace the current document with the given VIMD bytes. Returns
+    /// "" on success, else a short reason (the current document is kept).
+    pub fn load_document(&mut self, bytes: &[u8]) -> String {
+        match Document::load(bytes) {
+            Ok(doc) => {
+                self.replace_document(doc, "load");
+                String::new()
+            }
+            Err(status) => describe_load_error(status),
+        }
+    }
+
+    /// The document as VIMD bytes (Uint8Array on the JS side).
+    pub fn save_document(&self) -> Result<Vec<u8>, JsValue> {
+        self.doc
+            .save()
+            .map_err(|s| JsValue::from_str(&format!("save failed: {s:?}")))
+    }
+
+    /// Changes whenever the document content may have changed.
+    pub fn revision(&self) -> f64 {
+        self.revision as f64
+    }
+
+    // -- Frame loop -------------------------------------------------------
+
+    pub fn render(&mut self) -> Result<(), JsValue> {
+        self.camera.plane_z = self.active_elevation as f32;
+        self.update_grid();
+        let (eye, fraction) = self.camera.edge_nudge();
+        self.renderer.set_edge_nudge(eye, fraction);
+        let view_proj = self.camera.view_proj(self.renderer.aspect());
+        self.renderer.render(view_proj).map_err(|e| JsValue::from_str(&e))
+    }
+
+    pub fn resize(&mut self, width: u32, height: u32) {
+        self.renderer.resize(width, height);
+    }
+
+    // -- View ---------------------------------------------------------------
+
+    pub fn set_view_mode(&mut self, mode: &str) {
+        let mode = if mode == "3d" { ViewMode::Orbit } else { ViewMode::Plan };
+        self.camera.set_mode(mode);
+        self.refresh_styles();
+    }
+
+    pub fn view_mode(&self) -> String {
+        self.camera.mode.name().to_owned()
+    }
+
+    pub fn orbit(&mut self, dx: f32, dy: f32) {
+        self.camera.orbit(dx, dy);
+    }
+
+    /// Pan so the plane point under (x0, y0) moves under (x1, y1).
+    pub fn pan(&mut self, x0: f32, y0: f32, x1: f32, y1: f32) {
+        let z = self.active_elevation as f32;
+        let (w, h) = self.size_f();
+        let a = self.camera.unproject_to_plane(x0, y0, w, h, z);
+        let b = self.camera.unproject_to_plane(x1, y1, w, h, z);
+        match (a, b) {
+            (Some(a), Some(b)) if (a - b).length() < 1_000.0 => self.camera.pan_plane(a, b),
+            _ => self.camera.pan_pixels(x1 - x0, y1 - y0, h),
+        }
+    }
+
+    /// Zoom by `factor` (< 1 zooms in) toward the canvas point.
+    pub fn zoom_at(&mut self, factor: f32, px: f32, py: f32) {
+        let (w, h) = self.size_f();
+        let anchor = self
+            .camera
+            .unproject_to_plane(px, py, w, h, self.active_elevation as f32);
+        self.camera.zoom(factor.clamp(0.2, 5.0), anchor);
+    }
+
+    /// Frame all geometry (or the active level's square when empty).
+    pub fn zoom_fit(&mut self) {
+        let (w, h) = self.size_f();
+        let aspect = w / h;
+        match self.renderer.scene_bbox() {
+            Some((min, max)) => {
+                let v = |a: [f64; 3]| Vec3::new(a[0] as f32, a[1] as f32, a[2] as f32);
+                self.camera.fit(v(min), v(max), aspect);
+            }
+            None => {
+                let z = self.active_elevation as f32;
+                self.camera
+                    .fit(Vec3::new(-6.0, -6.0, z), Vec3::new(6.0, 6.0, z), aspect);
+            }
+        }
+    }
+
+    /// Camera state for session persistence (JSON).
+    pub fn camera_json(&self) -> String {
+        let c = &self.camera;
+        serde_json::json!({
+            "mode": c.mode.name(),
+            "tx": c.target.x, "ty": c.target.y,
+            "yaw": c.yaw, "pitch": c.pitch,
+            "distance": c.distance, "halfH": c.plan_half_h,
+        })
+        .to_string()
+    }
+
+    /// Restore [`AuthorApp::camera_json`] output; ignores bad input.
+    pub fn set_camera_json(&mut self, json: &str) {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else {
+            return;
+        };
+        let f = |k: &str| v.get(k).and_then(|x| x.as_f64()).filter(|x| x.is_finite());
+        let c = &mut self.camera;
+        if let (Some(tx), Some(ty)) = (f("tx"), f("ty")) {
+            c.target.x = tx as f32;
+            c.target.y = ty as f32;
+        }
+        if let Some(yaw) = f("yaw") {
+            c.yaw = yaw as f32;
+        }
+        if let Some(pitch) = f("pitch") {
+            c.pitch = (pitch as f32).clamp(-0.35, 1.53);
+        }
+        if let Some(d) = f("distance") {
+            c.distance = (d as f32).clamp(1.0, 600.0);
+        }
+        if let Some(hh) = f("halfH") {
+            c.plan_half_h = (hh as f32).clamp(0.5, 400.0);
+        }
+        if let Some(mode) = v.get("mode").and_then(|m| m.as_str()) {
+            c.mode = if mode == "3d" { ViewMode::Orbit } else { ViewMode::Plan };
+        }
+        self.refresh_styles();
+    }
+
+    // -- Display ------------------------------------------------------------
+
+    pub fn set_wireframe(&mut self, enabled: bool) {
+        self.renderer.wireframe = enabled;
+    }
+
+    pub fn wireframe(&self) -> bool {
+        self.renderer.wireframe
+    }
+
+    // -- Tools --------------------------------------------------------------
+
+    /// Activate a tool: "select", "plate", or "hole". Drawing tools need
+    /// an active level (`can_author`). Returns false when refused.
+    pub fn set_tool(&mut self, tool: &str) -> bool {
+        let tool = match tool {
+            "plate" => Tool::Plate,
+            "hole" => Tool::Hole,
+            _ => Tool::Select,
+        };
+        let sketch_tool = match tool {
+            Tool::Select => {
+                self.tool = Tool::Select;
+                self.sketch = None;
+                return true;
+            }
+            Tool::Plate => SketchTool::Plate,
+            Tool::Hole => SketchTool::Hole,
+        };
+        let Some(level) = self.active_level.filter(|_| self.can_author()) else {
+            return false;
+        };
+        self.tool = tool;
+        self.sketch = Some(Sketch::new(sketch_tool, self.shape, level));
+        true
+    }
+
+    pub fn tool(&self) -> String {
+        self.tool.name().to_owned()
+    }
+
+    /// Outline shape: "polygon" or "rect" (clears placed points).
+    pub fn set_shape(&mut self, shape: &str) {
+        self.shape = if shape == "rect" { Shape::Rect } else { Shape::Polygon };
+        if let Some(s) = self.sketch.as_mut() {
+            s.set_shape(self.shape);
+        }
+    }
+
+    pub fn shape(&self) -> String {
+        self.shape.name().to_owned()
+    }
+
+    pub fn set_snap(&mut self, enabled: bool, step: f64) {
+        self.snap_enabled = enabled;
+        if step.is_finite() && step > 0.0 {
+            self.snap_step = step.clamp(0.01, 10.0);
+        }
+        self.grid_key = None;
+    }
+
+    /// Thickness for NEW floor plates (meters).
+    pub fn set_plate_thickness_setting(&mut self, t: f64) {
+        if t.is_finite() {
+            self.plate_thickness = t.clamp(0.02, 5.0);
+        }
+    }
+
+    pub fn plate_thickness_setting(&self) -> f64 {
+        self.plate_thickness
+    }
+
+    /// Move the sketch cursor to a canvas point (device pixels) and snap
+    /// it. `tol_px` is the capture radius in device pixels (the page
+    /// passes a larger one for touch).
+    pub fn sketch_hover(&mut self, px: f32, py: f32, tol_px: f32) {
+        let Some(sketch) = &self.sketch else { return };
+        let z = self.active_elevation as f32;
+        let (w, h) = self.size_f();
+        let Some(hit) = self.camera.unproject_to_plane(px, py, w, h, z) else {
+            if let Some(s) = self.sketch.as_mut() {
+                s.cursor = None;
+            }
+            return;
+        };
+        let raw: P2 = [f64::from(hit.x), f64::from(hit.y)];
+        let ppm = self.px_per_m_at(hit);
+        let vertices = self.level_vertices(sketch.level);
+        // Axis anchors apply to polygons only: aligning a rectangle's
+        // second corner with its first would collapse it to zero area.
+        let polygon = sketch.shape == Shape::Polygon;
+        let first = sketch.points.first().copied().filter(|_| polygon);
+        let prev = sketch.points.last().copied().filter(|_| polygon);
+        let result = snap::snap(&SnapInput {
+            raw,
+            enabled: self.snap_enabled,
+            step: self.snap_step,
+            tolerance: f64::from(tol_px / ppm.max(1e-3)),
+            close_target: sketch.close_target(),
+            prev,
+            first,
+            vertices: &vertices,
+        });
+        if let Some(s) = self.sketch.as_mut() {
+            s.cursor = Some(result);
+        }
+    }
+
+    /// The pointer left the canvas: hide the cursor.
+    pub fn sketch_leave(&mut self) {
+        if let Some(s) = self.sketch.as_mut() {
+            s.cursor = None;
+        }
+    }
+
+    /// Place a vertex at the current cursor. Returns JSON
+    /// `{"result": "added"|"duplicate"|"none"|"committed"|"rejected",
+    ///   "reason": ..., "count": n, "name": ...}`.
+    pub fn sketch_place(&mut self) -> String {
+        let Some(sketch) = self.sketch.as_mut() else {
+            return r#"{"result":"none","count":0}"#.to_owned();
+        };
+        let outcome = sketch.place();
+        match outcome {
+            PlaceOutcome::Added => {
+                let status = self.sketch_status();
+                let reason = status.and_then(|s| s.reason).map(|r| r.message());
+                serde_json::json!({
+                    "result": "added",
+                    "count": self.sketch_count(),
+                    "reason": reason,
+                })
+                .to_string()
+            }
+            PlaceOutcome::Duplicate => {
+                serde_json::json!({"result": "duplicate", "count": self.sketch_count()}).to_string()
+            }
+            PlaceOutcome::NoCursor => {
+                serde_json::json!({"result": "none", "count": self.sketch_count()}).to_string()
+            }
+            PlaceOutcome::CloseRequested => self.sketch_finish(),
+            PlaceOutcome::RectComplete => {
+                let out = self.sketch_finish();
+                // A rejected rectangle keeps its first corner so the user
+                // can simply try the second corner again.
+                if let Some(s) = self.sketch.as_mut() {
+                    s.points.truncate(1);
+                }
+                out
+            }
+        }
+    }
+
+    pub fn sketch_undo_point(&mut self) -> bool {
+        self.sketch.as_mut().is_some_and(|s| s.undo_point())
+    }
+
+    /// Commit the outline if valid. Returns JSON like `sketch_place`.
+    pub fn sketch_finish(&mut self) -> String {
+        let Some(sketch) = self.sketch.clone() else {
+            return r#"{"result":"none","count":0}"#.to_owned();
+        };
+        let status = self.sketch_status();
+        if let Some(st) = status.filter(|s| !s.can_finish) {
+            let reason = st
+                .reason
+                .unwrap_or(crate::authoring::geom::Invalid::TooFewPoints);
+            return serde_json::json!({
+                "result": "rejected",
+                "reason": reason.message(),
+                "code": reason.code(),
+                "count": sketch.points.len(),
+            })
+            .to_string();
+        }
+        let outline = sketch.outline();
+        let depth = self.doc.undo_depth();
+        let result = match sketch.tool {
+            SketchTool::Plate => {
+                let name = ops::next_element_name(&self.doc, "Floor plate");
+                ops::commit_plate(&mut self.doc, sketch.level, &outline, self.plate_thickness, &name)
+                    .map(|ids| (name, Some(ids.element)))
+            }
+            SketchTool::Hole => {
+                let plates = self.plate_outlines(sketch.level);
+                match sketch::validate_hole(&outline, &plates) {
+                    Ok(index) => {
+                        let face = plates[index].face;
+                        let element = self.plate_by_face(face).map(|p| p.element);
+                        let name = self
+                            .plate_by_face(face)
+                            .map_or_else(String::new, |p| p.name.clone());
+                        ops::commit_hole(&mut self.doc, sketch.level, face, &outline)
+                            .map(|_| (format!("Hole in {name}"), element))
+                    }
+                    Err(invalid) => Err(invalid.message().to_owned()),
+                }
+            }
+        };
+        match result {
+            Ok((name, element)) => {
+                self.gestures.one_shot(depth);
+                if let Some(s) = self.sketch.as_mut() {
+                    s.points.clear();
+                }
+                let op = if sketch.tool == SketchTool::Plate { "draw plate" } else { "add hole" };
+                self.sync(op);
+                self.notice = Some(format!("{name} created"));
+                serde_json::json!({
+                    "result": "committed",
+                    "name": name,
+                    "element": element.map(|e| e.0 as f64),
+                    "count": 0,
+                })
+                .to_string()
+            }
+            Err(e) => {
+                ops::rollback_to(&mut self.doc, depth);
+                self.gestures.invalidate_redo();
+                self.sync("commit failed");
+                serde_json::json!({"result": "rejected", "reason": e, "count": sketch.points.len()})
+                    .to_string()
+            }
+        }
+    }
+
+    /// Discard the in-progress outline (the tool stays active). Returns
+    /// the number of points that were discarded.
+    pub fn sketch_cancel(&mut self) -> u32 {
+        self.sketch.as_mut().map_or(0, |s| {
+            let n = s.points.len() as u32;
+            s.points.clear();
+            n
+        })
+    }
+
+    /// Screen-space sketch overlay for the page's 2D HUD canvas (device
+    /// pixels): placed points, preview outline, cursor + snap kind,
+    /// guides, live segment length, validity.
+    pub fn hud_json(&self) -> String {
+        let Some(sk) = &self.sketch else {
+            return r#"{"active":false}"#.to_owned();
+        };
+        let z = self.active_elevation as f32;
+        let (w, h) = self.size_f();
+        let proj = |p: P2| -> Option<[f32; 2]> {
+            self.camera
+                .project(Vec3::new(p[0] as f32, p[1] as f32, z), w, h)
+                .map(|(x, y)| [x, y])
+        };
+        let points: Vec<[f32; 2]> = sk.points.iter().filter_map(|p| proj(*p)).collect();
+        let preview_uv = sk.preview();
+        let preview: Vec<[f32; 2]> = preview_uv.iter().filter_map(|p| proj(*p)).collect();
+        let cursor = sk.cursor.as_ref().and_then(|c| {
+            proj(c.point).map(|[x, y]| {
+                serde_json::json!({
+                    "x": x, "y": y, "u": c.point[0], "v": c.point[1],
+                    "kind": c.kind.name(),
+                    "label": format!("x {} · y {}", fmt_m(c.point[0]), fmt_m(c.point[1])),
+                })
+            })
+        });
+        let guides: Vec<[f32; 4]> = sk
+            .cursor
+            .as_ref()
+            .map(|c| {
+                c.guides
+                    .iter()
+                    .filter_map(|(a, b)| match (proj(*a), proj(*b)) {
+                        (Some(a), Some(b)) => Some([a[0], a[1], b[0], b[1]]),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let seg = match (sk.shape, sk.points.as_slice(), sk.cursor.as_ref()) {
+            (Shape::Polygon, [.., last], Some(c)) if dist(*last, c.point) > 1e-6 => {
+                let mid = [(last[0] + c.point[0]) / 2.0, (last[1] + c.point[1]) / 2.0];
+                proj(mid).map(|[x, y]| {
+                    serde_json::json!({"x": x, "y": y,
+                        "text": format!("{} m", fmt_m(dist(*last, c.point)))})
+                })
+            }
+            (Shape::Rect, [a], Some(c)) => {
+                let mid = [(a[0] + c.point[0]) / 2.0, (a[1] + c.point[1]) / 2.0];
+                proj(mid).map(|[x, y]| {
+                    serde_json::json!({"x": x, "y": y, "text": format!("{} × {} m",
+                        fmt_m((c.point[0] - a[0]).abs()), fmt_m((c.point[1] - a[1]).abs()))})
+                })
+            }
+            _ => None,
+        };
+        let status = self.sketch_status();
+        let first = sk.close_target().and_then(proj);
+        serde_json::json!({
+            "active": true,
+            "tool": sk.tool.name(),
+            "shape": sk.shape.name(),
+            "count": sk.points.len(),
+            "points": points,
+            "preview": preview,
+            "closed": sk.shape == Shape::Rect || preview_uv.len() >= 3,
+            "cursor": cursor,
+            "guides": guides,
+            "seg": seg,
+            "first": first,
+            "canFinish": status.as_ref().is_some_and(|s| s.can_finish),
+            "previewOk": status.as_ref().is_none_or(|s| s.preview_ok),
+            "reason": status.as_ref().and_then(|s| s.reason).map(|r| r.message()),
+            "reasonCode": status.as_ref().and_then(|s| s.reason).map(|r| r.code()),
+        })
+        .to_string()
+    }
+
+    /// Sketch state for tests: placed points in plane coordinates.
+    pub fn sketch_json(&self) -> String {
+        match &self.sketch {
+            Some(s) => serde_json::json!({
+                "active": true,
+                "tool": s.tool.name(),
+                "shape": s.shape.name(),
+                "points": s.points,
+                "cursor": s.cursor.as_ref().map(|c| serde_json::json!({
+                    "u": c.point[0], "v": c.point[1], "kind": c.kind.name()})),
+            })
+            .to_string(),
+            None => r#"{"active":false}"#.to_owned(),
+        }
+    }
+
+    // -- Selection ----------------------------------------------------------
+
+    /// Pick the element under a canvas point (device pixels): its id, or
+    /// -1 for empty space.
+    pub fn pick(&self, px: f32, py: f32) -> f64 {
+        let (w, h) = self.size_f();
+        let Some((origin, dir)) = self.camera.ray(px, py, w, h) else {
+            return -1.0;
+        };
+        match self.pick.pick(origin, dir) {
+            Some((id, _)) => id.0 as f64,
+            None => -1.0,
+        }
+    }
+
+    /// Select an element (-1 clears). Session state: no document change.
+    pub fn select(&mut self, id: f64) {
+        let id = eid(id);
+        self.selection = self.model.iter().any(|e| e.element() == id).then_some(id);
+        self.refresh_styles();
+    }
+
+    pub fn selection(&self) -> f64 {
+        self.selection.map_or(-1.0, |id| id.0 as f64)
+    }
+
+    /// Properties of the selected element (JSON, `null` when none).
+    pub fn selected_json(&self) -> String {
+        let Some(sel) = self.selection else {
+            return "null".to_owned();
+        };
+        self.model
+            .iter()
+            .find(|e| e.element() == sel)
+            .map_or_else(|| "null".to_owned(), |e| self.element_value(e).to_string())
+    }
+
+    /// The derived element list (JSON array).
+    pub fn elements_json(&self) -> String {
+        serde_json::Value::Array(self.model.iter().map(|e| self.element_value(e)).collect())
+            .to_string()
+    }
+
+    // -- Element edits (one gesture each) -----------------------------------
+
+    pub fn set_element_name(&mut self, id: f64, name: String) {
+        let id = eid(id);
+        if !self.model.iter().any(|e| e.element() == id) {
+            return;
+        }
+        let coalesce = self.gestures.begin_continuing(&self.doc, &format!("name_{}", id.0));
+        self.submit(Command::UpdateElement { id, name: Some(name), members: None, coalesce });
+        self.sync("rename");
+    }
+
+    /// Edit a floor plate's thickness (coalesced within one gesture;
+    /// the page calls [`AuthorApp::end_gesture`] on commit).
+    pub fn set_plate_thickness(&mut self, id: f64, thickness: f64) {
+        let id = eid(id);
+        if !thickness.is_finite() {
+            return;
+        }
+        let t = thickness.clamp(0.02, 5.0);
+        let Some(plate) = self.plate(id).cloned() else { return };
+        let Some((_, s)) = model::control_point(&self.doc, plate.path_start) else { return };
+        let end = if plate.downward { [s[0], s[1], s[2] - t] } else { [s[0], s[1], s[2] + t] };
+        let coalesce = self.gestures.begin_continuing(&self.doc, &format!("thickness_{}", id.0));
+        self.submit(Command::UpdateControlPoint { id: plate.path_end, position: end, coalesce });
+        self.sync("plate thickness");
+    }
+
+    /// Close the open continuous edit gesture.
+    pub fn end_gesture(&mut self) {
+        self.gestures.end();
+    }
+
+    /// Remove a hole from a plate and sweep its construction geometry.
+    pub fn delete_hole(&mut self, element: f64, wire: f64) -> bool {
+        let Some(plate) = self.plate(eid(element)).cloned() else {
+            return false;
+        };
+        let depth = self.doc.undo_depth();
+        match ops::delete_hole(&mut self.doc, plate.face, eid(wire)) {
+            Ok(()) => {
+                self.gestures.one_shot(depth);
+                self.sync("delete hole");
+                true
+            }
+            Err(e) => {
+                ops::rollback_to(&mut self.doc, depth);
+                self.gestures.invalidate_redo();
+                web_sys::console::error_1(&JsValue::from_str(&e));
+                self.sync("delete hole (failed)");
+                false
+            }
+        }
+    }
+
+    /// Delete an element with the orphan sweep (one undo step).
+    pub fn delete_element(&mut self, id: f64) -> bool {
+        let id = eid(id);
+        let depth = self.doc.undo_depth();
+        match ops::delete_element(&mut self.doc, id) {
+            Ok(()) => {
+                self.gestures.one_shot(depth);
+                if self.selection == Some(id) {
+                    self.selection = None;
+                }
+                self.sync("delete element");
+                true
+            }
+            Err(e) => {
+                ops::rollback_to(&mut self.doc, depth);
+                self.gestures.invalidate_redo();
+                web_sys::console::error_1(&JsValue::from_str(&format!("delete element: {e}")));
+                self.sync("delete element (failed)");
+                false
+            }
+        }
+    }
+
+    // -- Site + levels ---------------------------------------------------------
+
+    pub fn site_json(&self) -> String {
+        match ops::site_params(&self.doc) {
+            Some((id, lat, lon, elev, north)) => serde_json::json!({
+                "id": id.0 as f64, "latitude": lat, "longitude": lon,
+                "elevation": elev, "trueNorth": north,
+            })
+            .to_string(),
+            None => "null".to_owned(),
+        }
+    }
+
+    pub fn set_site(&mut self, latitude: f64, longitude: f64, elevation: f64) {
+        let Some((id, ..)) = ops::site_params(&self.doc) else { return };
+        if ![latitude, longitude, elevation].iter().all(|v| v.is_finite()) {
+            return;
+        }
+        let coalesce = self.gestures.begin_continuing(&self.doc, "site");
+        self.submit(Command::UpdateSite {
+            id,
+            latitude_deg: Some(latitude.clamp(-90.0, 90.0)),
+            longitude_deg: Some(longitude.clamp(-180.0, 180.0)),
+            elevation_m: Some(elevation),
+            true_north_deg: None,
+            coalesce,
+        });
+        self.sync("site");
+    }
+
+    /// Levels (ascending elevation) plus the session's active level.
+    pub fn levels_json(&self) -> String {
+        let levels: Vec<serde_json::Value> = ops::levels_sorted(&self.doc)
+            .iter()
+            .map(|l| {
+                let count = self.model.iter().filter(|e| e.level() == Some(l.id)).count();
+                serde_json::json!({
+                    "id": l.id.0 as f64, "name": l.name, "elevation": l.elevation_m,
+                    "isStory": l.is_building_story, "color": l.color, "extent": l.extent_m,
+                    "elements": count,
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "activeId": self.active_level.map(|id| id.0 as f64),
+            "levels": levels,
+        })
+        .to_string()
+    }
+
+    /// Select the active level — SESSION state only (no document change,
+    /// no undo step). A sketch in progress moves to the new plane.
+    pub fn set_active_level(&mut self, id: f64) -> bool {
+        let id = eid(id);
+        if !matches!(self.doc.entity(id).map(|e| e.kind()), Some(EntityKind::Level)) {
+            return false;
+        }
+        self.active_level = Some(id);
+        self.refresh_session_and_overlays();
+        true
+    }
+
+    pub fn add_level(&mut self) {
+        let levels = ops::levels_sorted(&self.doc);
+        let top = levels.last().map_or(0.0, |l| l.elevation_m);
+        let elevation = if levels.is_empty() { 0.0 } else { top + 3.0 };
+        let name = if levels.is_empty() {
+            "Ground".to_owned()
+        } else {
+            format!("Level {}", levels.len() + 1)
+        };
+        let color = ops::APP_LEVEL_COLORS[levels.len() % ops::APP_LEVEL_COLORS.len()];
+        let depth = self.doc.undo_depth();
+        match self.doc.submit(Command::CreateLevel {
+            name,
+            elevation_m: elevation,
+            is_building_story: true,
+            color,
+            extent_m: ops::LEVEL_EXTENT_M,
+        }) {
+            Ok(_) => self.gestures.one_shot(depth),
+            Err(status) => web_sys::console::error_1(&JsValue::from_str(&format!(
+                "CreateLevel rejected: {status:?}"
+            ))),
+        }
+        self.sync("add level");
+    }
+
+    pub fn update_level_name(&mut self, id: f64, name: String) {
+        self.submit_level_update(id, "level name", Some(name), None, None, None);
+    }
+
+    pub fn update_level_elevation(&mut self, id: f64, elevation: f64) {
+        if elevation.is_finite() {
+            self.submit_level_update(id, "level elevation", None, Some(elevation), None, None);
+        }
+    }
+
+    pub fn update_level_story(&mut self, id: f64, is_story: bool) {
+        self.submit_level_update(id, "level story", None, None, Some(is_story), None);
+    }
+
+    /// Update a level's color, preserving its stored alpha.
+    pub fn update_level_color(&mut self, id: f64, r: f32, g: f32, b: f32) {
+        let alpha = ops::levels_sorted(&self.doc)
+            .iter()
+            .find(|l| l.id == eid(id))
+            .map_or(0.3, |l| l.color[3]);
+        self.submit_level_update(id, "level color", None, None, None, Some([r, g, b, alpha]));
+    }
+
+    /// Non-cascade delete attempt: "deleted", "has_dependents" (the page
+    /// shows the cascade confirmation), or an error string.
+    pub fn delete_level(&mut self, id: f64) -> String {
+        let depth = self.doc.undo_depth();
+        match self.doc.submit(Command::DeleteLevel { id: eid(id), cascade: false }) {
+            Ok(_) => {
+                self.gestures.one_shot(depth);
+                self.sync("delete level");
+                "deleted".to_owned()
+            }
+            Err(VimStatus::HasDependents) => "has_dependents".to_owned(),
+            Err(status) => format!("error: {status:?}"),
+        }
+    }
+
+    /// Confirmed cascade delete: the level plus everything associated
+    /// with / attached to it — ONE undo step.
+    pub fn delete_level_cascade(&mut self, id: f64) -> bool {
+        let depth = self.doc.undo_depth();
+        match self.doc.submit(Command::DeleteLevel { id: eid(id), cascade: true }) {
+            Ok(_) => {
+                self.gestures.one_shot(depth);
+                self.sync("delete level (cascade)");
+                true
+            }
+            Err(status) => {
+                web_sys::console::error_1(&JsValue::from_str(&format!(
+                    "DeleteLevel cascade rejected: {status:?}"
+                )));
+                false
+            }
+        }
+    }
+
+    /// True when drawing is allowed: a level exists and is active
+    /// (every element is associated with the active level).
+    pub fn can_author(&self) -> bool {
+        self.active_level.is_some()
+    }
+
+    // -- Undo / redo --------------------------------------------------------
+
+    pub fn undo(&mut self) -> bool {
+        if self.gestures.undo(&mut self.doc) {
+            self.sync("undo");
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn redo(&mut self) -> bool {
+        if self.gestures.redo(&mut self.doc) {
+            self.sync("redo");
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn can_undo(&self) -> bool {
+        self.gestures.can_undo()
+    }
+
+    pub fn can_redo(&self) -> bool {
+        self.gestures.can_redo()
+    }
+
+    // -- Status ---------------------------------------------------------------
+
+    /// True (drained on read) when a poll reported parametric changes
+    /// since the last call — the page's single trigger to repaint its
+    /// document-bound panels.
+    pub fn take_params_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.params_dirty)
+    }
+
+    /// One-shot user notice ("Floor plate 2 created"), drained on read.
+    pub fn take_notice(&mut self) -> String {
+        self.notice.take().unwrap_or_default()
+    }
+
+    pub fn stats_json(&self) -> String {
+        let errors: Vec<String> = self
+            .errors
+            .iter()
+            .map(|(id, msg)| format!("#{}: {}", id.0, msg))
+            .collect();
+        let plates_on_level = self
+            .active_level
+            .map_or(0, |l| self.plate_outlines(l).len());
+        serde_json::json!({
+            "backend": self.renderer.backend_name(),
+            "msaa": self.renderer.sample_count(),
+            "committed": self.committed,
+            "evaluated": self.evaluated,
+            "pending": self.pending,
+            "settled": self.committed == self.evaluated && self.pending == 0,
+            "triangles": self.renderer.drawn_triangle_count(),
+            "lastOp": self.last_op,
+            "lastLatencyMs": self.last_latency_ms,
+            "lastMeshUpserts": self.last_mesh_upserts,
+            "lastBaseTransforms": self.last_base_transforms,
+            "canAuthor": self.can_author(),
+            "canUndo": self.can_undo(),
+            "canRedo": self.can_redo(),
+            "wireframe": self.renderer.wireframe,
+            "tool": self.tool.name(),
+            "shape": self.shape.name(),
+            "view": self.camera.mode.name(),
+            "selection": self.selection.map(|id| id.0 as f64),
+            "revision": self.revision,
+            "elements": self.model.len(),
+            "plates": self.model.iter().filter(|e| matches!(e, ElementModel::Plate(_))).count(),
+            "platesOnLevel": plates_on_level,
+            "snap": { "enabled": self.snap_enabled, "step": self.snap_step },
+            "errors": errors,
+        })
+        .to_string()
+    }
+
+    /// Diagnostics for "Copy debug info": entity counts by kind, errors,
+    /// generations.
+    pub fn debug_json(&self) -> String {
+        let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+        for (_, record) in self.doc.entities() {
+            *counts.entry(format!("{:?}", record.kind())).or_default() += 1;
+        }
+        serde_json::json!({
+            "lib": vim_design_lib::version(),
+            "entities": self.doc.entity_count(),
+            "byKind": counts,
+            "elements": self.model.len(),
+            "committed": self.committed,
+            "evaluated": self.evaluated,
+            "undoDepth": self.doc.undo_depth(),
+            "evalErrors": self.errors.values().collect::<Vec<_>>(),
+        })
+        .to_string()
+    }
+
+    /// World -> canvas device pixels: `[x, y]` JSON or `null`.
+    pub fn world_to_screen(&self, x: f64, y: f64, z: f64) -> String {
+        let (w, h) = self.size_f();
+        match self
+            .camera
+            .project(Vec3::new(x as f32, y as f32, z as f32), w, h)
+        {
+            Some((px, py)) => format!("[{px},{py}]"),
+            None => "null".to_owned(),
+        }
+    }
+
+    pub fn scene_bbox_json(&self) -> String {
+        match self.renderer.scene_bbox() {
+            Some((min, max)) => serde_json::json!({ "min": min, "max": max }).to_string(),
+            None => "null".to_owned(),
+        }
+    }
+}
+
+fn describe_load_error(status: VimStatus) -> String {
+    match status {
+        VimStatus::UnsupportedVersion => "not a VIM Design file (or a newer format)".to_owned(),
+        VimStatus::MalformedData => "the file is damaged or incomplete".to_owned(),
+        other => format!("could not read the file ({other:?})"),
+    }
+}
+
+impl AuthorApp {
+    fn size_f(&self) -> (f32, f32) {
+        let (w, h) = self.renderer.size();
+        (w as f32, h as f32)
+    }
+
+    /// Screen pixels per meter around a plane point.
+    fn px_per_m_at(&self, p: Vec3) -> f32 {
+        let (w, h) = self.size_f();
+        let a = self.camera.project(p - Vec3::X * 0.5, w, h);
+        let b = self.camera.project(p + Vec3::X * 0.5, w, h);
+        let c = self.camera.project(p - Vec3::Y * 0.5, w, h);
+        let d = self.camera.project(p + Vec3::Y * 0.5, w, h);
+        let len = |a: Option<(f32, f32)>, b: Option<(f32, f32)>| match (a, b) {
+            (Some(a), Some(b)) => (a.0 - b.0).hypot(a.1 - b.1),
+            _ => 0.0,
+        };
+        len(a, b).max(len(c, d)).max(1e-3)
+    }
+
+    fn sketch_count(&self) -> usize {
+        self.sketch.as_ref().map_or(0, |s| s.points.len())
+    }
+
+    fn plate(&self, element: EntityId) -> Option<&PlateModel> {
+        self.model.iter().find_map(|e| match e {
+            ElementModel::Plate(p) if p.element == element => Some(p),
+            _ => None,
+        })
+    }
+
+    fn plate_by_face(&self, face: EntityId) -> Option<&PlateModel> {
+        self.model.iter().find_map(|e| match e {
+            ElementModel::Plate(p) if p.face == face => Some(p),
+            _ => None,
+        })
+    }
+
+    /// Plates whose top face lies on `level`'s plane (w = 0).
+    fn plate_outlines(&self, level: EntityId) -> Vec<PlateOutline<'_>> {
+        self.model
+            .iter()
+            .filter_map(|e| match e {
+                ElementModel::Plate(p) if p.plane_level == level && p.top_w.abs() < 1e-9 => {
+                    Some(PlateOutline {
+                        face: p.face,
+                        outline: &p.outline,
+                        holes: p.holes.iter().map(|h| h.outline.as_slice()).collect(),
+                    })
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Snap vertices: plate + hole corners on `level`'s plane.
+    fn level_vertices(&self, level: EntityId) -> Vec<P2> {
+        let mut out = Vec::new();
+        for e in &self.model {
+            if let ElementModel::Plate(p) = e {
+                if p.plane_level == level && p.top_w.abs() < 1e-9 {
+                    out.extend_from_slice(&p.outline);
+                    for h in &p.holes {
+                        out.extend_from_slice(&h.outline);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn sketch_status(&self) -> Option<sketch::SketchStatus> {
+        let sk = self.sketch.as_ref()?;
+        let plates = self.plate_outlines(sk.level);
+        Some(sketch::status(sk, &plates))
+    }
+
+    fn level_name(&self, id: Option<EntityId>) -> Option<String> {
+        let id = id?;
+        match self.doc.entity(id).map(|e| &e.params) {
+            Some(Params::Level { name, .. }) => Some(name.clone()),
+            _ => None,
+        }
+    }
+
+    fn element_value(&self, e: &ElementModel) -> serde_json::Value {
+        let base = serde_json::json!({
+            "id": e.element().0 as f64,
+            "kind": e.kind_name(),
+            "name": e.name(),
+            "levelId": e.level().map(|l| l.0 as f64),
+            "levelName": self.level_name(e.level()),
+        });
+        match e {
+            ElementModel::Plate(p) => {
+                let mut v = base;
+                let holes: Vec<serde_json::Value> = p
+                    .holes
+                    .iter()
+                    .enumerate()
+                    .map(|(i, h)| {
+                        serde_json::json!({
+                            "wire": h.wire.0 as f64,
+                            "index": i + 1,
+                            "area": signed_area(&h.outline).abs(),
+                            "outline": h.outline,
+                        })
+                    })
+                    .collect();
+                if let Some(obj) = v.as_object_mut() {
+                    obj.insert("thickness".into(), p.thickness.into());
+                    obj.insert("area".into(), p.area.into());
+                    obj.insert("outline".into(), serde_json::json!(p.outline));
+                    obj.insert("holes".into(), holes.into());
+                }
+                v
+            }
+            ElementModel::Other(_) => base,
+        }
+    }
+
+    /// Swap in a new document (new project, load, import): fresh engine,
+    /// cleared GPU/pick state and history; session state revalidated.
+    fn replace_document(&mut self, doc: Document, op: &str) {
+        self.doc = doc;
+        self.engine = Engine::new();
+        // This renderer composes `world = instance ∘ base`: opt into
+        // translation factoring (level elevation edits become
+        // transform-only).
+        self.engine.set_translation_factoring(true);
+        self.engine.set_params_watch(None);
+        self.renderer.clear_scene();
+        self.pick.clear();
+        self.gestures = Gestures::default();
+        self.errors.clear();
+        self.selection = None;
+        self.sketch = None;
+        self.tool = Tool::Select;
+        self.active_level = None;
+        self.active_elevation = 0.0;
+        self.last_committed = 0;
+        // A loaded document reports no params_changed (nothing was
+        // "touched"), so the replacement itself triggers the derivation
+        // (before the first sync, which colors meshes by element kind).
+        self.model = model::derive(&self.doc);
+        self.params_dirty = true;
+        self.sync(op);
+        self.revision += 1;
+        self.refresh_session_and_overlays();
+    }
+
+    fn submit_level_update(
+        &mut self,
+        id: f64,
+        op: &str,
+        name: Option<String>,
+        elevation_m: Option<f64>,
+        is_building_story: Option<bool>,
+        color: Option<[f32; 4]>,
+    ) {
+        let id = eid(id);
+        if !matches!(self.doc.entity(id).map(|e| e.kind()), Some(EntityKind::Level)) {
+            return;
+        }
+        let coalesce = self.gestures.begin_continuing(&self.doc, &format!("{op}_{}", id.0));
+        self.submit(Command::UpdateLevel {
+            id,
+            name,
+            elevation_m,
+            is_building_story,
+            color,
+            extent_m: None,
+            coalesce,
+        });
+        self.sync(op);
+    }
+
+    fn submit(&mut self, cmd: Command) {
+        let label = cmd.label();
+        if let Err(status) = self.doc.submit(cmd) {
+            web_sys::console::error_1(&JsValue::from_str(&format!(
+                "{label} rejected: {status:?}"
+            )));
+        }
+    }
+
+    fn material_color(&self, material: Option<EntityId>, fallback: [f32; 3]) -> [f32; 3] {
+        match material.and_then(|id| self.doc.entity(id)).map(|e| &e.params) {
+            Some(Params::Material { color, .. }) => {
+                [color[0] as f32, color[1] as f32, color[2] as f32]
+            }
+            _ => fallback,
+        }
+    }
+
+    /// The facade drive cycle: evaluate, poll, apply to GPU + pick scene
+    /// (removals before upserts), re-derive the model on parametric
+    /// changes.
+    fn sync(&mut self, op: &str) {
+        let t0 = now_ms();
+        self.engine.evaluate_pending(&mut self.doc);
+        let updates = self.engine.poll_updates(&self.doc);
+        if !updates.params_changed.is_empty() {
+            self.model = model::derive(&self.doc);
+            self.params_dirty = true;
+        }
+
+        for id in &updates.meshes_removed {
+            self.renderer.remove_mesh(*id);
+            self.pick.remove_mesh(*id);
+        }
+        for id in &updates.instances_removed {
+            self.renderer.remove_instance(*id);
+            self.pick.remove_instance(*id);
+        }
+        for mu in &updates.meshes {
+            let fallback = if self.plate(mu.id).is_some() { rgb(CONCRETE) } else { rgb(OTHER_ELEMENT) };
+            let colors: Vec<[f32; 3]> = mu
+                .mesh
+                .submeshes
+                .iter()
+                .map(|sub| self.material_color(sub.material, fallback))
+                .collect();
+            self.renderer
+                .upsert_mesh(mu.id, &mu.mesh, &colors, &mu.base_transform);
+            self.pick.upsert_mesh(mu.id, &mu.mesh, &mu.base_transform);
+        }
+        for bt in &updates.base_transforms {
+            self.renderer.set_base_transform(bt.id, &bt.transform);
+            self.pick.set_base(bt.id, &bt.transform);
+        }
+        for iu in &updates.instances {
+            self.renderer.upsert_instance(iu.id, iu.element_id, &iu.transform);
+            self.pick.upsert_instance(iu.id, iu.element_id, &iu.transform);
+        }
+        for (id, diag) in &updates.errors {
+            self.errors.insert(*id, diag.to_string());
+        }
+        for id in &updates.errors_cleared {
+            self.errors.remove(id);
+        }
+        self.errors.retain(|id, _| self.doc.entity(*id).is_some());
+
+        if updates.committed_generation != self.last_committed {
+            self.last_committed = updates.committed_generation;
+            self.revision += 1;
+        }
+        self.committed = updates.committed_generation;
+        self.evaluated = updates.evaluated_generation;
+        self.pending = updates.pending_count;
+        self.last_mesh_upserts = updates.meshes.len();
+        self.last_base_transforms = updates.base_transforms.len();
+
+        if self
+            .selection
+            .is_some_and(|s| !self.model.iter().any(|e| e.element() == s))
+        {
+            self.selection = None;
+        }
+        self.refresh_session_and_overlays();
+
+        self.last_latency_ms = now_ms() - t0;
+        self.last_op = op.to_owned();
+    }
+
+    /// Revalidate the active level (fallback: nearest by elevation),
+    /// keep the sketch on it, rebuild level outlines and styles.
+    fn refresh_session_and_overlays(&mut self) {
+        let levels = ops::levels_sorted(&self.doc);
+        let alive = self
+            .active_level
+            .filter(|id| levels.iter().any(|l| l.id == *id));
+        self.active_level = alive.or_else(|| {
+            levels
+                .iter()
+                .min_by(|a, b| {
+                    let da = (a.elevation_m - self.active_elevation).abs();
+                    let db = (b.elevation_m - self.active_elevation).abs();
+                    da.total_cmp(&db)
+                })
+                .map(|l| l.id)
+        });
+        if let Some(info) = self
+            .active_level
+            .and_then(|a| levels.iter().find(|l| l.id == a))
+        {
+            self.active_elevation = info.elevation_m;
+        }
+        // The camera orbits / looks down onto the active plane.
+        self.camera.plane_z = self.active_elevation as f32;
+        // The sketch lives on the active plane.
+        match (self.active_level, self.sketch.as_ref().map(|s| s.level)) {
+            (Some(active), Some(level)) if active != level => {
+                if let Some(s) = self.sketch.as_mut() {
+                    s.level = active;
+                    s.points.clear();
+                    s.cursor = None;
+                }
+            }
+            (None, Some(_)) => {
+                self.sketch = None;
+                self.tool = Tool::Select;
+            }
+            _ => {}
+        }
+
+        // Other levels: faint outline squares (a full translucent square
+        // would obscure the plan view). The active level shows its grid.
+        let mut lines: Vec<f32> = Vec::new();
+        for l in levels.iter().filter(|l| Some(l.id) != self.active_level) {
+            let (e, z) = (l.extent_m as f32, l.elevation_m as f32);
+            let c = [l.color[0], l.color[1], l.color[2], 0.55];
+            let corners = [[-e, -e], [e, -e], [e, e], [-e, e]];
+            for i in 0..4 {
+                let (a, b) = (corners[i], corners[(i + 1) % 4]);
+                lines.extend_from_slice(&[a[0], a[1], z]);
+                lines.extend_from_slice(&c);
+                lines.extend_from_slice(&[b[0], b[1], z]);
+                lines.extend_from_slice(&c);
+            }
+        }
+        self.renderer.set_lines(LineLayer::Plain, &lines);
+        self.grid_key = None;
+        self.refresh_styles();
+    }
+
+    /// Per-owner styles: selection accent, plan-view dimming of other
+    /// levels, crisp feature edges everywhere.
+    fn refresh_styles(&mut self) {
+        let edge = rgba(EDGE, 0.5);
+        self.renderer.set_default_style(MeshStyle { tint: [0.0; 4], edge });
+        let mut styles: HashMap<EntityId, MeshStyle> = HashMap::new();
+        let [cr, cg, cb] = rgb(CLEAR);
+        for id in self.pick.owner_ids().collect::<Vec<_>>() {
+            let level = self.model.iter().find(|e| e.element() == id).and_then(|e| e.level());
+            let style = if Some(id) == self.selection {
+                MeshStyle { tint: rgba(ACCENT, 0.34), edge: rgba(ACCENT, 1.0) }
+            } else if self.camera.mode == ViewMode::Plan
+                && level.is_some()
+                && level != self.active_level
+            {
+                MeshStyle { tint: [cr, cg, cb, 0.6], edge: rgba(EDGE, 0.15) }
+            } else {
+                MeshStyle { tint: [0.0; 4], edge }
+            };
+            styles.insert(id, style);
+        }
+        self.renderer.set_styles(styles);
+    }
+
+    /// Rebuild the grid on the active plane when the view changes enough
+    /// (density follows zoom; extent covers the view).
+    fn update_grid(&mut self) {
+        let (w, h) = self.size_f();
+        let ppm = f64::from(self.camera.px_per_m(h));
+        // Sparser in 3D: perspective compresses distant lines.
+        let min_px = if self.camera.mode == ViewMode::Plan { 9.0 } else { 16.0 };
+        let mut minor = self.snap_step;
+        for s in GRID_STEPS {
+            if minor * ppm >= min_px {
+                break;
+            }
+            if s > minor {
+                minor = s;
+            }
+        }
+        let major = if minor < 1.0 { 1.0 } else { minor * 5.0 };
+        let target = self.camera.target;
+        let (half_x, half_y, fade) = match self.camera.mode {
+            ViewMode::Plan => {
+                let hh = f64::from(self.camera.plan_half_h) * 1.15;
+                (hh * f64::from(w / h), hh, 0.0f32)
+            }
+            ViewMode::Orbit => {
+                let r = (f64::from(self.camera.distance) * 1.3).clamp(12.0, 900.0);
+                (r, r, r as f32)
+            }
+        };
+        // Cap the line count (very wide views at fine steps).
+        while (2.0 * half_x.max(half_y) / minor) > 700.0 {
+            minor = if minor < 1.0 { 1.0 } else { minor * 2.0 };
+        }
+        let major = major.max(minor);
+        let snapq = |v: f64| (v / major).floor() as i64;
+        let cx = f64::from(target.x);
+        let cy = f64::from(target.y);
+        let key = (
+            minor.to_bits(),
+            major.to_bits(),
+            snapq(cx - half_x),
+            snapq(cx + half_x) + 1,
+            snapq(cy - half_y),
+            snapq(cy + half_y) + 1,
+            (self.active_elevation as f32).to_bits(),
+            u8::from(self.camera.mode == ViewMode::Plan),
+        );
+        let z = self.active_elevation as f32 + GRID_LIFT_M;
+        self.renderer.set_fade([target.x, target.y, z], fade);
+        if self.grid_key == Some(key) {
+            return;
+        }
+        self.grid_key = Some(key);
+        let (x0, x1) = (key.2 as f64 * major, key.3 as f64 * major);
+        let (y0, y1) = (key.4 as f64 * major, key.5 as f64 * major);
+        let minor_c = rgba(GRID, 0.07);
+        let major_c = rgba(GRID, 0.17);
+        let axis_x = rgba(AXIS_X, 0.75);
+        let axis_y = rgba(AXIS_Y, 0.75);
+        let mut verts: Vec<f32> = Vec::new();
+        let mut line = |a: [f64; 2], b: [f64; 2], c: [f32; 4]| {
+            verts.extend_from_slice(&[a[0] as f32, a[1] as f32, z]);
+            verts.extend_from_slice(&c);
+            verts.extend_from_slice(&[b[0] as f32, b[1] as f32, z]);
+            verts.extend_from_slice(&c);
+        };
+        let is_multiple = |v: f64, step: f64| ((v / step).round() * step - v).abs() < 1e-6;
+        let (i0, i1) = ((x0 / minor).ceil() as i64, (x1 / minor).floor() as i64);
+        for i in i0..=i1 {
+            let x = i as f64 * minor;
+            if x.abs() < 1e-9 {
+                continue; // the Y axis is drawn below, on top
+            }
+            let c = if is_multiple(x, major) { major_c } else { minor_c };
+            line([x, y0], [x, y1], c);
+        }
+        let (j0, j1) = ((y0 / minor).ceil() as i64, (y1 / minor).floor() as i64);
+        for j in j0..=j1 {
+            let y = j as f64 * minor;
+            if y.abs() < 1e-9 {
+                continue;
+            }
+            let c = if is_multiple(y, major) { major_c } else { minor_c };
+            line([x0, y], [x1, y], c);
+        }
+        if x0 <= 0.0 && 0.0 <= x1 {
+            line([0.0, y0], [0.0, y1], axis_y);
+        }
+        if y0 <= 0.0 && 0.0 <= y1 {
+            line([x0, 0.0], [x1, 0.0], axis_x);
+        }
+        self.renderer.set_lines(LineLayer::Grid, &verts);
+    }
+}

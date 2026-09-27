@@ -14,6 +14,8 @@
 use vim_design_lib::entity::slot;
 use vim_design_lib::{Command, Document, EntityId, EntityKind, Params, ProvenancePath, SubRef};
 
+use crate::authoring::ops;
+
 /// Site defaults (docs/AUTHORING.md §1): downtown Montreal.
 pub const DEFAULT_LATITUDE: f64 = 45.5019;
 pub const DEFAULT_LONGITUDE: f64 = -73.5674;
@@ -461,31 +463,6 @@ pub fn build_scene(doc: &mut Document) -> Result<SceneIds, String> {
 // Phase C: interactive floor-plate authoring (docs/AUTHORING.md §3/§5).
 // ---------------------------------------------------------------------
 
-/// Signed area (shoelace). Positive = counter-clockwise in the (u, v)
-/// plane.
-fn signed_area(points: &[[f64; 2]]) -> f64 {
-    let n = points.len();
-    (0..n)
-        .map(|i| {
-            let [x0, y0] = points[i];
-            let [x1, y1] = points[(i + 1) % n];
-            x0 * y1 - x1 * y0
-        })
-        .sum::<f64>()
-        / 2.0
-}
-
-/// Normalize a clicked outline to counter-clockwise winding (the
-/// orientation every profile in this app is authored with). Users click
-/// in either direction; the kernel gets a consistent one.
-fn normalized_ccw(points: &[[f64; 2]]) -> Vec<[f64; 2]> {
-    let mut pts = points.to_vec();
-    if signed_area(&pts) < 0.0 {
-        pts.reverse();
-    }
-    pts
-}
-
 /// A floor plate authored by the interactive tool. (Only `level` and
 /// `face` are consumed today — the hole tool needs them; the producer
 /// ids will matter for chamfering/picking in later phases.)
@@ -494,44 +471,10 @@ pub struct AuthoredPlate {
     pub face: EntityId,
 }
 
-/// Build a level-attached loop from (u, v) outline points (w = 0 on the
-/// level plane): control points (attached) -> lines -> edges -> wire.
-fn build_attached_outline(
-    doc: &mut Document,
-    level: EntityId,
-    points: &[[f64; 2]],
-) -> Result<EntityId, String> {
-    let mut cps = Vec::with_capacity(points.len());
-    for [u, v] in points {
-        let cp = one(doc, Command::CreateControlPoint { position: [*u, *v, 0.0] })?;
-        ok(
-            doc,
-            Command::UpdateControlPointPlane {
-                id: cp,
-                plane: Some(level),
-                position: None, // stored coords ARE the (u, v, w)
-            },
-        )?;
-        cps.push(cp);
-    }
-    let mut edges = Vec::with_capacity(cps.len());
-    for i in 0..cps.len() {
-        let line = one(
-            doc,
-            Command::CreateLine {
-                start: cps[i],
-                end: cps[(i + 1) % cps.len()],
-            },
-        )?;
-        edges.push(one(doc, Command::CreateEdge { curve: line })?);
-    }
-    one(doc, Command::CreateWire { edges })
-}
-
-/// Commit a drawn floor plate: attached outline -> face -> downward
-/// extrusion (thickness meters, top surface on the level plane) ->
-/// element (associated with the level) + identity instance. The caller
-/// wraps this in one gesture group so a single undo removes it all.
+/// Commit a drawn floor plate (the shared authoring operation: attached
+/// outline -> face -> downward extrusion -> element + identity
+/// instance). The caller wraps this in one gesture group so a single
+/// undo removes it all.
 pub fn commit_plate(
     doc: &mut Document,
     level: EntityId,
@@ -539,145 +482,24 @@ pub fn commit_plate(
     thickness: f64,
     name: &str,
 ) -> Result<AuthoredPlate, String> {
-    let outline = normalized_ccw(points);
-    let wire = build_attached_outline(doc, level, &outline)?;
-    let face = one(
-        doc,
-        Command::CreateFace {
-            outer: wire,
-            holes: vec![],
-            plane: None,
-        },
-    )?;
-    let start_cp = one(doc, Command::CreateControlPoint { position: [0.0, 0.0, 0.0] })?;
-    let end_cp = one(
-        doc,
-        Command::CreateControlPoint {
-            position: [0.0, 0.0, -thickness],
-        },
-    )?;
-    let path = one(
-        doc,
-        Command::CreateLine {
-            start: start_cp,
-            end: end_cp,
-        },
-    )?;
-    let extrusion = one(doc, Command::CreateExtrusion { profile: face, path })?;
-    attach_all(doc, level, &[start_cp, end_cp])?; // whole spatial closure attached
-    let element = one(
-        doc,
-        Command::CreateElement {
-            name: name.to_owned(),
-            members: vec![extrusion],
-            level,
-        },
-    )?;
-    one(
-        doc,
-        Command::CreateInstance {
-            element,
-            transform: [
-                1.0, 0.0, 0.0, 0.0, //
-                0.0, 1.0, 0.0, 0.0, //
-                0.0, 0.0, 1.0, 0.0,
-            ],
-        },
-    )?;
-    Ok(AuthoredPlate { level, face })
+    ops::commit_plate(doc, level, points, thickness, name)
+        .map(|ids| AuthoredPlate { level, face: ids.face })
 }
 
-/// Commit a drawn hole into an existing plate face: attached outline
-/// wire appended to the face's holes slot. One gesture group, same as
-/// the plate.
+/// Commit a drawn hole into an existing plate face (shared authoring
+/// operation). One gesture group, same as the plate.
 pub fn commit_hole(
     doc: &mut Document,
     level: EntityId,
     face: EntityId,
     points: &[[f64; 2]],
 ) -> Result<(), String> {
-    let outline = normalized_ccw(points);
-    let wire = build_attached_outline(doc, level, &outline)?;
-    let mut holes: Vec<EntityId> = doc
-        .entity(face)
-        .and_then(|record| record.inputs.get(slot::FACE_HOLES))
-        .map(|s| s.referenced().collect())
-        .unwrap_or_default();
-    holes.push(wire);
-    ok(
-        doc,
-        Command::UpdateFace {
-            id: face,
-            outer: None,
-            holes: Some(holes),
-            plane: None,
-            coalesce: false,
-        },
-    )?;
-    Ok(())
+    ops::commit_hole(doc, level, face, points).map(|_| ())
 }
 
-// ---------------------------------------------------------------------
-// Authoring-tool readers (site + levels are enumerated from the
-// document — order derived from elevation, never stored).
-// ---------------------------------------------------------------------
-
-/// One level's params, read back for the level manager UI.
-pub struct LevelInfo {
-    pub id: EntityId,
-    pub name: String,
-    pub elevation_m: f64,
-    pub is_building_story: bool,
-    pub color: [f32; 4],
-    pub extent_m: f64,
-}
-
-/// All levels, sorted by elevation ASCENDING (ties broken by id for
-/// determinism). The UI displays them top-story-first (descending); the
-/// sort itself is always derived, never stored (docs/AUTHORING.md §2).
-pub fn levels_sorted(doc: &Document) -> Vec<LevelInfo> {
-    let mut levels: Vec<LevelInfo> = doc
-        .entities()
-        .filter_map(|(id, record)| match &record.params {
-            Params::Level {
-                name,
-                elevation_m,
-                is_building_story,
-                color,
-                extent_m,
-            } => Some(LevelInfo {
-                id: *id,
-                name: name.clone(),
-                elevation_m: *elevation_m,
-                is_building_story: *is_building_story,
-                color: *color,
-                extent_m: *extent_m,
-            }),
-            _ => None,
-        })
-        .collect();
-    levels.sort_by(|a, b| {
-        a.elevation_m
-            .partial_cmp(&b.elevation_m)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.id.cmp(&b.id))
-    });
-    levels
-}
-
-/// The Site singleton's params (there is at most one; `None` on a
-/// document without a site).
-pub fn site_params(doc: &Document) -> Option<(EntityId, f64, f64, f64, f64)> {
-    doc.entities().find_map(|(id, record)| match &record.params {
-        Params::Site {
-            latitude_deg,
-            longitude_deg,
-            elevation_m,
-            true_north_deg,
-        } => Some((*id, *latitude_deg, *longitude_deg, *elevation_m, *true_north_deg)),
-        _ => None,
-    })
-}
+// Site + level readers are the shared authoring-layer ones (enumerated
+// from the document; order derived from elevation, never stored).
+pub use crate::authoring::ops::{levels_sorted, site_params};
 
 /// Top-rim edges of the cube for the chamfer, addressed by provenance
 /// (docs/ARCHITECTURE.md §3.4): each is the intersection of the sweep's

@@ -4,7 +4,6 @@
 //! events call the `set_*` methods; a requestAnimationFrame loop calls
 //! `render()`.
 
-mod renderer;
 mod scene;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -14,7 +13,8 @@ use vim_design_lib::eval::Engine;
 use vim_design_lib::{Command, Document, EntityId, Params, VimStatus};
 use wasm_bindgen::prelude::*;
 
-use renderer::{Renderer, DEFAULT_COLOR};
+use crate::gestures::Gestures;
+use crate::render::{self as renderer, Renderer, DEFAULT_COLOR};
 use scene::SceneIds;
 
 /// Orbit camera: right-handed, Z-up (docs/ARCHITECTURE.md §7).
@@ -36,84 +36,6 @@ impl Camera {
         let proj =
             glam::camera::rh::proj::directx::perspective(45f32.to_radians(), aspect, 0.05, 200.0);
         proj * view
-    }
-}
-
-/// App-level slider-gesture grouping for undo/redo. The document already
-/// coalesces consecutive updates per entity; multi-entity sliders (the
-/// cube touches 5 control points per event) still produce many undo
-/// steps per drag, so the app records the undo depth at each gesture
-/// start and undoes/redoes whole gestures.
-#[derive(Default)]
-struct Gestures {
-    /// Undo depths recorded at the start of each gesture.
-    marks: Vec<usize>,
-    /// Step counts popped by `undo`, consumed by `redo`.
-    redo_counts: Vec<usize>,
-    current: Option<String>,
-}
-
-impl Gestures {
-    fn begin(&mut self, doc: &Document, name: &str) {
-        if self.current.as_deref() != Some(name) {
-            self.marks.push(doc.undo_depth());
-            self.current = Some(name.to_owned());
-        }
-        // Any new command invalidates the document's redo stack.
-        self.redo_counts.clear();
-    }
-
-    /// Record a one-shot operation (add/delete level, ...) that was
-    /// already submitted successfully: `depth` is the undo depth
-    /// captured BEFORE the submit. Used instead of `begin` when the
-    /// command may be rejected — a rejected command must not leave a
-    /// stray gesture mark or clear the redo counts.
-    fn one_shot(&mut self, depth: usize) {
-        self.marks.push(depth);
-        self.redo_counts.clear();
-        self.current = None;
-    }
-
-    fn undo(&mut self, doc: &mut Document) -> bool {
-        let depth = doc.undo_depth();
-        while self.marks.last().is_some_and(|m| *m >= depth) {
-            self.marks.pop();
-        }
-        let Some(mark) = self.marks.pop() else {
-            return false;
-        };
-        let steps = depth - mark;
-        for _ in 0..steps {
-            if doc.undo().is_err() {
-                break;
-            }
-        }
-        self.redo_counts.push(steps);
-        self.current = None;
-        true
-    }
-
-    fn redo(&mut self, doc: &mut Document) -> bool {
-        let Some(steps) = self.redo_counts.pop() else {
-            return false;
-        };
-        let mark = doc.undo_depth();
-        for _ in 0..steps {
-            if doc.redo().is_err() {
-                break;
-            }
-        }
-        self.marks.push(mark);
-        self.current = None;
-        true
-    }
-
-    fn can_undo(&self) -> bool {
-        !self.marks.is_empty()
-    }
-
-    fn can_redo(&self) -> bool {
-        !self.redo_counts.is_empty()
     }
 }
 

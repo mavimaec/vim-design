@@ -1,24 +1,34 @@
-//! wgpu renderer for the demo scene (wasm only).
+//! wgpu renderer shared by the demo and the authoring app (wasm only).
 //!
 //! Right-handed, Z-up (docs/ARCHITECTURE.md §7). Prefers the browser's
 //! WebGPU backend and falls back to WebGL2 (wgpu `webgl` feature) when no
 //! WebGPU adapter is available — the chosen path is reported by
-//! [`Renderer::backend_name`].
+//! [`Renderer::backend_name`]. The projection is the caller's business
+//! (`render(view_proj)`): perspective orbit and orthographic plan views
+//! both work unchanged.
 //!
 //! Bookkeeping follows the poll facade contract: two upsert maps,
 //! `mesh owner id -> GPU mesh` and `instance id -> (element id,
-//! transform)`. An owner with no instances is drawn once at identity;
-//! otherwise once per instance.
+//! transform)`. An owner with no instances is drawn once at its base
+//! transform; otherwise once per instance (`world = instance ∘ base`).
+//!
+//! Layers, in draw order:
+//! 1. shaded fill (per-owner tint via [`MeshStyle`]),
+//! 2. optional full wireframe (demo),
+//! 3. feature edges (crease/boundary lines, per-owner color; off unless
+//!    a style gives them alpha),
+//! 4. level overlay quads (demo), grid lines (distance fade) and plain
+//!    overlay lines (level outlines) — view-only, never document data,
+//! 5. draw-tool preview markers/lines (depth Always).
 //!
 //! Wireframe: wgpu's `PolygonMode::Line` needs `NON_FILL_POLYGON_MODE`,
-//! which browsers do not expose — instead each mesh carries a second,
-//! deduplicated line-list index buffer over the same vertex buffer, drawn
-//! by a dedicated pipeline whose vertex shader nudges clip-space depth
-//! toward the camera so the lines never z-fight the fill.
+//! which browsers do not expose — instead each mesh carries line-list
+//! index buffers over the same vertex buffer (all triangle edges for the
+//! wireframe; crease/boundary edges for the feature-edge layer).
 
 use std::collections::{HashMap, HashSet};
 
-use glam::Mat4;
+use glam::{Mat4, Vec3};
 use vim_design_lib::eval::Mesh;
 use vim_design_lib::EntityId;
 use wgpu::util::DeviceExt;
@@ -27,9 +37,14 @@ use wgpu::util::DeviceExt;
 pub const DEFAULT_COLOR: [f32; 3] = [0.78, 0.78, 0.75];
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth24Plus;
-/// Dynamic-offset stride for per-draw model matrices (WebGL2 requires
+/// Dynamic-offset stride for per-draw uniforms (WebGL2 requires
 /// 256-byte alignment).
 const MODEL_STRIDE: u64 = 256;
+/// Per-draw uniform payload: model matrix + tint + edge color.
+const MODEL_SIZE: u64 = 96;
+const GLOBALS_SIZE: u64 = 128;
+/// Dihedral angle above which a mesh edge is a feature edge.
+const FEATURE_ANGLE_COS: f32 = 0.866; // 30°
 
 const SHADER: &str = r#"
 // light_dir.w doubles as the "gamma encode in shader" flag: 1.0 when the
@@ -40,6 +55,11 @@ struct Globals {
     view_proj: mat4x4<f32>,
     light_dir: vec4<f32>,
     wire_color: vec4<f32>,
+    // Grid fade: xyz = center, w = radius (<= 0: no fade).
+    fade: vec4<f32>,
+    // Feature-edge depth nudge: xyz = eye (or a far point behind an
+    // orthographic camera), w = relative pull toward it.
+    eye: vec4<f32>,
 };
 
 fn encode(c: vec3<f32>) -> vec3<f32> {
@@ -50,7 +70,13 @@ fn encode(c: vec3<f32>) -> vec3<f32> {
 }
 @group(0) @binding(0) var<uniform> globals: Globals;
 
-struct Model { m: mat4x4<f32> };
+struct Model {
+    m: mat4x4<f32>,
+    // rgb mixed into the surface color by a.
+    tint: vec4<f32>,
+    // Feature-edge color (a = 0: no edges drawn).
+    edge: vec4<f32>,
+};
 @group(1) @binding(0) var<uniform> model: Model;
 
 struct VsOut {
@@ -90,6 +116,25 @@ fn vs_wire(
     return out;
 }
 
+@vertex
+fn vs_edge(
+    @location(0) p: vec3<f32>,
+    @location(1) n: vec3<f32>,
+    @location(2) c: vec3<f32>,
+) -> VsOut {
+    var out: VsOut;
+    let world = (model.m * vec4<f32>(p, 1.0)).xyz;
+    // Pull toward the eye by a fraction of the distance: a view-space
+    // offset that behaves the same for perspective and orthographic
+    // projections (a clip-z bias does not).
+    let eye = globals.eye.xyz;
+    let pulled = eye + (world - eye) * (1.0 - globals.eye.w);
+    out.pos = globals.view_proj * vec4<f32>(pulled, 1.0);
+    out.normal = n;
+    out.color = c;
+    return out;
+}
+
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let n = normalize(in.normal);
@@ -98,7 +143,8 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let fill_dir = normalize(vec3<f32>(-l.x, -l.y, 0.35));
     let fill = 0.25 * max(dot(n, fill_dir), 0.0);
     let shade = 0.24 + 0.72 * key + fill;
-    return vec4<f32>(encode(in.color * min(shade, 1.15)), 1.0);
+    let base = mix(in.color, model.tint.rgb, model.tint.a);
+    return vec4<f32>(encode(base * min(shade, 1.15)), 1.0);
 }
 
 @fragment
@@ -106,12 +152,17 @@ fn fs_wire(in: VsOut) -> @location(0) vec4<f32> {
     return vec4<f32>(encode(globals.wire_color.rgb), globals.wire_color.a);
 }
 
-// Level overlays (docs/AUTHORING.md §2): translucent colored squares in
-// world coordinates — unlit, alpha-blended, depth-tested but not
-// depth-written so the scene stays visible through them.
+@fragment
+fn fs_edge(in: VsOut) -> @location(0) vec4<f32> {
+    return vec4<f32>(encode(model.edge.rgb), model.edge.a);
+}
+
+// Overlay family (level squares, grid, outlines, previews): world
+// coordinates, unlit, alpha-blended, never depth-written.
 struct OverlayOut {
     @builtin(position) pos: vec4<f32>,
     @location(0) color: vec4<f32>,
+    @location(1) world: vec3<f32>,
 };
 
 @vertex
@@ -119,12 +170,24 @@ fn vs_overlay(@location(0) p: vec3<f32>, @location(1) c: vec4<f32>) -> OverlayOu
     var out: OverlayOut;
     out.pos = globals.view_proj * vec4<f32>(p, 1.0);
     out.color = c;
+    out.world = p;
     return out;
 }
 
 @fragment
 fn fs_overlay(in: OverlayOut) -> @location(0) vec4<f32> {
     return vec4<f32>(encode(in.color.rgb), in.color.a);
+}
+
+@fragment
+fn fs_grid(in: OverlayOut) -> @location(0) vec4<f32> {
+    var a = in.color.a;
+    let r = globals.fade.w;
+    if (r > 0.0) {
+        let d = distance(in.world.xy, globals.fade.xy);
+        a = a * (1.0 - smoothstep(r * 0.45, r, d));
+    }
+    return vec4<f32>(encode(in.color.rgb), a);
 }
 "#;
 
@@ -134,6 +197,8 @@ struct GpuMesh {
     index_count: u32,
     wire_indices: wgpu::Buffer,
     wire_index_count: u32,
+    edge_indices: wgpu::Buffer,
+    edge_index_count: u32,
     triangle_count: u32,
     /// Base placement (translation factoring): mesh bytes are owner-
     /// local; `world = instance ∘ base`, base applied first. Identity
@@ -154,25 +219,61 @@ pub struct OverlayQuad {
     pub color: [f32; 4],
 }
 
+/// Per-owner draw style. The default (all zero) is the plain shaded
+/// look with no feature edges.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct MeshStyle {
+    /// rgb mixed into the surface color by `a` (selection, dimming).
+    pub tint: [f32; 4],
+    /// Feature-edge color; `a == 0` draws no edges.
+    pub edge: [f32; 4],
+}
+
+/// Which overlay line layer to replace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineLayer {
+    /// Faded with distance from the fade center ([`Renderer::set_fade`]).
+    Grid,
+    /// Never faded (level outlines, guides).
+    Plain,
+}
+
+/// Construction options.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RendererOptions {
+    /// Request 4x MSAA (used when the surface format supports it).
+    pub msaa: bool,
+}
+
+#[derive(Default)]
+struct VertexBuf {
+    buf: Option<wgpu::Buffer>,
+    count: u32,
+}
+
 pub struct Renderer {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
+    sample_count: u32,
     depth_view: wgpu::TextureView,
+    msaa_view: Option<wgpu::TextureView>,
     fill_pipeline: wgpu::RenderPipeline,
     wire_pipeline: wgpu::RenderPipeline,
+    edge_pipeline: wgpu::RenderPipeline,
     overlay_pipeline: wgpu::RenderPipeline,
-    overlay_buf: Option<wgpu::Buffer>,
-    overlay_vertex_count: u32,
+    grid_pipeline: wgpu::RenderPipeline,
+    plain_line_pipeline: wgpu::RenderPipeline,
+    overlay: VertexBuf,
+    grid_lines: VertexBuf,
+    plain_lines: VertexBuf,
     /// Draw-tool preview (view-only, never document entities): triangle
     /// markers + rubber-band lines, drawn on top of everything.
     preview_tri_pipeline: wgpu::RenderPipeline,
     preview_line_pipeline: wgpu::RenderPipeline,
-    preview_tri_buf: Option<wgpu::Buffer>,
-    preview_tri_count: u32,
-    preview_line_buf: Option<wgpu::Buffer>,
-    preview_line_count: u32,
+    preview_tris: VertexBuf,
+    preview_lines: VertexBuf,
     globals_buf: wgpu::Buffer,
     globals_bind: wgpu::BindGroup,
     model_layout: wgpu::BindGroupLayout,
@@ -181,6 +282,11 @@ pub struct Renderer {
     model_capacity: u32,
     meshes: HashMap<EntityId, GpuMesh>,
     instances: HashMap<EntityId, (EntityId, Mat4)>,
+    styles: HashMap<EntityId, MeshStyle>,
+    default_style: MeshStyle,
+    clear: [f64; 3],
+    fade: [f32; 4],
+    edge_eye: [f32; 4],
     backend: &'static str,
     pub wireframe: bool,
 }
@@ -223,8 +329,64 @@ pub fn mat4_from_row_major_4x3(t: &[f64; 12]) -> Mat4 {
     ])
 }
 
+/// Feature edges of a triangle list: boundary edges plus creases whose
+/// adjacent face normals differ by more than ~30°. Vertices are matched
+/// by quantized position (tessellators duplicate vertices per face), and
+/// each line reuses one of the original vertex indices.
+fn feature_edges(verts: &[f32], indices: &[u32]) -> Vec<u32> {
+    let key = |i: u32| -> (i64, i64, i64) {
+        let b = i as usize * 9;
+        let q = |v: f32| (f64::from(v) * 1e5).round() as i64;
+        (q(verts[b]), q(verts[b + 1]), q(verts[b + 2]))
+    };
+    let pos = |i: u32| -> Vec3 {
+        let b = i as usize * 9;
+        Vec3::new(verts[b], verts[b + 1], verts[b + 2])
+    };
+    type Key = (i64, i64, i64);
+    let mut edges: HashMap<(Key, Key), (u32, u32, Vec<Vec3>)> = HashMap::new();
+    for tri in indices.chunks_exact(3) {
+        let n = (pos(tri[1]) - pos(tri[0])).cross(pos(tri[2]) - pos(tri[0]));
+        let len = n.length();
+        if len <= 1e-12 {
+            continue; // degenerate sliver
+        }
+        let n = n / len;
+        for (a, b) in [(tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])] {
+            let (ka, kb) = (key(a), key(b));
+            if ka == kb {
+                continue;
+            }
+            let k = if ka < kb { (ka, kb) } else { (kb, ka) };
+            edges.entry(k).or_insert_with(|| (a, b, Vec::new())).2.push(n);
+        }
+    }
+    let mut out = Vec::new();
+    for (a, b, normals) in edges.values() {
+        let feature = match normals.as_slice() {
+            [_] => true,
+            // Any adjacent face turning by more than the threshold
+            // (opposite-facing folds included) makes a crease.
+            [n0, rest @ ..] => rest.iter().any(|n| n0.dot(*n) < FEATURE_ANGLE_COS),
+            [] => false,
+        };
+        if feature {
+            out.push(*a);
+            out.push(*b);
+        }
+    }
+    out
+}
+
 impl Renderer {
     pub async fn new(canvas: web_sys::HtmlCanvasElement) -> Result<Renderer, String> {
+        Self::with_options(canvas, RendererOptions::default()).await
+    }
+
+    pub async fn with_options(
+        canvas: web_sys::HtmlCanvasElement,
+        options: RendererOptions,
+    ) -> Result<Renderer, String> {
         // Prefer WebGPU. Adapter probing happens *before* the canvas is
         // touched: a canvas can hold only one context type, so we must
         // not create a webgpu surface unless a WebGPU adapter exists. The
@@ -274,7 +436,7 @@ impl Renderer {
         let limits = wgpu::Limits::downlevel_webgl2_defaults().using_resolution(adapter.limits());
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
-                label: Some("vim-design demo device"),
+                label: Some("vim-design device"),
                 required_features: wgpu::Features::empty(),
                 required_limits: limits,
                 ..Default::default()
@@ -288,22 +450,43 @@ impl Renderer {
             .iter()
             .copied()
             .find(|f| f.is_srgb())
-            .unwrap_or(caps.formats[0]);
+            .or_else(|| caps.formats.first().copied())
+            .ok_or_else(|| "surface reports no formats".to_owned())?;
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
             width,
             height,
             present_mode: wgpu::PresentMode::Fifo,
-            alpha_mode: caps.alpha_modes[0],
+            alpha_mode: caps
+                .alpha_modes
+                .first()
+                .copied()
+                .unwrap_or(wgpu::CompositeAlphaMode::Auto),
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
         surface.configure(&device, &config);
-        let depth_view = create_depth(&device, width, height);
+
+        let sample_count = if options.msaa
+            && adapter
+                .get_texture_format_features(format)
+                .flags
+                .sample_count_supported(4)
+            && adapter
+                .get_texture_format_features(DEPTH_FORMAT)
+                .flags
+                .sample_count_supported(4)
+        {
+            4
+        } else {
+            1
+        };
+        let depth_view = create_depth(&device, width, height, sample_count);
+        let msaa_view = create_msaa(&device, format, width, height, sample_count);
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("demo shader"),
+            label: Some("vim-design shader"),
             source: wgpu::ShaderSource::Wgsl(SHADER.into()),
         });
 
@@ -315,7 +498,7 @@ impl Renderer {
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
-                    min_binding_size: wgpu::BufferSize::new(96),
+                    min_binding_size: wgpu::BufferSize::new(GLOBALS_SIZE),
                 },
                 count: None,
             }],
@@ -324,11 +507,11 @@ impl Renderer {
             label: Some("model layout"),
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: true,
-                    min_binding_size: wgpu::BufferSize::new(64),
+                    min_binding_size: wgpu::BufferSize::new(MODEL_SIZE),
                 },
                 count: None,
             }],
@@ -336,7 +519,7 @@ impl Renderer {
 
         let globals_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("globals"),
-            size: 96,
+            size: GLOBALS_SIZE,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -354,7 +537,7 @@ impl Renderer {
             create_model_buffer(&device, &model_layout, model_capacity);
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("demo pipeline layout"),
+            label: Some("mesh pipeline layout"),
             bind_group_layouts: &[&globals_layout, &model_layout],
             push_constant_ranges: &[],
         });
@@ -363,6 +546,10 @@ impl Renderer {
             array_stride: 9 * 4,
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x3],
+        };
+        let multisample = wgpu::MultisampleState {
+            count: sample_count,
+            ..Default::default()
         };
 
         let make_pipeline = |label: &str,
@@ -396,7 +583,7 @@ impl Renderer {
                     stencil: Default::default(),
                     bias: Default::default(),
                 }),
-                multisample: Default::default(),
+                multisample,
                 fragment: Some(wgpu::FragmentState {
                     module: &shader,
                     entry_point: Some(fs),
@@ -431,12 +618,17 @@ impl Renderer {
             false,
             Some(wgpu::BlendState::ALPHA_BLENDING),
         );
+        let edge_pipeline = make_pipeline(
+            "edges",
+            "vs_edge",
+            "fs_edge",
+            wgpu::PrimitiveTopology::LineList,
+            false,
+            Some(wgpu::BlendState::ALPHA_BLENDING),
+        );
 
         // Overlay-family pipelines (pos + rgba vertices in world
-        // coordinates, no model matrix — globals only): the level
-        // overlays (depth-tested), and the draw-tool preview markers +
-        // rubber-band lines (depth Always: the preview must stay visible
-        // over everything while sketching).
+        // coordinates, no model matrix — globals only).
         let overlay_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("overlay pipeline layout"),
             bind_group_layouts: &[&globals_layout],
@@ -448,6 +640,7 @@ impl Renderer {
             attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4],
         };
         let make_overlay_pipeline = |label: &str,
+                                     fs: &str,
                                      topology: wgpu::PrimitiveTopology,
                                      depth_compare: wgpu::CompareFunction| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -472,10 +665,10 @@ impl Renderer {
                     stencil: Default::default(),
                     bias: Default::default(),
                 }),
-                multisample: Default::default(),
+                multisample,
                 fragment: Some(wgpu::FragmentState {
                     module: &shader,
-                    entry_point: Some("fs_overlay"),
+                    entry_point: Some(fs),
                     compilation_options: Default::default(),
                     targets: &[Some(wgpu::ColorTargetState {
                         format,
@@ -489,16 +682,31 @@ impl Renderer {
         };
         let overlay_pipeline = make_overlay_pipeline(
             "overlay",
+            "fs_overlay",
             wgpu::PrimitiveTopology::TriangleList,
+            wgpu::CompareFunction::Less,
+        );
+        let grid_pipeline = make_overlay_pipeline(
+            "grid lines",
+            "fs_grid",
+            wgpu::PrimitiveTopology::LineList,
+            wgpu::CompareFunction::Less,
+        );
+        let plain_line_pipeline = make_overlay_pipeline(
+            "overlay lines",
+            "fs_overlay",
+            wgpu::PrimitiveTopology::LineList,
             wgpu::CompareFunction::Less,
         );
         let preview_tri_pipeline = make_overlay_pipeline(
             "preview tris",
+            "fs_overlay",
             wgpu::PrimitiveTopology::TriangleList,
             wgpu::CompareFunction::Always,
         );
         let preview_line_pipeline = make_overlay_pipeline(
             "preview lines",
+            "fs_overlay",
             wgpu::PrimitiveTopology::LineList,
             wgpu::CompareFunction::Always,
         );
@@ -508,18 +716,22 @@ impl Renderer {
             device,
             queue,
             config,
+            sample_count,
             depth_view,
+            msaa_view,
             fill_pipeline,
             wire_pipeline,
+            edge_pipeline,
             overlay_pipeline,
-            overlay_buf: None,
-            overlay_vertex_count: 0,
+            grid_pipeline,
+            plain_line_pipeline,
+            overlay: VertexBuf::default(),
+            grid_lines: VertexBuf::default(),
+            plain_lines: VertexBuf::default(),
             preview_tri_pipeline,
             preview_line_pipeline,
-            preview_tri_buf: None,
-            preview_tri_count: 0,
-            preview_line_buf: None,
-            preview_line_count: 0,
+            preview_tris: VertexBuf::default(),
+            preview_lines: VertexBuf::default(),
             globals_buf,
             globals_bind,
             model_layout,
@@ -528,6 +740,12 @@ impl Renderer {
             model_capacity,
             meshes: HashMap::new(),
             instances: HashMap::new(),
+            styles: HashMap::new(),
+            default_style: MeshStyle::default(),
+            // Linear ~[0.090, 0.106, 0.133]: the demo's dark slate.
+            clear: [0.090, 0.106, 0.133],
+            fade: [0.0; 4],
+            edge_eye: [0.0; 4],
             backend,
             wireframe: true,
         })
@@ -535,6 +753,11 @@ impl Renderer {
 
     pub fn backend_name(&self) -> &'static str {
         self.backend
+    }
+
+    /// MSAA sample count in use (1 = off).
+    pub fn sample_count(&self) -> u32 {
+        self.sample_count
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -545,7 +768,9 @@ impl Renderer {
         self.config.width = width;
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
-        self.depth_view = create_depth(&self.device, width, height);
+        self.depth_view = create_depth(&self.device, width, height, self.sample_count);
+        self.msaa_view =
+            create_msaa(&self.device, self.config.format, width, height, self.sample_count);
     }
 
     pub fn aspect(&self) -> f32 {
@@ -557,12 +782,47 @@ impl Renderer {
         (self.config.width, self.config.height)
     }
 
+    /// Background color (linear RGB).
+    pub fn set_clear_color(&mut self, linear: [f64; 3]) {
+        self.clear = linear;
+    }
+
+    /// Grid fade: lines fade out between 45% and 100% of `radius` from
+    /// `center` (xy). `radius <= 0` disables the fade.
+    pub fn set_fade(&mut self, center: [f32; 3], radius: f32) {
+        self.fade = [center[0], center[1], center[2], radius];
+    }
+
+    /// Feature-edge depth nudge: edges are pulled toward `eye` by
+    /// `fraction` of their distance (pass a far point behind an
+    /// orthographic camera).
+    pub fn set_edge_nudge(&mut self, eye: [f32; 3], fraction: f32) {
+        self.edge_eye = [eye[0], eye[1], eye[2], fraction];
+    }
+
+    /// Style for owners without an explicit style.
+    pub fn set_default_style(&mut self, style: MeshStyle) {
+        self.default_style = style;
+    }
+
+    /// Replace all per-owner styles.
+    pub fn set_styles(&mut self, styles: HashMap<EntityId, MeshStyle>) {
+        self.styles = styles;
+    }
+
     pub fn remove_mesh(&mut self, id: EntityId) {
         self.meshes.remove(&id);
     }
 
     pub fn remove_instance(&mut self, id: EntityId) {
         self.instances.remove(&id);
+    }
+
+    /// Drop every mesh and instance (document replaced).
+    pub fn clear_scene(&mut self) {
+        self.meshes.clear();
+        self.instances.clear();
+        self.styles.clear();
     }
 
     pub fn upsert_instance(&mut self, id: EntityId, element: EntityId, transform: &[f64; 12]) {
@@ -592,25 +852,37 @@ impl Renderer {
         // Expand to an interleaved (pos, normal, color) vertex stream.
         // Vertices are remapped per submesh so each vertex carries its
         // submesh's color (a vertex referenced by two submeshes is
-        // duplicated).
+        // duplicated). Out-of-range indices are skipped (never panic on
+        // a malformed mesh).
         let mut verts: Vec<f32> = Vec::with_capacity(mesh.positions.len() * 9);
         let mut indices: Vec<u32> = Vec::with_capacity(mesh.indices.len());
         for (si, sub) in mesh.submeshes.iter().enumerate() {
             let color = submesh_colors.get(si).copied().unwrap_or(DEFAULT_COLOR);
             let mut remap: HashMap<u32, u32> = HashMap::new();
             let start = sub.index_start as usize;
-            let end = start + sub.index_count as usize;
-            for &old in &mesh.indices[start..end] {
-                let next = (verts.len() / 9) as u32;
-                let new = *remap.entry(old).or_insert_with(|| {
-                    let p = mesh.positions[old as usize];
-                    let n = mesh.normals[old as usize];
-                    verts.extend_from_slice(&[
-                        p[0], p[1], p[2], n[0], n[1], n[2], color[0], color[1], color[2],
-                    ]);
-                    next
+            let end = start.saturating_add(sub.index_count as usize);
+            let Some(range) = mesh.indices.get(start..end) else {
+                continue;
+            };
+            for tri in range.chunks_exact(3) {
+                let in_range = tri.iter().all(|&i| {
+                    (i as usize) < mesh.positions.len() && (i as usize) < mesh.normals.len()
                 });
-                indices.push(new);
+                if !in_range {
+                    continue;
+                }
+                for &old in tri {
+                    let next = (verts.len() / 9) as u32;
+                    let new = *remap.entry(old).or_insert_with(|| {
+                        let p = mesh.positions[old as usize];
+                        let n = mesh.normals[old as usize];
+                        verts.extend_from_slice(&[
+                            p[0], p[1], p[2], n[0], n[1], n[2], color[0], color[1], color[2],
+                        ]);
+                        next
+                    });
+                    indices.push(new);
+                }
             }
         }
 
@@ -626,28 +898,21 @@ impl Renderer {
             wire.push(a);
             wire.push(b);
         }
+        let feature = feature_edges(&verts, &indices);
 
-        let vertices = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("mesh vertices"),
-                contents: &f32s_to_bytes(&verts),
-                usage: wgpu::BufferUsages::VERTEX,
-            });
-        let index_buf = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("mesh indices"),
-                contents: &u32s_to_bytes(&indices),
-                usage: wgpu::BufferUsages::INDEX,
-            });
-        let wire_buf = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("mesh wire indices"),
-                contents: &u32s_to_bytes(&wire),
-                usage: wgpu::BufferUsages::INDEX,
-            });
+        let buffer = |label: &str, contents: &[u8], usage: wgpu::BufferUsages| {
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some(label),
+                    // Zero-sized buffers are invalid on some backends.
+                    contents: if contents.is_empty() { &[0u8; 4] } else { contents },
+                    usage,
+                })
+        };
+        let vertices = buffer("mesh vertices", &f32s_to_bytes(&verts), wgpu::BufferUsages::VERTEX);
+        let index_buf = buffer("mesh indices", &u32s_to_bytes(&indices), wgpu::BufferUsages::INDEX);
+        let wire_buf = buffer("mesh wire", &u32s_to_bytes(&wire), wgpu::BufferUsages::INDEX);
+        let edge_buf = buffer("mesh edges", &u32s_to_bytes(&feature), wgpu::BufferUsages::INDEX);
         let mut bbox_min = [f32::INFINITY; 3];
         let mut bbox_max = [f32::NEG_INFINITY; 3];
         for p in &mesh.positions {
@@ -664,12 +929,28 @@ impl Renderer {
                 index_count: indices.len() as u32,
                 wire_indices: wire_buf,
                 wire_index_count: wire.len() as u32,
+                edge_indices: edge_buf,
+                edge_index_count: feature.len() as u32,
                 triangle_count: (indices.len() / 3) as u32,
                 base: mat4_from_row_major_4x3(base_transform),
                 bbox_min,
                 bbox_max,
             },
         );
+    }
+
+    fn vertex_buf(&self, data: &[f32], label: &str) -> VertexBuf {
+        VertexBuf {
+            buf: (!data.is_empty()).then(|| {
+                self.device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some(label),
+                        contents: &f32s_to_bytes(data),
+                        usage: wgpu::BufferUsages::VERTEX,
+                    })
+            }),
+            count: (data.len() / 7) as u32,
+        }
     }
 
     /// Replace the level-overlay quads (world coordinates; caller passes
@@ -687,34 +968,25 @@ impl Renderer {
                 verts.extend_from_slice(&q.color);
             }
         }
-        self.overlay_vertex_count = (verts.len() / 7) as u32;
-        self.overlay_buf = (!verts.is_empty()).then(|| {
-            self.device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("level overlays"),
-                    contents: &f32s_to_bytes(&verts),
-                    usage: wgpu::BufferUsages::VERTEX,
-                })
-        });
+        self.overlay = self.vertex_buf(&verts, "level overlays");
+    }
+
+    /// Replace one overlay line layer (interleaved pos3 + rgba4 line-list
+    /// vertices in world coordinates; empty clears it).
+    pub fn set_lines(&mut self, layer: LineLayer, verts: &[f32]) {
+        let buf = self.vertex_buf(verts, "overlay lines");
+        match layer {
+            LineLayer::Grid => self.grid_lines = buf,
+            LineLayer::Plain => self.plain_lines = buf,
+        }
     }
 
     /// Replace the draw-tool preview geometry (interleaved pos3+rgba4
     /// vertices in world coordinates; empty slices clear it). Triangles
     /// are point markers; lines are the rubber-band polyline.
     pub fn set_preview(&mut self, tris: &[f32], lines: &[f32]) {
-        let mk = |data: &[f32], label: &str, device: &wgpu::Device| {
-            (!data.is_empty()).then(|| {
-                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some(label),
-                    contents: &f32s_to_bytes(data),
-                    usage: wgpu::BufferUsages::VERTEX,
-                })
-            })
-        };
-        self.preview_tri_buf = mk(tris, "preview tris", &self.device);
-        self.preview_tri_count = (tris.len() / 7) as u32;
-        self.preview_line_buf = mk(lines, "preview lines", &self.device);
-        self.preview_line_count = (lines.len() / 7) as u32;
+        self.preview_tris = self.vertex_buf(tris, "preview tris");
+        self.preview_lines = self.vertex_buf(lines, "preview lines");
     }
 
     /// World-space AABB of the drawn scene (meshes x instance
@@ -724,7 +996,7 @@ impl Renderer {
         let mut max = [f64::NEG_INFINITY; 3];
         let mut any = false;
         for (id, m) in self.draw_list() {
-            let mesh = &self.meshes[&id];
+            let Some(mesh) = self.meshes.get(&id) else { continue };
             if mesh.index_count == 0 {
                 continue;
             }
@@ -770,14 +1042,15 @@ impl Renderer {
     pub fn drawn_triangle_count(&self) -> u64 {
         self.draw_list()
             .iter()
-            .map(|(id, _)| u64::from(self.meshes[id].triangle_count))
+            .filter_map(|(id, _)| self.meshes.get(id))
+            .map(|m| u64::from(m.triangle_count))
             .sum()
     }
 
     pub fn render(&mut self, view_proj: Mat4) -> Result<(), String> {
         let draws = self.draw_list();
 
-        // Grow the per-draw model buffer if needed.
+        // Grow the per-draw uniform buffer if needed.
         if draws.len() as u32 > self.model_capacity {
             self.model_capacity = (draws.len() as u32).next_power_of_two();
             let (buf, bind) =
@@ -787,19 +1060,29 @@ impl Renderer {
         }
 
         // Globals: view-proj, key light direction (world space) with the
-        // gamma flag in .w (see the shader comment), wire color.
+        // gamma flag in .w (see the shader comment), wire color, grid
+        // fade, edge nudge.
         let gamma_encode = !self.config.format.is_srgb();
-        let mut globals = [0f32; 24];
+        let mut globals = [0f32; 32];
         globals[..16].copy_from_slice(&view_proj.to_cols_array());
         globals[16..20].copy_from_slice(&[0.45, -0.55, 0.72, f32::from(gamma_encode)]);
         globals[20..24].copy_from_slice(&[0.04, 0.05, 0.07, 0.42]);
+        globals[24..28].copy_from_slice(&self.fade);
+        globals[28..32].copy_from_slice(&self.edge_eye);
         self.queue
             .write_buffer(&self.globals_buf, 0, &f32s_to_bytes(&globals));
-        for (i, (_, m)) in draws.iter().enumerate() {
+        let mut any_edges = false;
+        for (i, (id, m)) in draws.iter().enumerate() {
+            let style = self.styles.get(id).copied().unwrap_or(self.default_style);
+            any_edges |= style.edge[3] > 0.0;
+            let mut data = [0f32; 24];
+            data[..16].copy_from_slice(&m.to_cols_array());
+            data[16..20].copy_from_slice(&style.tint);
+            data[20..24].copy_from_slice(&style.edge);
             self.queue.write_buffer(
                 &self.model_buf,
                 i as u64 * MODEL_STRIDE,
-                &f32s_to_bytes(&m.to_cols_array()),
+                &f32s_to_bytes(&data),
             );
         }
 
@@ -820,17 +1103,25 @@ impl Renderer {
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
         {
+            let (target, resolve) = match &self.msaa_view {
+                Some(msaa) => (msaa, Some(&view)),
+                None => (&view, None),
+            };
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("scene"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
+                    view: target,
+                    resolve_target: resolve,
                     depth_slice: None,
                     ops: wgpu::Operations {
                         // Clear values bypass the shader, so pre-encode
                         // them on non-sRGB surfaces to match.
-                        load: wgpu::LoadOp::Clear(clear_color(gamma_encode)),
-                        store: wgpu::StoreOp::Store,
+                        load: wgpu::LoadOp::Clear(clear_color(self.clear, gamma_encode)),
+                        store: if resolve.is_some() {
+                            wgpu::StoreOp::Discard
+                        } else {
+                            wgpu::StoreOp::Store
+                        },
                     },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
@@ -847,7 +1138,7 @@ impl Renderer {
             pass.set_pipeline(&self.fill_pipeline);
             pass.set_bind_group(0, &self.globals_bind, &[]);
             for (i, (id, _)) in draws.iter().enumerate() {
-                let mesh = &self.meshes[id];
+                let Some(mesh) = self.meshes.get(id) else { continue };
                 pass.set_bind_group(1, &self.model_bind, &[(i as u32) * MODEL_STRIDE as u32]);
                 pass.set_vertex_buffer(0, mesh.vertices.slice(..));
                 pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
@@ -857,7 +1148,7 @@ impl Renderer {
             if self.wireframe {
                 pass.set_pipeline(&self.wire_pipeline);
                 for (i, (id, _)) in draws.iter().enumerate() {
-                    let mesh = &self.meshes[id];
+                    let Some(mesh) = self.meshes.get(id) else { continue };
                     pass.set_bind_group(1, &self.model_bind, &[(i as u32) * MODEL_STRIDE as u32]);
                     pass.set_vertex_buffer(0, mesh.vertices.slice(..));
                     pass.set_index_buffer(mesh.wire_indices.slice(..), wgpu::IndexFormat::Uint32);
@@ -865,27 +1156,36 @@ impl Renderer {
                 }
             }
 
-            // Level overlays last: translucent planes blended over the
-            // opaque scene, depth-tested against it.
-            if let Some(buf) = &self.overlay_buf {
-                pass.set_pipeline(&self.overlay_pipeline);
-                pass.set_bind_group(0, &self.globals_bind, &[]);
-                pass.set_vertex_buffer(0, buf.slice(..));
-                pass.draw(0..self.overlay_vertex_count, 0..1);
+            if any_edges {
+                pass.set_pipeline(&self.edge_pipeline);
+                for (i, (id, _)) in draws.iter().enumerate() {
+                    let Some(mesh) = self.meshes.get(id) else { continue };
+                    if mesh.edge_index_count == 0 {
+                        continue;
+                    }
+                    pass.set_bind_group(1, &self.model_bind, &[(i as u32) * MODEL_STRIDE as u32]);
+                    pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+                    pass.set_index_buffer(mesh.edge_indices.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.draw_indexed(0..mesh.edge_index_count, 0, 0..1);
+                }
             }
 
-            // Draw-tool preview on top of everything (depth Always).
-            if let Some(buf) = &self.preview_line_buf {
-                pass.set_pipeline(&self.preview_line_pipeline);
-                pass.set_bind_group(0, &self.globals_bind, &[]);
-                pass.set_vertex_buffer(0, buf.slice(..));
-                pass.draw(0..self.preview_line_count, 0..1);
-            }
-            if let Some(buf) = &self.preview_tri_buf {
-                pass.set_pipeline(&self.preview_tri_pipeline);
-                pass.set_bind_group(0, &self.globals_bind, &[]);
-                pass.set_vertex_buffer(0, buf.slice(..));
-                pass.draw(0..self.preview_tri_count, 0..1);
+            // Overlays last: translucent geometry blended over the
+            // opaque scene, depth-tested against it.
+            for (pipeline, layer) in [
+                (&self.overlay_pipeline, &self.overlay),
+                (&self.grid_pipeline, &self.grid_lines),
+                (&self.plain_line_pipeline, &self.plain_lines),
+                // Draw-tool preview on top of everything (depth Always).
+                (&self.preview_line_pipeline, &self.preview_lines),
+                (&self.preview_tri_pipeline, &self.preview_tris),
+            ] {
+                if let Some(buf) = &layer.buf {
+                    pass.set_pipeline(pipeline);
+                    pass.set_bind_group(0, &self.globals_bind, &[]);
+                    pass.set_vertex_buffer(0, buf.slice(..));
+                    pass.draw(0..layer.count, 0..1);
+                }
             }
         }
         self.queue.submit([encoder.finish()]);
@@ -894,21 +1194,26 @@ impl Renderer {
     }
 }
 
-/// Background clear color (linear ~[0.090, 0.106, 0.133]); pre-encoded
-/// to sRGB when the surface format will not encode it in hardware.
-fn clear_color(gamma_encode: bool) -> wgpu::Color {
+/// Background clear color from linear RGB; pre-encoded to sRGB when the
+/// surface format will not encode it in hardware.
+fn clear_color(linear: [f64; 3], gamma_encode: bool) -> wgpu::Color {
     let encode = |v: f64| {
         if gamma_encode { v.powf(1.0 / 2.2) } else { v }
     };
     wgpu::Color {
-        r: encode(0.090),
-        g: encode(0.106),
-        b: encode(0.133),
+        r: encode(linear[0]),
+        g: encode(linear[1]),
+        b: encode(linear[2]),
         a: 1.0,
     }
 }
 
-fn create_depth(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureView {
+fn create_depth(
+    device: &wgpu::Device,
+    width: u32,
+    height: u32,
+    sample_count: u32,
+) -> wgpu::TextureView {
     device
         .create_texture(&wgpu::TextureDescriptor {
             label: Some("depth"),
@@ -918,7 +1223,7 @@ fn create_depth(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Texture
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
-            sample_count: 1,
+            sample_count,
             dimension: wgpu::TextureDimension::D2,
             format: DEPTH_FORMAT,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -927,26 +1232,53 @@ fn create_depth(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Texture
         .create_view(&wgpu::TextureViewDescriptor::default())
 }
 
+fn create_msaa(
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+    width: u32,
+    height: u32,
+    sample_count: u32,
+) -> Option<wgpu::TextureView> {
+    (sample_count > 1).then(|| {
+        device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("msaa color"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            })
+            .create_view(&wgpu::TextureViewDescriptor::default())
+    })
+}
+
 fn create_model_buffer(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
     capacity: u32,
 ) -> (wgpu::Buffer, wgpu::BindGroup) {
     let buf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("model matrices"),
+        label: Some("per-draw uniforms"),
         size: u64::from(capacity) * MODEL_STRIDE,
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
     let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("model bind"),
+        label: Some("per-draw bind"),
         layout,
         entries: &[wgpu::BindGroupEntry {
             binding: 0,
             resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                 buffer: &buf,
                 offset: 0,
-                size: wgpu::BufferSize::new(64),
+                size: wgpu::BufferSize::new(MODEL_SIZE),
             }),
         }],
     });

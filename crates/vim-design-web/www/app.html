@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport"
+        content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#eef0f3" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="description" content="VIM Design — author building elements in the browser." />
+  <title>VIM Design</title>
+  <link rel="icon"
+        href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%232f6fed'/%3E%3Cpath d='M6 15l10-6 10 6-10 6z' fill='white'/%3E%3Cpath d='M6 19l10 6 10-6' fill='none' stroke='white' stroke-width='2'/%3E%3C/svg%3E" />
+  <link rel="stylesheet" href="./app.css" />
+</head>
+<body>
+  <main id="stage">
+    <canvas id="view" aria-label="3D model view"></canvas>
+    <canvas id="hud" aria-hidden="true"></canvas>
+  </main>
+
+  <header id="topbar">
+    <div class="brand" aria-hidden="true">
+      <svg viewBox="0 0 32 32" width="26" height="26"><rect width="32" height="32" rx="8" fill="#2f6fed"/><path d="M6 15l10-6 10 6-10 6z" fill="#fff"/><path d="M6 19l10 6 10-6" fill="none" stroke="#fff" stroke-width="2"/></svg>
+      <span>VIM Design</span>
+    </div>
+    <button id="level-chip" class="chip" type="button" aria-haspopup="listbox" title="Active level">
+      <span class="swatch"></span>
+      <span class="chip-text"><span class="chip-name">—</span><span class="chip-elev"></span></span>
+      <svg class="ico sm" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></svg>
+    </button>
+    <div class="seg" id="view-toggle" role="tablist" aria-label="View">
+      <button type="button" data-view="plan" role="tab">Plan</button>
+      <button type="button" data-view="3d" role="tab">3D</button>
+    </div>
+    <div class="spacer"></div>
+    <button id="undo" class="icon-btn" type="button" title="Undo (Ctrl+Z)" aria-label="Undo">
+      <svg class="ico" viewBox="0 0 24 24"><path d="M9 14L4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 010 11H11"/></svg>
+    </button>
+    <button id="redo" class="icon-btn" type="button" title="Redo (Ctrl+Shift+Z)" aria-label="Redo">
+      <svg class="ico" viewBox="0 0 24 24"><path d="M15 14l5-5-5-5"/><path d="M20 9H9.5a5.5 5.5 0 000 11H13"/></svg>
+    </button>
+    <button id="menu-btn" class="icon-btn" type="button" title="Menu" aria-label="Menu">
+      <svg class="ico" viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
+    </button>
+  </header>
+
+  <div id="level-popover" class="popover" hidden role="listbox" aria-label="Levels"></div>
+
+  <nav id="toolbar" aria-label="Tools">
+    <button class="tool" type="button" data-tool="select" title="Select (V)">
+      <svg class="ico" viewBox="0 0 24 24"><path d="M5 3.5l13 6.2-5.6 1.7-2.2 5.8z"/><path d="M12.4 11.4l5.1 5.1"/></svg>
+      <span>Select</span>
+    </button>
+    <button class="tool" type="button" data-tool="plate" title="Floor plate (F)">
+      <svg class="ico" viewBox="0 0 24 24"><path d="M2.5 10.5L12 5.5l9.5 5-9.5 5z"/><path d="M2.5 10.5v3l9.5 5 9.5-5v-3"/></svg>
+      <span>Floor</span>
+    </button>
+    <button class="tool" type="button" data-tool="hole" title="Hole in a floor plate (H)">
+      <svg class="ico" viewBox="0 0 24 24"><path d="M2.5 10.5L12 5.5l9.5 5-9.5 5z"/><path d="M2.5 10.5v3l9.5 5 9.5-5v-3"/><path d="M9 10.4l3-1.6 3 1.6-3 1.6z" class="fill"/></svg>
+      <span>Hole</span>
+    </button>
+    <div class="tool-sep" aria-hidden="true"></div>
+    <button id="snap-toggle" class="tool toggle" type="button" title="Snapping" aria-pressed="true">
+      <svg class="ico" viewBox="0 0 24 24"><path d="M6 3v8a6 6 0 0012 0V3"/><path d="M6 7h3.5M14.5 7H18"/></svg>
+      <span>Snap</span>
+    </button>
+    <button id="fit-btn" class="tool" type="button" title="Zoom to fit (double-tap empty space)">
+      <svg class="ico" viewBox="0 0 24 24"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>
+      <span>Fit</span>
+    </button>
+  </nav>
+
+  <div id="hint" class="hint" hidden></div>
+
+  <section id="drawbar" hidden aria-label="Drawing">
+    <div class="drawbar-row">
+      <div class="seg small" id="shape-toggle" role="tablist" aria-label="Shape">
+        <button type="button" data-shape="polygon" title="Polygon">
+          <svg class="ico sm" viewBox="0 0 24 24"><path d="M5 18l-1-9 8-5 8 5-2 9z"/></svg>Polygon
+        </button>
+        <button type="button" data-shape="rect" title="Rectangle">
+          <svg class="ico sm" viewBox="0 0 24 24"><rect x="4" y="6" width="16" height="12" rx="1"/></svg>Rectangle
+        </button>
+      </div>
+      <label class="stepper" id="thickness-stepper" title="Thickness of new floor plates">
+        <span class="stepper-label">Thick</span>
+        <button type="button" data-step="-1" aria-label="Thinner">−</button>
+        <input id="thickness-input" type="text" inputmode="decimal" value="0.30" aria-label="Thickness (m)" />
+        <span class="unit">m</span>
+        <button type="button" data-step="1" aria-label="Thicker">+</button>
+      </label>
+    </div>
+    <div class="drawbar-row actions">
+      <button id="undo-point" class="act" type="button" title="Undo last point (Backspace)">
+        <svg class="ico sm" viewBox="0 0 24 24"><path d="M10 7L5 12l5 5"/><path d="M5 12h14"/></svg>
+        <span>Undo point</span>
+      </button>
+      <button id="cancel-draw" class="act" type="button" title="Cancel (Esc)">
+        <svg class="ico sm" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg>
+        <span>Cancel</span>
+      </button>
+      <button id="finish-draw" class="act primary" type="button" title="Finish (Enter)">
+        <svg class="ico sm" viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>
+        <span>Finish</span>
+      </button>
+    </div>
+    <div id="draw-reason" class="reason" aria-live="polite"></div>
+  </section>
+
+  <aside id="sheet" class="sheet" hidden aria-live="polite">
+    <div class="sheet-handle" aria-hidden="true"></div>
+    <div class="sheet-head">
+      <button id="sheet-back" class="icon-btn ghost" type="button" aria-label="Back" hidden>
+        <svg class="ico" viewBox="0 0 24 24"><path d="M15 6l-6 6 6 6"/></svg>
+      </button>
+      <h2 id="sheet-title"></h2>
+      <button id="sheet-close" class="icon-btn ghost" type="button" aria-label="Close">
+        <svg class="ico" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg>
+      </button>
+    </div>
+    <div id="sheet-body" class="sheet-body"></div>
+  </aside>
+
+  <div id="toasts" aria-live="polite"></div>
+
+  <div id="dialog-backdrop" hidden>
+    <div class="dialog" role="alertdialog" aria-modal="true" aria-labelledby="dialog-title">
+      <h3 id="dialog-title"></h3>
+      <p id="dialog-message"></p>
+      <div class="dialog-actions">
+        <button id="dialog-cancel" type="button" class="btn">Cancel</button>
+        <button id="dialog-ok" type="button" class="btn primary">OK</button>
+      </div>
+    </div>
+  </div>
+
+  <input type="file" id="import-input" accept=".vimd,application/octet-stream" hidden />
+
+  <div id="loading">
+    <div class="loading-card">
+      <svg viewBox="0 0 32 32" width="44" height="44"><rect width="32" height="32" rx="8" fill="#2f6fed"/><path d="M6 15l10-6 10 6-10 6z" fill="#fff"/><path d="M6 19l10 6 10-6" fill="none" stroke="#fff" stroke-width="2"/></svg>
+      <div class="loading-title">VIM Design</div>
+      <div id="loading-status" class="loading-status">Loading…</div>
+      <div class="loading-bar"><div></div></div>
+    </div>
+  </div>
+
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

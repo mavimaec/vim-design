@@ -1,0 +1,258 @@
+//! The authoring app's camera: a top-down orthographic PLAN view onto
+//! the active level, and a perspective 3D ORBIT view. Right-handed,
+//! Z-up. Camera state is session state: never in the document, never
+//! undoable.
+
+use glam::{Mat4, Vec3, Vec4};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewMode {
+    Plan,
+    Orbit,
+}
+
+impl ViewMode {
+    pub fn name(self) -> &'static str {
+        match self {
+            ViewMode::Plan => "plan",
+            ViewMode::Orbit => "3d",
+        }
+    }
+}
+
+/// Vertical field of view of the 3D view.
+const FOV_Y: f32 = 45.0 * std::f32::consts::PI / 180.0;
+/// Plan cut height above the active level (the architectural "cut
+/// plane"): geometry above it is clipped by the near plane, so upper
+/// floors never hide the level being drawn on.
+pub const PLAN_CUT_M: f32 = 1.2;
+/// Depth range below the plan cut.
+const PLAN_DEPTH_M: f32 = 400.0;
+const MIN_DISTANCE: f32 = 1.0;
+const MAX_DISTANCE: f32 = 600.0;
+const MIN_HALF_H: f32 = 0.5;
+const MAX_HALF_H: f32 = 400.0;
+
+#[derive(Debug, Clone)]
+pub struct Camera {
+    pub mode: ViewMode,
+    /// Orbit target / plan center (x, y). `z` follows the active plane.
+    pub target: Vec3,
+    pub yaw: f32,
+    pub pitch: f32,
+    pub distance: f32,
+    /// Plan view: half the visible height in meters.
+    pub plan_half_h: f32,
+    /// Elevation of the active construction plane.
+    pub plane_z: f32,
+}
+
+impl Default for Camera {
+    fn default() -> Self {
+        Self {
+            mode: ViewMode::Plan,
+            target: Vec3::ZERO,
+            yaw: -120f32.to_radians(),
+            pitch: 32f32.to_radians(),
+            distance: 28.0,
+            plan_half_h: 9.0,
+            plane_z: 0.0,
+        }
+    }
+}
+
+impl Camera {
+    fn orbit_dir(&self) -> Vec3 {
+        let (sy, cy) = self.yaw.sin_cos();
+        let (sp, cp) = self.pitch.sin_cos();
+        Vec3::new(cp * cy, cp * sy, sp)
+    }
+
+    fn orbit_target(&self) -> Vec3 {
+        Vec3::new(self.target.x, self.target.y, self.plane_z)
+    }
+
+    /// The 3D view's eye position.
+    pub fn eye(&self) -> Vec3 {
+        self.orbit_target() + self.distance * self.orbit_dir()
+    }
+
+    pub fn view_proj(&self, aspect: f32) -> Mat4 {
+        match self.mode {
+            ViewMode::Orbit => {
+                let target = self.orbit_target();
+                let eye = self.eye();
+                // Looking straight down makes Z-up degenerate as the up
+                // vector; the pitch clamp keeps us away from it.
+                let view = glam::camera::rh::view::look_at_mat4(eye, target, Vec3::Z);
+                let near = (self.distance * 0.01).max(0.05);
+                let far = self.distance * 40.0 + 200.0;
+                glam::camera::rh::proj::directx::perspective(FOV_Y, aspect, near, far) * view
+            }
+            ViewMode::Plan => {
+                let eye = Vec3::new(self.target.x, self.target.y, self.plane_z + PLAN_CUT_M);
+                let view = glam::camera::rh::view::look_at_mat4(eye, eye - Vec3::Z, Vec3::Y);
+                let hh = self.plan_half_h;
+                let hw = hh * aspect;
+                glam::camera::rh::proj::directx::orthographic(-hw, hw, -hh, hh, 0.0, PLAN_DEPTH_M)
+                    * view
+            }
+        }
+    }
+
+    /// Screen pixels per meter at the target (for grid density).
+    pub fn px_per_m(&self, height_px: f32) -> f32 {
+        let half_h = match self.mode {
+            ViewMode::Plan => self.plan_half_h,
+            ViewMode::Orbit => self.distance * (FOV_Y / 2.0).tan(),
+        };
+        height_px / (2.0 * half_h.max(1e-3))
+    }
+
+    /// Feature-edge nudge anchor and fraction (see the renderer).
+    pub fn edge_nudge(&self) -> ([f32; 3], f32) {
+        match self.mode {
+            ViewMode::Orbit => (self.eye().to_array(), 0.0015),
+            // A far point straight above: 1000 m * 5e-6 = 5 mm pull.
+            ViewMode::Plan => (
+                [self.target.x, self.target.y, self.plane_z + 1000.0],
+                5e-6,
+            ),
+        }
+    }
+
+    pub fn orbit(&mut self, dx: f32, dy: f32) {
+        if self.mode != ViewMode::Orbit {
+            return;
+        }
+        self.yaw -= dx * 0.0065;
+        self.pitch = (self.pitch + dy * 0.0065).clamp(-0.35, 1.53);
+    }
+
+    /// Zoom by `factor` (< 1 = in) keeping the plane point `anchor`
+    /// fixed on screen (zoom toward the cursor).
+    pub fn zoom(&mut self, factor: f32, anchor: Option<Vec3>) {
+        match self.mode {
+            ViewMode::Plan => {
+                let old = self.plan_half_h;
+                let new = (old * factor).clamp(MIN_HALF_H, MAX_HALF_H);
+                if let Some(a) = anchor {
+                    let k = new / old;
+                    self.target.x = a.x + (self.target.x - a.x) * k;
+                    self.target.y = a.y + (self.target.y - a.y) * k;
+                }
+                self.plan_half_h = new;
+            }
+            ViewMode::Orbit => {
+                let old = self.distance;
+                let new = (old * factor).clamp(MIN_DISTANCE, MAX_DISTANCE);
+                if let Some(a) = anchor {
+                    let k = new / old;
+                    self.target.x = a.x + (self.target.x - a.x) * k;
+                    self.target.y = a.y + (self.target.y - a.y) * k;
+                }
+                self.distance = new;
+            }
+        }
+    }
+
+    /// Translate the view so that the plane point under the previous
+    /// pointer lands under the current pointer.
+    pub fn pan_plane(&mut self, from: Vec3, to: Vec3) {
+        let d = from - to;
+        self.target.x += d.x;
+        self.target.y += d.y;
+    }
+
+    /// Screen-space pan fallback (the pointer is off the plane).
+    pub fn pan_pixels(&mut self, dx: f32, dy: f32, height_px: f32) {
+        let m_per_px = 1.0 / self.px_per_m(height_px);
+        let (right, up) = match self.mode {
+            ViewMode::Plan => (Vec3::X, Vec3::Y),
+            ViewMode::Orbit => {
+                let fwd = -self.orbit_dir();
+                let right = fwd.cross(Vec3::Z).normalize_or_zero();
+                let up = Vec3::new(fwd.x, fwd.y, 0.0).normalize_or_zero();
+                (right, up)
+            }
+        };
+        self.target -= right * dx * m_per_px;
+        self.target += up * dy * m_per_px;
+    }
+
+    /// Frame the world AABB.
+    pub fn fit(&mut self, min: Vec3, max: Vec3, aspect: f32) {
+        let center = (min + max) * 0.5;
+        self.target.x = center.x;
+        self.target.y = center.y;
+        let size = max - min;
+        let half_h = (size.y * 0.5).max(size.x * 0.5 / aspect.max(0.1)).max(1.0) * 1.25;
+        self.plan_half_h = half_h.clamp(MIN_HALF_H, MAX_HALF_H);
+        let radius = (size.length() * 0.5).max(2.0);
+        let fov = if aspect < 1.0 {
+            2.0 * ((FOV_Y / 2.0).tan() * aspect).atan()
+        } else {
+            FOV_Y
+        };
+        self.distance = (radius / (fov / 2.0).sin() * 1.05).clamp(MIN_DISTANCE, MAX_DISTANCE);
+    }
+
+    /// Switch views keeping the framing roughly continuous.
+    pub fn set_mode(&mut self, mode: ViewMode) {
+        if self.mode == mode {
+            return;
+        }
+        match mode {
+            ViewMode::Orbit => {
+                self.distance = (self.plan_half_h / (FOV_Y / 2.0).tan() * 1.1)
+                    .clamp(MIN_DISTANCE, MAX_DISTANCE);
+            }
+            ViewMode::Plan => {
+                self.plan_half_h =
+                    (self.distance * (FOV_Y / 2.0).tan()).clamp(MIN_HALF_H, MAX_HALF_H);
+            }
+        }
+        self.mode = mode;
+    }
+
+    /// Canvas pixel -> world ray (origin, unit direction).
+    pub fn ray(&self, px: f32, py: f32, w: f32, h: f32) -> Option<(Vec3, Vec3)> {
+        let ndc_x = px / w * 2.0 - 1.0;
+        let ndc_y = 1.0 - py / h * 2.0;
+        let inv = self.view_proj(w / h).inverse();
+        let near = inv * Vec4::new(ndc_x, ndc_y, 0.0, 1.0);
+        let far = inv * Vec4::new(ndc_x, ndc_y, 1.0, 1.0);
+        if near.w.abs() <= 1e-12 || far.w.abs() <= 1e-12 {
+            return None;
+        }
+        let a = near.truncate() / near.w;
+        let b = far.truncate() / far.w;
+        let dir = (b - a).normalize_or_zero();
+        (dir != Vec3::ZERO).then_some((a, dir))
+    }
+
+    /// Canvas pixel -> intersection with the horizontal plane z = `z`.
+    pub fn unproject_to_plane(&self, px: f32, py: f32, w: f32, h: f32, z: f32) -> Option<Vec3> {
+        let (o, d) = self.ray(px, py, w, h)?;
+        if d.z.abs() <= 1e-6 {
+            return None;
+        }
+        let t = (z - o.z) / d.z;
+        if t < 0.0 {
+            return None;
+        }
+        let hit = o + d * t;
+        // Reject grazing hits far beyond the horizon.
+        ((hit - o).length() < 5_000.0).then_some(hit)
+    }
+
+    /// World -> canvas pixels (None behind the camera).
+    pub fn project(&self, world: Vec3, w: f32, h: f32) -> Option<(f32, f32)> {
+        let clip = self.view_proj(w / h) * Vec4::new(world.x, world.y, world.z, 1.0);
+        if clip.w <= 1e-6 {
+            return None;
+        }
+        let ndc = clip / clip.w;
+        Some(((ndc.x * 0.5 + 0.5) * w, (0.5 - ndc.y * 0.5) * h))
+    }
+}

@@ -1,5 +1,5 @@
 // Playwright configuration for VimDesignWebTest.
-import { defineConfig } from "@playwright/test";
+import { defineConfig, devices } from "@playwright/test";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -7,6 +7,13 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(here, "..");
 const wwwDir = path.join(repoRoot, "crates", "vim-design-web", "www");
 const serverScript = path.join(repoRoot, "devops", "lib", "dev-server.mjs");
+
+// The authoring app specs (app-*.spec.js) run against the www/ checkout
+// served in the GitHub Pages layout (dev-server --pages-layout: no
+// COOP/COEP, single-threaded bundle as ./pkg/, app.html as the root) —
+// the same conditions as https://mavimaec.github.io/vim-design/.
+export const APP_URL = "http://localhost:8791/";
+const APP_SPECS = /app-.*\.spec\.js/;
 
 export default defineConfig({
   testDir: "./tests",
@@ -28,10 +35,32 @@ export default defineConfig({
     // the demo takes its WebGL2 (SwiftShader) fallback path, which
     // composites correctly. Real desktop browsers get WebGPU.
   },
-  webServer: {
-    command: `node "${serverScript}" "${wwwDir}" 8787`,
-    url: "http://localhost:8787/index.html",
-    reuseExistingServer: true,
-    timeout: 30_000,
-  },
+  projects: [
+    {
+      // Every spec (demo, probe, authoring app) at the default 1280x720.
+      name: "desktop",
+      use: { browserName: "chromium" },
+    },
+    {
+      // The authoring app on an emulated phone: touch input, DPR 2.6,
+      // 412x839 viewport.
+      name: "mobile",
+      testMatch: APP_SPECS,
+      use: { ...devices["Pixel 7"], browserName: "chromium" },
+    },
+  ],
+  webServer: [
+    {
+      command: `node "${serverScript}" "${wwwDir}" 8787`,
+      url: "http://localhost:8787/index.html",
+      reuseExistingServer: true,
+      timeout: 30_000,
+    },
+    {
+      command: `node "${serverScript}" "${wwwDir}" 8791 --pages-layout`,
+      url: APP_URL,
+      reuseExistingServer: true,
+      timeout: 30_000,
+    },
+  ],
 });

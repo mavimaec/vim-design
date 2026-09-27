@@ -1,6 +1,13 @@
-//! VimDesignWeb — the interactive rendered demo (wgpu) plus the WASM
-//! threading probe.
+//! VimDesignWeb — the authoring web app, the interactive rendered demo
+//! (wgpu), and the WASM threading probe.
 //!
+//! - `author` (wasm only): the [`author::AuthorApp`] behind `www/app.html`
+//!   — the mobile + desktop authoring single-page app (floor plates with
+//!   holes; the GitHub Pages site root).
+//! - `authoring` (native + wasm): the pure authoring layer both apps
+//!   share — document operations, element-model derivation, polygon
+//!   validation, snapping, sketch state; unit-tested natively.
+//! - `render` (wasm only): the shared wgpu renderer.
 //! - `demo` (wasm only): the [`demo::DemoApp`] behind `www/index.html` —
 //!   wgpu renderer (WebGPU, WebGL2 fallback), the four-object acceptance
 //!   scene authored through the real command API, sliders, undo/redo.
@@ -18,8 +25,15 @@
 
 use wasm_bindgen::prelude::*;
 
+pub mod authoring;
+pub mod gestures;
+
+#[cfg(target_arch = "wasm32")]
+pub mod author;
 #[cfg(target_arch = "wasm32")]
 pub mod demo;
+#[cfg(target_arch = "wasm32")]
+pub mod render;
 
 // Re-export so wasm-bindgen emits `initThreadPool` in the JS glue
 // (threaded builds only).
