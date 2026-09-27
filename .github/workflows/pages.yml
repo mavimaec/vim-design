@@ -1,0 +1,68 @@
+# Builds the authoring single-page app and deploys it to GitHub Pages
+# (https://mavimaec.github.io/vim-design/) on every push to develop.
+#
+# Gate: the Rust workspace tests must pass before the site deploys.
+# Bundle: single-threaded wasm only — GitHub Pages cannot send the COOP/COEP
+# headers that SharedArrayBuffer (wasm threads) requires.
+# Local equivalent: pwsh devops/vpages.ps1 -Serve
+
+name: Deploy authoring app to GitHub Pages
+
+on:
+  push:
+    branches: [develop]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deployment at a time; runs queued behind an in-progress run collapse to the latest.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            . -> target-wasm-st
+
+      - name: Install wasm-bindgen-cli (must match the pinned wasm-bindgen crate)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen@0.2.127
+
+      - name: Test gate (Rust workspace)
+        run: cargo test --workspace --locked
+
+      - name: Build site (dist/pages)
+        shell: pwsh
+        run: ./devops/vpages.ps1
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist/pages
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

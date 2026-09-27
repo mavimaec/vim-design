@@ -10,6 +10,24 @@ function Build-RustNative {
     Write-Ok "native build done (target/$Config; FFI header at crates/vim-design-ffi/include/vim_design.h)"
 }
 
+# Builds the stable, single-threaded wasm bundle -> crates/vim-design-web/www/pkg-st.
+# Used as the threaded build's fallback and as the GitHub Pages bundle (Pages
+# cannot send COOP/COEP headers, so SharedArrayBuffer/wasm threads are unavailable).
+function Build-WasmSingleThreaded {
+    $root = Get-RepoRoot
+    $pkgSt = Join-Path $root 'crates' 'vim-design-web' 'www' 'pkg-st'
+    Write-Info 'building single-threaded wasm (stable)...'
+    Invoke-Exec -File 'cargo' -WorkingDirectory $root -Arguments @(
+        'build', '-p', 'vim-design-web', '--release',
+        '--target', 'wasm32-unknown-unknown'
+    ) -Environment @{ CARGO_TARGET_DIR = 'target-wasm-st' }
+    Invoke-Exec -File 'wasm-bindgen' -WorkingDirectory $root -Arguments @(
+        '--target', 'web', '--out-dir', $pkgSt,
+        (Join-Path $root 'target-wasm-st' 'wasm32-unknown-unknown' 'release' 'vim_design_web.wasm')
+    )
+    Write-Ok 'single-threaded wasm bundle -> www/pkg-st'
+}
+
 # Builds BOTH wasm configurations of vim-design-web:
 #   1. threaded  -> crates/vim-design-web/www/pkg     (nightly, atomics, rayon)
 #   2. fallback  -> crates/vim-design-web/www/pkg-st  (stable, single-threaded)
@@ -25,16 +43,7 @@ function Build-Wasm {
     $pkgSt = Join-Path $www 'pkg-st'
 
     # --- single-threaded fallback (stable) ---
-    Write-Info 'building single-threaded fallback (stable)...'
-    Invoke-Exec -File 'cargo' -WorkingDirectory $root -Arguments @(
-        'build', '-p', 'vim-design-web', '--release',
-        '--target', 'wasm32-unknown-unknown'
-    ) -Environment @{ CARGO_TARGET_DIR = 'target-wasm-st' }
-    Invoke-Exec -File 'wasm-bindgen' -WorkingDirectory $root -Arguments @(
-        '--target', 'web', '--out-dir', $pkgSt,
-        (Join-Path $root 'target-wasm-st' 'wasm32-unknown-unknown' 'release' 'vim_design_web.wasm')
-    )
-    Write-Ok 'single-threaded wasm bundle -> www/pkg-st'
+    Build-WasmSingleThreaded
 
     # --- threaded (nightly + atomics + build-std) ---
     $threadedOk = $false

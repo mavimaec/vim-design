@@ -4,14 +4,17 @@
 // threads):  Cross-Origin-Opener-Policy: same-origin
 //            Cross-Origin-Embedder-Policy: require-corp
 //
-// Usage: node dev-server.mjs [rootDir] [port]
+// Usage: node dev-server.mjs [rootDir] [port] [--no-isolation]
+//   --no-isolation  omit COOP/COEP (mimics GitHub Pages: no SharedArrayBuffer)
 
 import http from "node:http";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 
-const root = path.resolve(process.argv[2] ?? "crates/vim-design-web/www");
-const port = Number(process.argv[3] ?? 8787);
+const positional = process.argv.slice(2).filter((a) => !a.startsWith("--"));
+const isolate = !process.argv.includes("--no-isolation");
+const root = path.resolve(positional[0] ?? "crates/vim-design-web/www");
+const port = Number(positional[1] ?? 8787);
 
 const MIME = {
   ".html": "text/html; charset=utf-8",
@@ -37,12 +40,15 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     const data = await fs.readFile(file);
-    res.writeHead(200, {
+    const headers = {
       "Content-Type": MIME[path.extname(file)] ?? "application/octet-stream",
-      "Cross-Origin-Opener-Policy": "same-origin",
-      "Cross-Origin-Embedder-Policy": "require-corp",
       "Cache-Control": "no-store",
-    });
+    };
+    if (isolate) {
+      headers["Cross-Origin-Opener-Policy"] = "same-origin";
+      headers["Cross-Origin-Embedder-Policy"] = "require-corp";
+    }
+    res.writeHead(200, headers);
     res.end(data);
   } catch (e) {
     res.writeHead(e.code === "ENOENT" ? 404 : 500, {
@@ -54,5 +60,9 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(port, () => {
   console.log(`vim-design dev server: http://localhost:${port}/ (root: ${root})`);
-  console.log("COOP/COEP headers enabled — SharedArrayBuffer available.");
+  console.log(
+    isolate
+      ? "COOP/COEP headers enabled — SharedArrayBuffer available."
+      : "COOP/COEP headers OFF (GitHub Pages mode) — single-threaded only."
+  );
 });
