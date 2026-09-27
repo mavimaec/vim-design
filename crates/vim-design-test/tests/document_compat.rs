@@ -9,17 +9,29 @@
 //! load it, evaluate it, and save it back to the SAME bytes (new enum
 //! variants are appended, so existing postcard variant indices stay put).
 //!
-//! `write_fixture` is the generator. It only writes when the environment
-//! variable `VIMD_WRITE_COMPAT_FIXTURE` is set; regenerate the fixture
-//! only on an intentional, announced format break.
+//! `fixtures/authoring_project_v2.vimd` was saved by the library as it
+//! was before the `Wall` and `Workplane` entity kinds existed: the same
+//! Site, levels, and walls with windows, and a floor plate that is a
+//! `Sketch` (two solid faces, a through void, a pocket void) instead of
+//! an extrusion.
+//!
+//! `write_fixture` / `write_fixture_v2` are the generators. They only
+//! write when the environment variable `VIMD_WRITE_COMPAT_FIXTURE` is
+//! set; regenerate a fixture only on an intentional, announced format
+//! break.
 
 use vim_design_lib::entity::slot;
 use vim_design_lib::eval::Engine;
+use vim_design_lib::sketch::{Sketch, SketchDirection, SketchFaceKind, ops};
 use vim_design_lib::{Command, Document, EntityId, EntityKind, Params};
 
 const FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/fixtures/authoring_project.vimd"
+);
+const FIXTURE_V2: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/fixtures/authoring_project_v2.vimd"
 );
 
 fn one(doc: &mut Document, cmd: Command) -> EntityId {
@@ -116,6 +128,58 @@ fn place_element(doc: &mut Document, name: &str, member: EntityId, level: Entity
 
 /// The authoring project, built with the commands the web app submits.
 fn build_project() -> Document {
+    let (mut doc, ground) = seed();
+    extrusion_plate(&mut doc, ground);
+    walls_with_windows(&mut doc, ground);
+    doc
+}
+
+/// The same project with the floor plate authored as a `Sketch`.
+fn build_project_v2() -> Document {
+    let (mut doc, ground) = seed();
+    let mut plate = Sketch::default();
+    for (outline, kind) in [
+        (
+            [[0.0, 0.0], [8.0, 0.0], [8.0, 6.0], [0.0, 6.0]],
+            SketchFaceKind::Solid { thickness: 0.3 },
+        ),
+        (
+            [[8.0, 0.0], [10.0, 0.0], [10.0, 3.0], [8.0, 3.0]],
+            SketchFaceKind::Solid { thickness: 0.2 },
+        ),
+        (
+            [[1.0, 1.0], [2.0, 1.0], [2.0, 2.0], [1.0, 2.0]],
+            SketchFaceKind::Void { depth: None },
+        ),
+        (
+            [[5.0, 3.0], [6.5, 3.0], [6.5, 4.0], [5.0, 4.0]],
+            SketchFaceKind::Void { depth: Some(0.1) },
+        ),
+    ] {
+        plate = ops::add_face(&plate, &outline, kind).expect("add_face");
+    }
+    let sketch = one(
+        &mut doc,
+        Command::CreateSketch {
+            plane: ground,
+            sketch: plate,
+            direction: SketchDirection::Below,
+        },
+    );
+    one(
+        &mut doc,
+        Command::CreateElement {
+            name: "Floor plate 1".to_owned(),
+            members: vec![sketch],
+            level: ground,
+        },
+    );
+    walls_with_windows(&mut doc, ground);
+    doc
+}
+
+/// Site and the two default levels; returns (document, Ground).
+fn seed() -> (Document, EntityId) {
     let mut doc = Document::new();
     one(
         &mut doc,
@@ -146,39 +210,43 @@ fn build_project() -> Document {
             extent_m: 10.0,
         },
     );
+    (doc, ground)
+}
 
+fn extrusion_plate(doc: &mut Document, ground: EntityId) {
+    let doc = &mut *doc;
     // Floor plate 8 x 6 m, 0.3 m thick (extruded downward), two holes.
     let outline = [[0.0, 0.0], [8.0, 0.0], [8.0, 6.0], [0.0, 6.0]];
     let outer = attached_loop(
-        &mut doc,
+        doc,
         ground,
         &outline.map(|[u, v]| [u, v, 0.0]),
     );
     let plate_face = one(
-        &mut doc,
+        doc,
         Command::CreateFace {
             outer,
             holes: vec![],
             plane: None,
         },
     );
-    let path = attached_path(&mut doc, ground, [0.0, 0.0, 0.0], [0.0, 0.0, -0.3]);
+    let path = attached_path(doc, ground, [0.0, 0.0, 0.0], [0.0, 0.0, -0.3]);
     let plate = one(
-        &mut doc,
+        doc,
         Command::CreateExtrusion {
             profile: plate_face,
             path,
         },
     );
-    place_element(&mut doc, "Floor plate 1", plate, ground);
+    place_element(doc, "Floor plate 1", plate, ground);
     let mut holes = Vec::new();
     for hole in [
         [[1.0, 1.0], [2.0, 1.0], [2.0, 2.0], [1.0, 2.0]],
         [[5.0, 3.0], [6.5, 3.0], [6.5, 4.0], [5.0, 4.0]],
     ] {
-        holes.push(attached_loop(&mut doc, ground, &hole.map(|[u, v]| [u, v, 0.0])));
+        holes.push(attached_loop(doc, ground, &hole.map(|[u, v]| [u, v, 0.0])));
         ok(
-            &mut doc,
+            doc,
             Command::UpdateFace {
                 id: plate_face,
                 outer: None,
@@ -189,6 +257,9 @@ fn build_project() -> Document {
         );
     }
 
+}
+
+fn walls_with_windows(doc: &mut Document, ground: EntityId) {
     // A closed wall run traced on the plate edge (CCW, grows inward),
     // 2.7 m high, 0.2 m thick, butt joins at the four convex corners:
     // each next segment's start is trimmed by the thickness.
@@ -204,7 +275,7 @@ fn build_project() -> Document {
         let start = [a[0] + d[0] * thickness, a[1] + d[1] * thickness];
         let end = b;
         let wire = attached_loop(
-            &mut doc,
+            doc,
             ground,
             &[
                 [start[0], start[1], 0.0],
@@ -214,7 +285,7 @@ fn build_project() -> Document {
             ],
         );
         let face = one(
-            &mut doc,
+            doc,
             Command::CreateFace {
                 outer: wire,
                 holes: vec![],
@@ -222,7 +293,7 @@ fn build_project() -> Document {
             },
         );
         let path = attached_path(
-            &mut doc,
+            doc,
             ground,
             [start[0], start[1], 0.0],
             [
@@ -231,8 +302,8 @@ fn build_project() -> Document {
                 0.0,
             ],
         );
-        let extrusion = one(&mut doc, Command::CreateExtrusion { profile: face, path });
-        place_element(&mut doc, &format!("Wall {}", i + 1), extrusion, ground);
+        let extrusion = one(doc, Command::CreateExtrusion { profile: face, path });
+        place_element(doc, &format!("Wall {}", i + 1), extrusion, ground);
         wall_faces.push((face, start, d));
     }
 
@@ -240,12 +311,12 @@ fn build_project() -> Document {
     for (face, start, d) in wall_faces.iter().take(2) {
         let at = |u: f64, v: f64| [start[0] + d[0] * u, start[1] + d[1] * u, v];
         let wire = attached_loop(
-            &mut doc,
+            doc,
             ground,
             &[at(2.0, 0.9), at(3.2, 0.9), at(3.2, 1.9), at(2.0, 1.9)],
         );
         ok(
-            &mut doc,
+            doc,
             Command::UpdateFace {
                 id: *face,
                 outer: None,
@@ -255,7 +326,6 @@ fn build_project() -> Document {
             },
         );
     }
-    doc
 }
 
 #[test]
@@ -266,6 +336,48 @@ fn write_fixture() {
     }
     let bytes = build_project().save().expect("save");
     std::fs::write(FIXTURE, bytes).expect("write fixture");
+}
+
+#[test]
+#[ignore = "generator: writes the fixture only when VIMD_WRITE_COMPAT_FIXTURE is set"]
+fn write_fixture_v2() {
+    if std::env::var_os("VIMD_WRITE_COMPAT_FIXTURE").is_none() {
+        return;
+    }
+    let bytes = build_project_v2().save().expect("save");
+    std::fs::write(FIXTURE_V2, bytes).expect("write fixture");
+}
+
+#[test]
+fn saved_sketch_project_loads_evaluates_and_resaves_identically() {
+    let bytes = std::fs::read(FIXTURE_V2).expect("read fixture");
+    let mut doc = Document::load(&bytes).expect("a saved project must still load");
+    doc.debug_validate().expect("loaded graph is consistent");
+    assert_eq!(
+        doc.save().expect("save"),
+        bytes,
+        "load -> save must reproduce the saved bytes"
+    );
+    let count = |kind: EntityKind| doc.entities().filter(|(_, r)| r.kind() == kind).count();
+    assert_eq!(count(EntityKind::Site), 1);
+    assert_eq!(count(EntityKind::Level), 2);
+    assert_eq!(count(EntityKind::Sketch), 1);
+    assert_eq!(count(EntityKind::Element), 5, "one plate + four walls");
+    let plate = doc
+        .entities()
+        .find_map(|(_, r)| match &r.params {
+            Params::Sketch { sketch, .. } => Some(sketch.clone()),
+            _ => None,
+        })
+        .expect("sketch plate");
+    assert_eq!(plate.faces.len(), 4);
+
+    let mut engine = Engine::new();
+    engine.evaluate_pending(&mut doc);
+    let updates = engine.poll_updates(&doc);
+    assert!(updates.errors.is_empty(), "{:?}", updates.errors);
+    assert_eq!(updates.meshes.len(), 5);
+    assert_eq!(build_project_v2().save().expect("save"), bytes, "generator reproduces it");
 }
 
 #[test]

@@ -61,6 +61,12 @@ pub enum VimStatus {
     /// finite and positive). `sketch::validate_structure` names the
     /// exact problem.
     InvalidSketch = 22,
+    /// A wall fails structural validation (a zero-length or non-finite
+    /// reference line, a height that is not finite and positive, a
+    /// non-finite top offset, an invalid profile, or a top-anchored
+    /// point that is not in the profile). `wall::validate_structure`
+    /// names the exact problem.
+    InvalidWall = 23,
 }
 
 impl VimStatus {

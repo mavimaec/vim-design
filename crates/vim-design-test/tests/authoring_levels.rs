@@ -160,7 +160,9 @@ fn level_evaluates_to_a_frame_and_never_owns_a_mesh() {
             x_axis,
             y_axis,
             z_axis,
+            level_offset,
         }) => {
+            assert_eq!(*level_offset, [0.0; 3], "a level is its own root");
             assert_eq!(*origin, [0.0, 0.0, 3.0]);
             assert_eq!(*x_axis, [1.0, 0.0, 0.0]);
             assert_eq!(*y_axis, [0.0, 1.0, 0.0]);

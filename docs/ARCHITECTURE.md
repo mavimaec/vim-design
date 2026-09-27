@@ -104,6 +104,20 @@ Plus two kinds from the authoring-tool direction (2026-08-23, see
   (`InvalidSketch`); geometric validity (a self-crossing loop, zero area) is a
   per-entity evaluation error. Prism faces are provenance-named from the stable
   sketch ids (`SketchSide`, `SketchCap`, §3.4).
+- **`Workplane`** — a construction plane nested under a level or another workplane
+  (slot 0 `parent`, required, accepts `Level` | `Workplane`); params `name`,
+  `offset_m`, `color`, `extent_m`. It evaluates to the parent frame moved `offset_m`
+  along the parent's normal; every `Frame` also carries its offset from the root level
+  (`level_offset`, summed along the chain) so level-local geometry never depends on the
+  root's elevation. Construction-plane slots (control point, sketch, wall) accept it;
+  element association stays level-only (the root level). See AUTHORING.md §10.
+- **`Wall`** — a reference line (`start`, `end`) on a base plane (slot 0, required) with
+  an optional top plane (slot 1), a fixed `height_m` or a top-plane constraint
+  (`top_offset_m`), and an elevation-profile `Sketch` whose `top_points` measure v from
+  the top reference. It evaluates like a sketch in the wall's vertical frame (u along
+  the line, v up, material to the left). Structural problems reject (`InvalidWall`);
+  a non-positive top reference or a self-crossing effective profile is a per-entity
+  evaluation error. See AUTHORING.md §10.
 
 > Note: `Element`/`Instance` commands (`CreateElement`, `CreateInstance`, …) extend the
 > command list in the requirements; they fall out of the performance requirement (§8 of

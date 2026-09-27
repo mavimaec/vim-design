@@ -5,6 +5,7 @@
 
 use proptest::prelude::*;
 use vim_design_lib::sketch::{Sketch, SketchDirection, SketchFaceKind, ops};
+use vim_design_lib::wall::{self, ops as wall_ops};
 use vim_design_lib::{Command, Document, EntityId, EntityKind, Params};
 
 /// Abstract operations; indexes are resolved against the entities that
@@ -33,6 +34,12 @@ enum Op {
     // topology operations, each stored with one UpdateSketch.
     CreateSketch { level: usize, x: i8, w: u8, h: u8, void: bool },
     EditSketch { pick: usize, op: u8, a: usize, b: usize, x: i8, coalesce: bool },
+    // Workplanes and walls: nested planes, walls with and without a top
+    // constraint, and random profile edits through the anchor-keeping
+    // wall operations.
+    CreateWorkplane { parent: usize, offset: i8 },
+    CreateWall { base: usize, top: Option<usize>, len: u8 },
+    EditWall { pick: usize, op: u8, a: usize, x: i8, coalesce: bool },
     UpdateLevelElevation { pick: usize, elevation: i16, coalesce: bool },
     AttachCp { cp: usize, level: usize, detach: bool },
     DeleteLevelCascade(usize),
@@ -73,7 +80,76 @@ fn op_strategy() -> impl Strategy<Value = Op> {
             .prop_map(|(level, x, w, h, void)| Op::CreateSketch { level, x, w, h, void }),
         4 => (any::<usize>(), 0u8..7, any::<usize>(), any::<usize>(), any::<i8>(), any::<bool>())
             .prop_map(|(pick, op, a, b, x, coalesce)| Op::EditSketch { pick, op, a, b, x, coalesce }),
+        1 => (any::<usize>(), any::<i8>())
+            .prop_map(|(parent, offset)| Op::CreateWorkplane { parent, offset }),
+        2 => (any::<usize>(), prop::option::of(any::<usize>()), 1u8..60)
+            .prop_map(|(base, top, len)| Op::CreateWall { base, top, len }),
+        3 => (any::<usize>(), 0u8..6, any::<usize>(), any::<i8>(), any::<bool>())
+            .prop_map(|(pick, op, a, x, coalesce)| Op::EditWall { pick, op, a, x, coalesce }),
     ]
+}
+
+/// Construction planes: levels and workplanes, ascending ids.
+fn planes(doc: &Document) -> Vec<EntityId> {
+    let mut ids = ids_of_kind(doc, EntityKind::Level);
+    ids.extend(ids_of_kind(doc, EntityKind::Workplane));
+    ids.sort_unstable();
+    ids
+}
+
+/// One random wall edit, or `None` when it does not apply.
+fn edit_wall(doc: &Document, id: EntityId, op: u8, a: usize, x: i8, coalesce: bool) -> Option<Command> {
+    let (profile, top_points) = match &doc.entity(id)?.params {
+        Params::Wall { profile, top_points, .. } => (profile.clone(), top_points.clone()),
+        _ => return None,
+    };
+    let height = wall::wall_top_height(doc, id)?;
+    let offset = f64::from(x) * 0.02;
+    let point = profile.points.get(a % profile.points.len().max(1)).map(|p| p.id);
+    let edited = match op {
+        0 => {
+            let all = vim_design_lib::sketch::edges(&profile);
+            let edge = all.get(a % all.len().max(1))?;
+            wall_ops::insert_point_on_edge(&profile, &top_points, height, edge.a, edge.b, 0.5)
+        }
+        1 => wall_ops::move_points(&profile, &top_points, height, &[point?], [offset, offset]),
+        2 => wall_ops::add_face(
+            &profile,
+            &top_points,
+            height,
+            &[[0.5, 0.5], [1.0, 0.5], [1.0, 1.0], [0.5, 1.0]],
+            SketchFaceKind::Void { depth: None },
+        ),
+        3 => wall_ops::set_anchor(&profile, &top_points, height, &[point?], a.is_multiple_of(2)),
+        4 => wall_ops::delete_points(&profile, &top_points, height, &[point?]),
+        _ => {
+            return Some(Command::UpdateWall {
+                id,
+                base: None,
+                top: None,
+                start: None,
+                end: None,
+                height_m: Some(1.0 + f64::from(x.unsigned_abs()) * 0.05),
+                top_offset_m: Some(offset),
+                profile: None,
+                top_points: None,
+                coalesce,
+            });
+        }
+    };
+    let (profile, top_points) = edited.ok()?;
+    Some(Command::UpdateWall {
+        id,
+        base: None,
+        top: None,
+        start: None,
+        end: None,
+        height_m: None,
+        top_offset_m: None,
+        profile: Some(profile),
+        top_points: Some(top_points),
+        coalesce,
+    })
 }
 
 fn stored_sketch(doc: &Document, id: EntityId) -> Option<Sketch> {
@@ -219,6 +295,8 @@ fn run_op(doc: &mut Document, op: &Op) {
                     Some(EntityKind::Circle) => Command::DeleteCircle { id },
                     Some(EntityKind::Extrusion) => Command::DeleteExtrusion { id },
                     Some(EntityKind::Sketch) => Command::DeleteSketch { id },
+                    Some(EntityKind::Wall) => Command::DeleteWall { id },
+                    Some(EntityKind::Workplane) => Command::DeleteWorkplane { id },
                     _ => fallback,
                 },
                 None => fallback,
@@ -275,6 +353,7 @@ fn run_op(doc: &mut Document, op: &Op) {
             let mut producers = ids_of_kind(doc, EntityKind::Extrusion);
             producers.extend(ids_of_kind(doc, EntityKind::Revolve));
             producers.extend(ids_of_kind(doc, EntityKind::Sketch));
+            producers.extend(ids_of_kind(doc, EntityKind::Wall));
             producers.sort_unstable();
             let levels = ids_of_kind(doc, EntityKind::Level);
             match (pick(&producers, *member), pick(&levels, *level)) {
@@ -330,6 +409,40 @@ fn run_op(doc: &mut Document, op: &Op) {
                 },
                 None => fallback,
             }
+        }
+        Op::CreateWorkplane { parent, offset } => match pick(&planes(doc), *parent) {
+            Some(parent) => Command::CreateWorkplane {
+                parent,
+                name: "wp".to_owned(),
+                offset_m: f64::from(*offset) * 0.05,
+                color: [0.5, 0.5, 0.5, 0.2],
+                extent_m: 5.0,
+            },
+            None => fallback,
+        },
+        Op::CreateWall { base, top, len } => {
+            let all = planes(doc);
+            let length = f64::from(*len) * 0.1;
+            let (profile, top_points) = wall::default_profile(length, 0.2);
+            match pick(&all, *base) {
+                Some(base) => Command::CreateWall {
+                    base,
+                    top: top.and_then(|t| pick(&all, t)),
+                    start: [0.0, 0.0],
+                    end: [length, 0.0],
+                    height_m: 2.7,
+                    top_offset_m: 0.0,
+                    profile,
+                    top_points,
+                },
+                None => fallback,
+            }
+        }
+        Op::EditWall { pick: p, op, a, x, coalesce } => {
+            let walls = ids_of_kind(doc, EntityKind::Wall);
+            pick(&walls, *p)
+                .and_then(|id| edit_wall(doc, id, *op, *a, *x, *coalesce))
+                .unwrap_or(fallback)
         }
         Op::DeleteElement { pick: p, sweep } => {
             let elements = ids_of_kind(doc, EntityKind::Element);

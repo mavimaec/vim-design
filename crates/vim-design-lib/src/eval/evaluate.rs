@@ -180,6 +180,7 @@ pub(crate) fn compute_spaces(
                 | EntityKind::Revolve
                 | EntityKind::Chamfer
                 | EntityKind::Sketch
+                | EntityKind::Wall
         )
     };
 
@@ -188,25 +189,20 @@ pub(crate) fn compute_spaces(
         for id in wave {
             let Some(record) = records.get(id) else { continue };
             let space = match record.kind() {
-                EntityKind::ControlPoint => {
-                    match record
-                        .inputs
-                        .get(slot::CONTROL_POINT_PLANE)
-                        .and_then(|s| s.referenced().next())
-                    {
-                        Some(level) => Space::Level(level),
-                        None => Space::World,
+                // Geometry on a construction plane lives in the space of
+                // the plane's root level (a workplane's offset is part of
+                // the level-local geometry).
+                EntityKind::ControlPoint => plane_space(graph, record, slot::CONTROL_POINT_PLANE),
+                EntityKind::Sketch => plane_space(graph, record, slot::SKETCH_PLANE),
+                // A wall constrained by a top plane depends on two planes:
+                // world space.
+                EntityKind::Wall => {
+                    if record.inputs.get(slot::WALL_TOP).is_some_and(|s| !s.is_empty()) {
+                        Space::World
+                    } else {
+                        plane_space(graph, record, slot::WALL_BASE)
                     }
                 }
-                // A sketch on a level lives in that level's space.
-                EntityKind::Sketch => match record
-                    .inputs
-                    .get(slot::SKETCH_PLANE)
-                    .and_then(|s| s.referenced().next())
-                {
-                    Some(level) => Space::Level(level),
-                    None => Space::World,
-                },
                 // An explicit Plane input anchors the entity to world
                 // coordinates (conservative disqualifier, documented).
                 EntityKind::Circle
@@ -308,6 +304,18 @@ pub(crate) fn compute_spaces(
     spaces
 }
 
+/// The space of an entity drawn on the plane wired into `slot`: the
+/// plane's root level, or world space when the slot is empty or the
+/// chain does not end at a level.
+fn plane_space(graph: &crate::graph::GraphState, record: &EntityRecord, slot_index: usize) -> Space {
+    record
+        .inputs
+        .get(slot_index)
+        .and_then(|s| s.referenced().next())
+        .and_then(|plane| crate::workplane::root_level_in(graph, plane))
+        .map_or(Space::World, Space::Level)
+}
+
 /// Cheap-and-exact value equality for the early cutoff. Plain-data
 /// variants compare exactly; kernel-handle variants (`Face`, `Solid`,
 /// `SolidSet`) are NOT comparable and always count as changed
@@ -331,14 +339,16 @@ fn value_equal(a: &Evaluated, b: &Evaluated) -> bool {
                 x_axis: ax,
                 y_axis: ay,
                 z_axis: az,
+                level_offset: al,
             },
             Evaluated::Frame {
                 origin: bo,
                 x_axis: bx,
                 y_axis: by,
                 z_axis: bz,
+                level_offset: bl,
             },
-        ) => ao == bo && ax == bx && ay == by && az == bz,
+        ) => ao == bo && ax == bx && ay == by && az == bz && al == bl,
         (
             Evaluated::Instance { element: ae, transform: at },
             Evaluated::Instance { element: be, transform: bt },
@@ -412,30 +422,33 @@ pub(crate) fn evaluate_waves(
                     return true;
                 }
                 let own_space = space_of(**id);
-                // Level-local evaluation reads a frame's axes, never its
-                // origin (the origin travels as the owner's base
-                // transform), so a frame that only moved does not
-                // re-evaluate consumers in its own space.
-                let frame_axes_unchanged = |input: EntityId| {
-                    let axes = |value: &Evaluated| match value {
+                // Level-local evaluation reads a frame's axes and its
+                // offset from the root level, never its world origin (the
+                // root origin travels as the owner's base transform). A
+                // frame that only moved with its root level therefore does
+                // not re-evaluate level-local consumers.
+                let frame_local_unchanged = |input: EntityId| {
+                    let local = |value: &Evaluated| match value {
                         Evaluated::Frame {
                             x_axis,
                             y_axis,
                             z_axis,
+                            level_offset,
                             ..
-                        } => Some((*x_axis, *y_axis, *z_axis)),
+                        } => Some((*x_axis, *y_axis, *z_axis, *level_offset)),
                         _ => None,
                     };
-                    let old = base.get(&input).and_then(|e| e.value.as_ref()).and_then(axes);
+                    let old = base.get(&input).and_then(|e| e.value.as_ref()).and_then(local);
                     let new = match fresh.get(&input) {
-                        Some(Ok(value)) => axes(value),
+                        Some(Ok(value)) => local(value),
                         _ => None,
                     };
                     old.is_some() && old == new
                 };
                 evaluation_inputs(record).into_iter().any(|input| {
                     if changed.contains(&input) {
-                        return !(own_space == Space::Level(input) && frame_axes_unchanged(input));
+                        return !(matches!(own_space, Space::Level(_))
+                            && frame_local_unchanged(input));
                     }
                     // Cross-space consumption: a level-local input is
                     // world-ified with the level's CURRENT origin, so a
@@ -691,10 +704,11 @@ pub(crate) fn evaluate_entity(
                         x_axis,
                         y_axis,
                         z_axis,
+                        level_offset,
                     } => {
                         let [u, v, w] = position;
                         let base = match own_space {
-                            Space::Level(_) => [0.0; 3],
+                            Space::Level(_) => *level_offset,
                             Space::World => *origin,
                         };
                         let point = [
@@ -1177,70 +1191,119 @@ pub(crate) fn evaluate_entity(
                 x_axis: [1.0, 0.0, 0.0],
                 y_axis: [0.0, 1.0, 0.0],
                 z_axis: [0.0, 0.0, 1.0],
+                level_offset: [0.0; 3],
             }),
             _ => Err(params_mismatch(record)),
         },
         EntityKind::Sketch => evaluate_sketch(record, lookup, own_space, tol),
+        EntityKind::Workplane => {
+            let offset = match &record.params {
+                Params::Workplane { offset_m, .. } => *offset_m,
+                _ => return Err(params_mismatch(record)),
+            };
+            if !offset.is_finite() {
+                return Err(diag(EvalErrorKind::Degenerate, "workplane offset is not finite"));
+            }
+            match require(lookup, single_id(record, slot::WORKPLANE_PARENT), "parent")? {
+                Evaluated::Frame {
+                    origin,
+                    x_axis,
+                    y_axis,
+                    z_axis,
+                    level_offset,
+                } => {
+                    let shift = |p: [f64; 3]| {
+                        [
+                            p[0] + offset * z_axis[0],
+                            p[1] + offset * z_axis[1],
+                            p[2] + offset * z_axis[2],
+                        ]
+                    };
+                    Ok(Evaluated::Frame {
+                        origin: shift(*origin),
+                        x_axis: *x_axis,
+                        y_axis: *y_axis,
+                        z_axis: *z_axis,
+                        level_offset: shift(*level_offset),
+                    })
+                }
+                other => Err(diag(
+                    EvalErrorKind::UpstreamError,
+                    format!("parent input evaluated to {other:?}, expected a frame"),
+                )),
+            }
+        }
+        EntityKind::Wall => evaluate_wall(record, lookup, own_space, tol),
     }
 }
 
-/// Evaluate a sketch into its prisms, in the plane's frame. In
-/// level-local space the frame origin is zero (the level elevation
-/// travels as the owner's base transform); in world space it is the
-/// frame's origin.
-///
-/// Prism faces are named from stable sketch ids: a lateral face by the
-/// sketch face and point pair of the boundary edge that sweeps it
-/// (`SketchSide`), a cap by its depth and facing (`SketchCap`).
-fn evaluate_sketch(
-    record: &EntityRecord,
+/// A construction-plane frame as the evaluating entity sees it: the
+/// origin is the level offset in level-local space and the world origin
+/// otherwise.
+struct PlaneFrame {
+    origin: [f64; 3],
+    world_origin: [f64; 3],
+    x_axis: [f64; 3],
+    y_axis: [f64; 3],
+    z_axis: [f64; 3],
+}
+
+fn plane_frame(
     lookup: &Lookup<'_>,
+    plane: Option<EntityId>,
+    what: &str,
     own_space: Space,
+) -> Result<PlaneFrame, EvalDiag> {
+    match require(lookup, plane, what)? {
+        Evaluated::Frame {
+            origin,
+            x_axis,
+            y_axis,
+            z_axis,
+            level_offset,
+        } => Ok(PlaneFrame {
+            origin: match own_space {
+                Space::Level(_) => *level_offset,
+                Space::World => *origin,
+            },
+            world_origin: *origin,
+            x_axis: *x_axis,
+            y_axis: *y_axis,
+            z_axis: *z_axis,
+        }),
+        other => Err(diag(
+            EvalErrorKind::UpstreamError,
+            format!("{what} input evaluated to {other:?}, expected a frame"),
+        )),
+    }
+}
+
+/// The prisms of a 2D profile placed in 3D: profile point (u, v) sits at
+/// `origin + u * x_axis + v * y_axis`, and material at depth d sits
+/// `d` along `depth_axis`. Faces are named from the profile's stable
+/// ids (`SketchSide`, `SketchCap`).
+fn profile_prisms(
+    owner: EntityId,
+    profile: &crate::sketch::Sketch,
+    origin: [f64; 3],
+    x_axis: [f64; 3],
+    y_axis: [f64; 3],
+    depth_axis: [f64; 3],
     tol: f64,
 ) -> Result<Evaluated, EvalDiag> {
-    use crate::sketch::SketchDirection;
     use crate::subref::ProvenancePath;
 
-    let (sketch, direction) = match &record.params {
-        Params::Sketch { sketch, direction } => (sketch, *direction),
-        _ => return Err(params_mismatch(record)),
-    };
-    let (origin, x_axis, y_axis, z_axis) =
-        match require(lookup, single_id(record, slot::SKETCH_PLANE), "plane")? {
-            Evaluated::Frame {
-                origin,
-                x_axis,
-                y_axis,
-                z_axis,
-            } => (*origin, *x_axis, *y_axis, *z_axis),
-            other => {
-                return Err(diag(
-                    EvalErrorKind::UpstreamError,
-                    format!("plane input evaluated to {other:?}, expected a frame"),
-                ));
-            }
-        };
-    let origin = match own_space {
-        Space::Level(_) => [0.0; 3],
-        Space::World => origin,
-    };
-    let sign = match direction {
-        SketchDirection::Below => -1.0,
-        SketchDirection::Above => 1.0,
-    };
     let at = |uv: [f64; 2], depth: f64| -> [f64; 3] {
         let [u, v] = uv;
-        let w = sign * depth;
         [
-            origin[0] + u * x_axis[0] + v * y_axis[0] + w * z_axis[0],
-            origin[1] + u * x_axis[1] + v * y_axis[1] + w * z_axis[1],
-            origin[2] + u * x_axis[2] + v * y_axis[2] + w * z_axis[2],
+            origin[0] + u * x_axis[0] + v * y_axis[0] + depth * depth_axis[0],
+            origin[1] + u * x_axis[1] + v * y_axis[1] + depth * depth_axis[1],
+            origin[2] + u * x_axis[2] + v * y_axis[2] + depth * depth_axis[2],
         ]
     };
     let depth_um = |depth: f64| (depth * 1.0e6).round() as i64;
-
-    let prisms = crate::sketch::layers::layered_prisms(sketch)
-        .map_err(|err| diag(EvalErrorKind::Degenerate, format!("sketch: {err}")))?;
+    let prisms = crate::sketch::layers::layered_prisms(profile)
+        .map_err(|err| diag(EvalErrorKind::Degenerate, format!("profile: {err}")))?;
     let mut solids = Vec::with_capacity(prisms.len());
     for prism in prisms {
         let loops: Vec<kernel::PrismLoop> = prism
@@ -1264,11 +1327,11 @@ fn evaluate_sketch(
         let Some((outer, holes)) = loops.split_first() else {
             continue;
         };
-        let depth_step = sign * (prism.bottom - prism.top);
+        let step = prism.bottom - prism.top;
         let extrude = [
-            depth_step * z_axis[0],
-            depth_step * z_axis[1],
-            depth_step * z_axis[2],
+            step * depth_axis[0],
+            step * depth_axis[1],
+            step * depth_axis[2],
         ];
         let solid = kernel::prism_solid(
             outer,
@@ -1285,9 +1348,107 @@ fn evaluate_sketch(
             tol,
         )
         .map_err(kernel_diag)?;
-        solids.push((record.id, solid, None));
+        solids.push((owner, solid, None));
     }
     Ok(Evaluated::SolidSet(solids))
+}
+
+/// Evaluate a sketch into its prisms, in its plane's frame. In
+/// level-local space the frame origin is the plane's offset from its
+/// root level (the root elevation travels as the owner's base
+/// transform); in world space it is the frame's origin.
+fn evaluate_sketch(
+    record: &EntityRecord,
+    lookup: &Lookup<'_>,
+    own_space: Space,
+    tol: f64,
+) -> Result<Evaluated, EvalDiag> {
+    use crate::sketch::SketchDirection;
+
+    let (sketch, direction) = match &record.params {
+        Params::Sketch { sketch, direction } => (sketch, *direction),
+        _ => return Err(params_mismatch(record)),
+    };
+    let frame = plane_frame(lookup, single_id(record, slot::SKETCH_PLANE), "plane", own_space)?;
+    let sign = match direction {
+        SketchDirection::Below => -1.0,
+        SketchDirection::Above => 1.0,
+    };
+    let z = frame.z_axis;
+    profile_prisms(
+        record.id,
+        sketch,
+        frame.origin,
+        frame.x_axis,
+        frame.y_axis,
+        [sign * z[0], sign * z[1], sign * z[2]],
+        tol,
+    )
+}
+
+/// Evaluate a wall: its effective elevation profile (top-anchored
+/// points raised to the top reference height) in the wall's vertical
+/// frame — u along the reference line from `start`, v along the base
+/// plane's normal — with material toward the left of start -> end.
+fn evaluate_wall(
+    record: &EntityRecord,
+    lookup: &Lookup<'_>,
+    own_space: Space,
+    tol: f64,
+) -> Result<Evaluated, EvalDiag> {
+    let (start, end, height_m, top_offset_m, profile, top_points) = match &record.params {
+        Params::Wall {
+            start,
+            end,
+            height_m,
+            top_offset_m,
+            profile,
+            top_points,
+        } => (*start, *end, *height_m, *top_offset_m, profile, top_points),
+        _ => return Err(params_mismatch(record)),
+    };
+    let base = plane_frame(lookup, single_id(record, slot::WALL_BASE), "base", own_space)?;
+    let height = match single_id(record, slot::WALL_TOP) {
+        Some(top_id) => {
+            let top = plane_frame(lookup, Some(top_id), "top", Space::World)?;
+            let rise = [
+                top.world_origin[0] - base.world_origin[0],
+                top.world_origin[1] - base.world_origin[1],
+                top.world_origin[2] - base.world_origin[2],
+            ];
+            kernel::dot(rise, base.z_axis) + top_offset_m
+        }
+        None => height_m,
+    };
+    if !(height.is_finite() && height > tol) {
+        return Err(diag(
+            EvalErrorKind::Degenerate,
+            format!("wall top reference is {height} m above its base (must be positive)"),
+        ));
+    }
+    let (du, dv) = (end[0] - start[0], end[1] - start[1]);
+    let length = (du * du + dv * dv).sqrt();
+    if !(length.is_finite() && length > tol) {
+        return Err(diag(EvalErrorKind::Degenerate, "wall reference line has no length"));
+    }
+    let (du, dv) = (du / length, dv / length);
+    let in_plane = |u: f64, v: f64| -> [f64; 3] {
+        [
+            u * base.x_axis[0] + v * base.y_axis[0],
+            u * base.x_axis[1] + v * base.y_axis[1],
+            u * base.x_axis[2] + v * base.y_axis[2],
+        ]
+    };
+    let along = in_plane(du, dv);
+    let left = in_plane(-dv, du);
+    let start_3d = in_plane(start[0], start[1]);
+    let origin = [
+        base.origin[0] + start_3d[0],
+        base.origin[1] + start_3d[1],
+        base.origin[2] + start_3d[2],
+    ];
+    let effective = crate::wall::effective_profile(profile, top_points, height);
+    profile_prisms(record.id, &effective, origin, along, base.z_axis, left, tol)
 }
 
 fn params_mismatch(record: &EntityRecord) -> EvalDiag {

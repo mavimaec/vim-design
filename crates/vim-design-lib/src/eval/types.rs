@@ -71,6 +71,11 @@ pub enum Evaluated {
         x_axis: [f64; 3],
         y_axis: [f64; 3],
         z_axis: [f64; 3],
+        /// The origin relative to the frame's root level: zero for a
+        /// level, the summed offsets for a workplane. Computed along the
+        /// parent chain (never by subtracting world origins), so it does
+        /// not change when only the root level moves.
+        level_offset: [f64; 3],
     },
 }
 

@@ -23,6 +23,8 @@ pub mod serialization;
 pub mod sketch;
 pub mod status;
 pub mod subref;
+pub mod wall;
+pub mod workplane;
 
 pub use command::{Command, CommandOutput};
 pub use delta::{Delta, SlotIdx, apply_delta};

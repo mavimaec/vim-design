@@ -43,6 +43,12 @@ pub enum EntityKind {
     /// A self-contained 2D profile on a construction plane that
     /// evaluates to prisms.
     Sketch,
+    /// A construction plane nested under a level or another workplane
+    /// (a ceiling plane, a sill plane).
+    Workplane,
+    /// A wall: a reference line on a construction plane and an editable
+    /// elevation profile, optionally height-constrained by a top plane.
+    Wall,
 }
 
 /// Per-kind parameters — a closed serde enum with one variant per
@@ -167,6 +173,30 @@ pub enum Params {
         sketch: Sketch,
         direction: SketchDirection,
     },
+    /// A construction plane offset `offset_m` meters along its parent
+    /// plane's normal. `color`/`extent_m` drive the display overlay only.
+    Workplane {
+        name: String,
+        offset_m: f64,
+        color: [f32; 4],
+        extent_m: f64,
+    },
+    /// A wall on its base plane. `start`/`end` is the reference line in
+    /// the base plane's (u, v); material grows to the left of
+    /// start -> end. `profile` is the elevation: u along the wall from
+    /// `start`, v up from the base plane; solid faces carry the wall
+    /// thickness, void faces are openings. Points listed in `top_points`
+    /// measure v from the top reference instead of the base. The top
+    /// reference is `height_m` above the base, or, when the top slot is
+    /// wired, the top plane raised by `top_offset_m`.
+    Wall {
+        start: [f64; 2],
+        end: [f64; 2],
+        height_m: f64,
+        top_offset_m: f64,
+        profile: Sketch,
+        top_points: Vec<u32>,
+    },
 }
 
 impl Params {
@@ -193,6 +223,8 @@ impl Params {
             Params::Site { .. } => EntityKind::Site,
             Params::Level { .. } => EntityKind::Level,
             Params::Sketch { .. } => EntityKind::Sketch,
+            Params::Workplane { .. } => EntityKind::Workplane,
+            Params::Wall { .. } => EntityKind::Wall,
         }
     }
 }
@@ -277,9 +309,41 @@ pub mod slot {
     pub const INSTANCE_ELEMENT: usize = 0;
     pub const SELECTION_SCOPE: usize = 0;
     pub const SKETCH_PLANE: usize = 0;
+    pub const WORKPLANE_PARENT: usize = 0;
+    pub const WALL_BASE: usize = 0;
+    pub const WALL_TOP: usize = 1;
 }
 
 const NO_SLOTS: &[SlotDecl] = &[];
+
+/// Kinds that evaluate to a construction-plane frame.
+const CONSTRUCTION_PLANES: &[EntityKind] = &[EntityKind::Level, EntityKind::Workplane];
+
+// A workplane hangs from a level or another workplane; the graph's
+// cycle check keeps parent chains acyclic.
+const WORKPLANE_SLOTS: &[SlotDecl] = &[SlotDecl {
+    name: "parent",
+    accepted: CONSTRUCTION_PLANES,
+    required: true,
+    multi: false,
+}];
+
+const WALL_SLOTS: &[SlotDecl] = &[
+    SlotDecl {
+        name: "base",
+        accepted: CONSTRUCTION_PLANES,
+        required: true,
+        multi: false,
+    },
+    // When wired, the wall's top reference is this plane (plus the
+    // wall's top offset) instead of the fixed height.
+    SlotDecl {
+        name: "top",
+        accepted: CONSTRUCTION_PLANES,
+        required: false,
+        multi: false,
+    },
+];
 
 // A control point may attach to a construction plane: its stored
 // coordinates are then (u, v, w) in the plane's evaluated Frame
@@ -289,7 +353,7 @@ const NO_SLOTS: &[SlotDecl] = &[];
 // widens.
 const CONTROL_POINT_SLOTS: &[SlotDecl] = &[SlotDecl {
     name: "plane",
-    accepted: &[EntityKind::Level],
+    accepted: CONSTRUCTION_PLANES,
     required: false,
     multi: false,
 }];
@@ -460,6 +524,7 @@ const ELEMENT_SLOTS: &[SlotDecl] = &[
             EntityKind::Revolve,
             EntityKind::Chamfer,
             EntityKind::Sketch,
+            EntityKind::Wall,
         ],
         required: true,
         multi: true,
@@ -508,6 +573,8 @@ const ANY_KIND: &[EntityKind] = &[
     EntityKind::Site,
     EntityKind::Level,
     EntityKind::Sketch,
+    EntityKind::Workplane,
+    EntityKind::Wall,
 ];
 
 // Mirror of the explicit scope ids in `Params::Selection::scope`
@@ -531,7 +598,7 @@ const SELECTION_SLOTS: &[SlotDecl] = &[SlotDecl {
 // point for future frame-producing kinds; acceptance only widens.
 const SKETCH_SLOTS: &[SlotDecl] = &[SlotDecl {
     name: "plane",
-    accepted: &[EntityKind::Level],
+    accepted: CONSTRUCTION_PLANES,
     required: true,
     multi: false,
 }];
@@ -547,6 +614,8 @@ pub fn slots(kind: EntityKind) -> &'static [SlotDecl] {
         | EntityKind::Level => NO_SLOTS,
         EntityKind::Selection => SELECTION_SLOTS,
         EntityKind::Sketch => SKETCH_SLOTS,
+        EntityKind::Workplane => WORKPLANE_SLOTS,
+        EntityKind::Wall => WALL_SLOTS,
         EntityKind::ControlPoint => CONTROL_POINT_SLOTS,
         EntityKind::Circle => CIRCLE_SLOTS,
         EntityKind::Line => LINE_SLOTS,
@@ -651,6 +720,8 @@ mod tests {
         EntityKind::Site,
         EntityKind::Level,
         EntityKind::Sketch,
+        EntityKind::Workplane,
+        EntityKind::Wall,
     ];
 
     #[test]

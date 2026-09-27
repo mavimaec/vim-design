@@ -455,7 +455,8 @@ impl Engine {
                 | EntityKind::Revolve
                 | EntityKind::Solid
                 | EntityKind::Chamfer
-                | EntityKind::Sketch => !consumed.contains(id),
+                | EntityKind::Sketch
+                | EntityKind::Wall => !consumed.contains(id),
                 _ => false,
             })
             .map(|(id, _)| *id)

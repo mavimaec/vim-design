@@ -466,6 +466,65 @@ pub enum Command {
     DeleteSketch {
         id: EntityId,
     },
+    // -- Workplane --------------------------------------------------------
+    /// Create a construction plane `offset_m` meters along its parent's
+    /// normal (the parent is a level or another workplane). Rejected with
+    /// `InvalidCommand` for a non-finite offset.
+    CreateWorkplane {
+        parent: EntityId,
+        name: String,
+        offset_m: f64,
+        color: [f32; 4],
+        extent_m: f64,
+    },
+    /// Update a workplane; `parent` rewires it (the cycle check rejects
+    /// a parent inside its own subtree).
+    UpdateWorkplane {
+        id: EntityId,
+        parent: Option<EntityId>,
+        name: Option<String>,
+        offset_m: Option<f64>,
+        color: Option<[f32; 4]>,
+        extent_m: Option<f64>,
+        coalesce: bool,
+    },
+    /// Delete a workplane (rejected while anything depends on it).
+    DeleteWorkplane {
+        id: EntityId,
+    },
+    // -- Wall -------------------------------------------------------------
+    /// Create a wall on `base`, optionally height-constrained by `top`.
+    /// Rejected with `InvalidWall` when structurally invalid; geometric
+    /// problems (a self-crossing effective profile, a top reference at
+    /// or below the base) are per-entity evaluation errors.
+    CreateWall {
+        base: EntityId,
+        top: Option<EntityId>,
+        start: [f64; 2],
+        end: [f64; 2],
+        height_m: f64,
+        top_offset_m: f64,
+        profile: Sketch,
+        top_points: Vec<u32>,
+    },
+    /// Update a wall: every field is optional; `top: Some(None)` removes
+    /// the top constraint. The merged result is validated like a create.
+    /// One undo step; coalesced updates merge a drag.
+    UpdateWall {
+        id: EntityId,
+        base: Option<EntityId>,
+        top: Option<Option<EntityId>>,
+        start: Option<[f64; 2]>,
+        end: Option<[f64; 2]>,
+        height_m: Option<f64>,
+        top_offset_m: Option<f64>,
+        profile: Option<Sketch>,
+        top_points: Option<Vec<u32>>,
+        coalesce: bool,
+    },
+    DeleteWall {
+        id: EntityId,
+    },
 }
 
 /// Serde default for `DeleteElement::sweep_orphans` — sweeping is the
@@ -554,6 +613,12 @@ impl Command {
             Command::CreateSketch { .. } => "CreateSketch",
             Command::UpdateSketch { .. } => "UpdateSketch",
             Command::DeleteSketch { .. } => "DeleteSketch",
+            Command::CreateWorkplane { .. } => "CreateWorkplane",
+            Command::UpdateWorkplane { .. } => "UpdateWorkplane",
+            Command::DeleteWorkplane { .. } => "DeleteWorkplane",
+            Command::CreateWall { .. } => "CreateWall",
+            Command::UpdateWall { .. } => "UpdateWall",
+            Command::DeleteWall { .. } => "DeleteWall",
         }
     }
 
@@ -582,6 +647,8 @@ impl Command {
             | Command::UpdateSelection { id, coalesce, .. }
             | Command::UpdateSite { id, coalesce, .. }
             | Command::UpdateSketch { id, coalesce, .. }
+            | Command::UpdateWorkplane { id, coalesce, .. }
+            | Command::UpdateWall { id, coalesce, .. }
             | Command::UpdateLevel { id, coalesce, .. } => (*coalesce, *id),
             Command::UpdateCylinder {
                 extrusion, coalesce, ..
@@ -1487,6 +1554,159 @@ fn run(ctx: &mut Ctx<'_>, command: &Command) -> Result<(), VimStatus> {
             )
         }
         Command::DeleteSketch { id } => ctx.delete(*id, EntityKind::Sketch),
+
+        // -- Workplane -----------------------------------------------------
+        Command::CreateWorkplane {
+            parent,
+            name,
+            offset_m,
+            color,
+            extent_m,
+        } => {
+            if !offset_m.is_finite() {
+                return Err(VimStatus::InvalidCommand);
+            }
+            ctx.create(
+                Params::Workplane {
+                    name: name.clone(),
+                    offset_m: *offset_m,
+                    color: *color,
+                    extent_m: *extent_m,
+                },
+                vec![SlotValue::One(Some(*parent))],
+            )?;
+            Ok(())
+        }
+        Command::UpdateWorkplane {
+            id,
+            parent,
+            name,
+            offset_m,
+            color,
+            extent_m,
+            ..
+        } => {
+            let record = ctx.expect_kind(*id, EntityKind::Workplane)?;
+            let params = match record.params {
+                Params::Workplane {
+                    name: old_name,
+                    offset_m: old_offset,
+                    color: old_color,
+                    extent_m: old_extent,
+                } => Params::Workplane {
+                    name: name.clone().unwrap_or(old_name),
+                    offset_m: offset_m.unwrap_or(old_offset),
+                    color: color.unwrap_or(old_color),
+                    extent_m: extent_m.unwrap_or(old_extent),
+                },
+                _ => return Err(VimStatus::ParamsKindMismatch),
+            };
+            if matches!(params, Params::Workplane { offset_m, .. } if !offset_m.is_finite()) {
+                return Err(VimStatus::InvalidCommand);
+            }
+            if let Some(parent) = parent {
+                ctx.rewire(*id, slot::WORKPLANE_PARENT, SlotValue::One(Some(*parent)))?;
+            }
+            ctx.set_params(*id, params)
+        }
+        Command::DeleteWorkplane { id } => ctx.delete(*id, EntityKind::Workplane),
+
+        // -- Wall ----------------------------------------------------------
+        Command::CreateWall {
+            base,
+            top,
+            start,
+            end,
+            height_m,
+            top_offset_m,
+            profile,
+            top_points,
+        } => {
+            let top_points = canonical_ids(top_points);
+            crate::wall::validate_structure(
+                *start,
+                *end,
+                *height_m,
+                *top_offset_m,
+                profile,
+                &top_points,
+            )
+            .map_err(|_| VimStatus::InvalidWall)?;
+            ctx.create(
+                Params::Wall {
+                    start: *start,
+                    end: *end,
+                    height_m: *height_m,
+                    top_offset_m: *top_offset_m,
+                    profile: profile.clone(),
+                    top_points,
+                },
+                vec![SlotValue::One(Some(*base)), SlotValue::One(*top)],
+            )?;
+            Ok(())
+        }
+        Command::UpdateWall {
+            id,
+            base,
+            top,
+            start,
+            end,
+            height_m,
+            top_offset_m,
+            profile,
+            top_points,
+            ..
+        } => {
+            let record = ctx.expect_kind(*id, EntityKind::Wall)?;
+            let params = match record.params {
+                Params::Wall {
+                    start: old_start,
+                    end: old_end,
+                    height_m: old_height,
+                    top_offset_m: old_offset,
+                    profile: old_profile,
+                    top_points: old_top,
+                } => Params::Wall {
+                    start: start.unwrap_or(old_start),
+                    end: end.unwrap_or(old_end),
+                    height_m: height_m.unwrap_or(old_height),
+                    top_offset_m: top_offset_m.unwrap_or(old_offset),
+                    profile: profile.clone().unwrap_or(old_profile),
+                    top_points: top_points
+                        .as_ref()
+                        .map(|ids| canonical_ids(ids))
+                        .unwrap_or(old_top),
+                },
+                _ => return Err(VimStatus::ParamsKindMismatch),
+            };
+            if let Params::Wall {
+                start,
+                end,
+                height_m,
+                top_offset_m,
+                profile,
+                top_points,
+            } = &params
+            {
+                crate::wall::validate_structure(
+                    *start,
+                    *end,
+                    *height_m,
+                    *top_offset_m,
+                    profile,
+                    top_points,
+                )
+                .map_err(|_| VimStatus::InvalidWall)?;
+            }
+            if let Some(base) = base {
+                ctx.rewire(*id, slot::WALL_BASE, SlotValue::One(Some(*base)))?;
+            }
+            if let Some(top) = top {
+                ctx.rewire(*id, slot::WALL_TOP, SlotValue::One(*top))?;
+            }
+            ctx.set_params(*id, params)
+        }
+        Command::DeleteWall { id } => ctx.delete(*id, EntityKind::Wall),
     }
 }
 
@@ -1568,6 +1788,14 @@ fn upsert_assignment(
     list
 }
 
+/// Sorted, deduplicated ids (deterministic params).
+fn canonical_ids(ids: &[u32]) -> Vec<u32> {
+    let mut ids = ids.to_vec();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
 /// The graph-edge mirror of a selection scope: explicit ids for
 /// `Entities`/`Element` scopes (sorted, deduplicated), empty for
 /// `Global` (the sanctioned implicit dependency, docs/ARCHITECTURE.md
@@ -1604,6 +1832,7 @@ fn sweepable(kind: EntityKind) -> bool {
             | EntityKind::Solid
             | EntityKind::Chamfer
             | EntityKind::Sketch
+            | EntityKind::Wall
     )
 }
 

@@ -232,6 +232,26 @@
 //! (translation factoring): a level elevation edit re-places the owner
 //! with a base transform and re-evaluates nothing.
 //!
+//! # Workplanes and walls
+//!
+//! A `Workplane` evaluates to its parent's frame moved along the
+//! parent's normal. Every [`Evaluated::Frame`] carries `level_offset`,
+//! its origin relative to its root level summed along the parent chain.
+//! Geometry on any construction plane lives in the space of the plane's
+//! ROOT level and uses `level_offset` as its local origin, so dragging
+//! the root level re-places owners with base transforms only; a frame
+//! whose axes and level offset did not change does not re-evaluate
+//! level-local consumers.
+//!
+//! A `Wall` evaluates to an [`Evaluated::SolidSet`] of prisms, owned by
+//! the wall: its effective profile (top-anchored points raised to the
+//! top reference height) placed in the wall's vertical frame, with the
+//! same layered algorithm and provenance names as sketches. A wall with
+//! only a base plane is level-local; a wall with a top plane is
+//! evaluated in world space, so moving either plane re-evaluates it. A
+//! top reference at or below the base is a per-entity
+//! [`EvalErrorKind::Degenerate`] error.
+//!
 //! # Chamfer
 //!
 //! A `Chamfer` blends edges of its `target` producer via
