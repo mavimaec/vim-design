@@ -188,6 +188,50 @@
 //! provenance, not by face index (the anti-topological-naming rule).
 //! Chamfers render their target's paints; blend faces get the default.
 //!
+//! # Sketches
+//!
+//! A `Sketch` entity (see [`crate::sketch`]) evaluates to an
+//! [`Evaluated::SolidSet`] of prisms, all tagged with the sketch's id. It
+//! is a solid producer for mesh ownership: an element member, or a
+//! standalone owner when no element wraps it. Material hangs from the
+//! plane on the `direction` side; at each point of the plane the solid
+//! depth is the thickest solid face covering it and the removed depth is
+//! the deepest void covering it (a void without depth removes
+//! everything). Each distinct thickness or depth is a layer boundary; a
+//! layer's footprint is the union of the solid faces thick enough for it
+//! minus the union of the voids deep enough for it, and each footprint
+//! polygon becomes a prism for that layer. A polygon that repeats
+//! unchanged in the next layer extends its prism, so a plain plate is
+//! one prism. Stacked prisms touch along internal faces; the element's
+//! mesh is their union (its volume is exact, but it is not one closed
+//! shell where layers meet).
+//!
+//! A sketch with no material left (only voids, or voids that remove
+//! every solid) has no mesh: its owner's mesh is tombstoned, and no
+//! error is reported. A face loop that crosses itself or has no area is
+//! a per-entity [`EvalErrorKind::Degenerate`] error on the sketch (the
+//! last good mesh stays).
+//!
+//! Provenance of sketch prisms is named from sketch-local ids, which are
+//! stable across edits:
+//! - a lateral face is `SketchSide { face, a, b }`: the boundary edge
+//!   between sketch points `a < b` of sketch face `face` that sweeps it.
+//!   When several sketch edges carry the same boundary (a solid and a
+//!   void sharing an edge), the name comes from a face that is active in
+//!   that layer, solid faces before voids, then the lowest face id;
+//! - a cap is `SketchCap { depth_um, toward_plane }`: its depth from the
+//!   plane in micrometers, and whether it faces the plane (the top of a
+//!   floor plate) or away from it. Caps at one depth and facing share the
+//!   name.
+//!
+//! `Engine::resolve_subref` resolves these names across all prisms of a
+//! sketch owner. Provenance queries (`SubRefSet`) do not expand on sketch
+//! output.
+//!
+//! A sketch on a level evaluates in that level's local space
+//! (translation factoring): a level elevation edit re-places the owner
+//! with a base transform and re-evaluates nothing.
+//!
 //! # Chamfer
 //!
 //! A `Chamfer` blends edges of its `target` producer via

@@ -55,6 +55,12 @@ pub enum VimStatus {
     /// enforced at the delta gate, so composites and speculative apply
     /// cannot smuggle one in (docs/AUTHORING.md §1).
     SingletonExists = 21,
+    /// A sketch fails structural validation (duplicate ids, a loop that
+    /// references a missing point or has fewer than three distinct
+    /// points, a non-finite coordinate, a thickness or depth that is not
+    /// finite and positive). `sketch::validate_structure` names the
+    /// exact problem.
+    InvalidSketch = 22,
 }
 
 impl VimStatus {

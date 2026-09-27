@@ -179,6 +179,7 @@ pub(crate) fn compute_spaces(
                 | EntityKind::Extrusion
                 | EntityKind::Revolve
                 | EntityKind::Chamfer
+                | EntityKind::Sketch
         )
     };
 
@@ -197,6 +198,15 @@ pub(crate) fn compute_spaces(
                         None => Space::World,
                     }
                 }
+                // A sketch on a level lives in that level's space.
+                EntityKind::Sketch => match record
+                    .inputs
+                    .get(slot::SKETCH_PLANE)
+                    .and_then(|s| s.referenced().next())
+                {
+                    Some(level) => Space::Level(level),
+                    None => Space::World,
+                },
                 // An explicit Plane input anchors the entity to world
                 // coordinates (conservative disqualifier, documented).
                 EntityKind::Circle
@@ -402,9 +412,30 @@ pub(crate) fn evaluate_waves(
                     return true;
                 }
                 let own_space = space_of(**id);
+                // Level-local evaluation reads a frame's axes, never its
+                // origin (the origin travels as the owner's base
+                // transform), so a frame that only moved does not
+                // re-evaluate consumers in its own space.
+                let frame_axes_unchanged = |input: EntityId| {
+                    let axes = |value: &Evaluated| match value {
+                        Evaluated::Frame {
+                            x_axis,
+                            y_axis,
+                            z_axis,
+                            ..
+                        } => Some((*x_axis, *y_axis, *z_axis)),
+                        _ => None,
+                    };
+                    let old = base.get(&input).and_then(|e| e.value.as_ref()).and_then(axes);
+                    let new = match fresh.get(&input) {
+                        Some(Ok(value)) => axes(value),
+                        _ => None,
+                    };
+                    old.is_some() && old == new
+                };
                 evaluation_inputs(record).into_iter().any(|input| {
                     if changed.contains(&input) {
-                        return true;
+                        return !(own_space == Space::Level(input) && frame_axes_unchanged(input));
                     }
                     // Cross-space consumption: a level-local input is
                     // world-ified with the level's CURRENT origin, so a
@@ -978,6 +1009,8 @@ pub(crate) fn evaluate_entity(
                     Evaluated::Solid { solid, material } => {
                         members.push((id, solid.clone(), *material));
                     }
+                    // A sketch member contributes all of its prisms.
+                    Evaluated::SolidSet(prisms) => members.extend(prisms.iter().cloned()),
                     other => {
                         return Err(diag(
                             EvalErrorKind::UpstreamError,
@@ -1147,7 +1180,114 @@ pub(crate) fn evaluate_entity(
             }),
             _ => Err(params_mismatch(record)),
         },
+        EntityKind::Sketch => evaluate_sketch(record, lookup, own_space, tol),
     }
+}
+
+/// Evaluate a sketch into its prisms, in the plane's frame. In
+/// level-local space the frame origin is zero (the level elevation
+/// travels as the owner's base transform); in world space it is the
+/// frame's origin.
+///
+/// Prism faces are named from stable sketch ids: a lateral face by the
+/// sketch face and point pair of the boundary edge that sweeps it
+/// (`SketchSide`), a cap by its depth and facing (`SketchCap`).
+fn evaluate_sketch(
+    record: &EntityRecord,
+    lookup: &Lookup<'_>,
+    own_space: Space,
+    tol: f64,
+) -> Result<Evaluated, EvalDiag> {
+    use crate::sketch::SketchDirection;
+    use crate::subref::ProvenancePath;
+
+    let (sketch, direction) = match &record.params {
+        Params::Sketch { sketch, direction } => (sketch, *direction),
+        _ => return Err(params_mismatch(record)),
+    };
+    let (origin, x_axis, y_axis, z_axis) =
+        match require(lookup, single_id(record, slot::SKETCH_PLANE), "plane")? {
+            Evaluated::Frame {
+                origin,
+                x_axis,
+                y_axis,
+                z_axis,
+            } => (*origin, *x_axis, *y_axis, *z_axis),
+            other => {
+                return Err(diag(
+                    EvalErrorKind::UpstreamError,
+                    format!("plane input evaluated to {other:?}, expected a frame"),
+                ));
+            }
+        };
+    let origin = match own_space {
+        Space::Level(_) => [0.0; 3],
+        Space::World => origin,
+    };
+    let sign = match direction {
+        SketchDirection::Below => -1.0,
+        SketchDirection::Above => 1.0,
+    };
+    let at = |uv: [f64; 2], depth: f64| -> [f64; 3] {
+        let [u, v] = uv;
+        let w = sign * depth;
+        [
+            origin[0] + u * x_axis[0] + v * y_axis[0] + w * z_axis[0],
+            origin[1] + u * x_axis[1] + v * y_axis[1] + w * z_axis[1],
+            origin[2] + u * x_axis[2] + v * y_axis[2] + w * z_axis[2],
+        ]
+    };
+    let depth_um = |depth: f64| (depth * 1.0e6).round() as i64;
+
+    let prisms = crate::sketch::layers::layered_prisms(sketch)
+        .map_err(|err| diag(EvalErrorKind::Degenerate, format!("sketch: {err}")))?;
+    let mut solids = Vec::with_capacity(prisms.len());
+    for prism in prisms {
+        let loops: Vec<kernel::PrismLoop> = prism
+            .contours
+            .iter()
+            .map(|contour| kernel::PrismLoop {
+                points: contour.points.iter().map(|uv| at(*uv, prism.top)).collect(),
+                names: contour
+                    .sides
+                    .iter()
+                    .map(|side| {
+                        side.map(|s| ProvenancePath::SketchSide {
+                            face: s.face,
+                            a: s.a,
+                            b: s.b,
+                        })
+                    })
+                    .collect(),
+            })
+            .collect();
+        let Some((outer, holes)) = loops.split_first() else {
+            continue;
+        };
+        let depth_step = sign * (prism.bottom - prism.top);
+        let extrude = [
+            depth_step * z_axis[0],
+            depth_step * z_axis[1],
+            depth_step * z_axis[2],
+        ];
+        let solid = kernel::prism_solid(
+            outer,
+            holes,
+            extrude,
+            ProvenancePath::SketchCap {
+                depth_um: depth_um(prism.top),
+                toward_plane: true,
+            },
+            ProvenancePath::SketchCap {
+                depth_um: depth_um(prism.bottom),
+                toward_plane: false,
+            },
+            tol,
+        )
+        .map_err(kernel_diag)?;
+        solids.push((record.id, solid, None));
+    }
+    Ok(Evaluated::SolidSet(solids))
 }
 
 fn params_mismatch(record: &EntityRecord) -> EvalDiag {

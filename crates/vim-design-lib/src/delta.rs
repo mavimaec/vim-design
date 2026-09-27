@@ -210,10 +210,10 @@ fn apply_delta_inner(graph: &mut GraphState, delta: &Delta) -> Result<(), VimSta
             // input referenced by several slots keeps its edge.
             let before = current.clone();
             graph.remove_edges(&before);
-            if let Some(record) = graph.get_mut(*id) {
-                if let Some(slot_value) = record.inputs.get_mut(*slot) {
-                    *slot_value = new.clone();
-                }
+            if let Some(record) = graph.get_mut(*id)
+                && let Some(slot_value) = record.inputs.get_mut(*slot)
+            {
+                *slot_value = new.clone();
             }
             if let Some(after) = graph.get(*id).cloned() {
                 graph.add_edges(&after);

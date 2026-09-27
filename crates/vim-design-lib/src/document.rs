@@ -253,13 +253,12 @@ impl Document {
             return;
         }
         let key = command.coalesce_key();
-        if let Some(key_value) = key {
-            if let Some(top) = self.undo_stack.last_mut() {
-                if top.coalesce_key == Some(key_value) {
-                    coalesce_into(&mut top.deltas, deltas);
-                    return;
-                }
-            }
+        if let Some(key_value) = key
+            && let Some(top) = self.undo_stack.last_mut()
+            && top.coalesce_key == Some(key_value)
+        {
+            coalesce_into(&mut top.deltas, deltas);
+            return;
         }
         self.undo_stack.push(CommandGroup {
             label: command.label().to_owned(),

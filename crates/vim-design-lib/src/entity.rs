@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::id::EntityId;
 use crate::selection::{PredicateAst, SelectionScope};
 use crate::status::VimStatus;
+use crate::sketch::{Sketch, SketchDirection};
 use crate::subref::{EdgeTarget, FaceTarget};
 
 /// The closed set of entity kinds (docs/ARCHITECTURE.md §3.1).
@@ -39,6 +40,9 @@ pub enum EntityKind {
     Site,
     /// Named elevation / construction plane (docs/AUTHORING.md §§2–3).
     Level,
+    /// A self-contained 2D profile on a construction plane that
+    /// evaluates to prisms.
+    Sketch,
 }
 
 /// Per-kind parameters — a closed serde enum with one variant per
@@ -155,6 +159,14 @@ pub enum Params {
         /// Half-size of the display square (meters).
         extent_m: f64,
     },
+    /// A 2D profile on its plane input: points and face loops in the
+    /// plane's (u, v) coordinates, each face solid (with its own
+    /// thickness) or void (with an optional depth). Material hangs from
+    /// the plane on the `direction` side.
+    Sketch {
+        sketch: Sketch,
+        direction: SketchDirection,
+    },
 }
 
 impl Params {
@@ -180,6 +192,7 @@ impl Params {
             Params::Selection { .. } => EntityKind::Selection,
             Params::Site { .. } => EntityKind::Site,
             Params::Level { .. } => EntityKind::Level,
+            Params::Sketch { .. } => EntityKind::Sketch,
         }
     }
 }
@@ -263,6 +276,7 @@ pub mod slot {
     pub const ELEMENT_LEVEL: usize = 1;
     pub const INSTANCE_ELEMENT: usize = 0;
     pub const SELECTION_SCOPE: usize = 0;
+    pub const SKETCH_PLANE: usize = 0;
 }
 
 const NO_SLOTS: &[SlotDecl] = &[];
@@ -445,6 +459,7 @@ const ELEMENT_SLOTS: &[SlotDecl] = &[
             EntityKind::Extrusion,
             EntityKind::Revolve,
             EntityKind::Chamfer,
+            EntityKind::Sketch,
         ],
         required: true,
         multi: true,
@@ -492,6 +507,7 @@ const ANY_KIND: &[EntityKind] = &[
     EntityKind::Selection,
     EntityKind::Site,
     EntityKind::Level,
+    EntityKind::Sketch,
 ];
 
 // Mirror of the explicit scope ids in `Params::Selection::scope`
@@ -510,6 +526,16 @@ const SELECTION_SLOTS: &[SlotDecl] = &[SlotDecl {
     multi: true,
 }];
 
+// A sketch lives on a construction plane: its (u, v) coordinates are in
+// the plane's evaluated frame. The accepted-kinds list is the extension
+// point for future frame-producing kinds; acceptance only widens.
+const SKETCH_SLOTS: &[SlotDecl] = &[SlotDecl {
+    name: "plane",
+    accepted: &[EntityKind::Level],
+    required: true,
+    multi: false,
+}];
+
 /// The static slot table for an entity kind — the single source of truth
 /// for structural validation (docs/ARCHITECTURE.md §3.2).
 pub fn slots(kind: EntityKind) -> &'static [SlotDecl] {
@@ -520,6 +546,7 @@ pub fn slots(kind: EntityKind) -> &'static [SlotDecl] {
         | EntityKind::Site
         | EntityKind::Level => NO_SLOTS,
         EntityKind::Selection => SELECTION_SLOTS,
+        EntityKind::Sketch => SKETCH_SLOTS,
         EntityKind::ControlPoint => CONTROL_POINT_SLOTS,
         EntityKind::Circle => CIRCLE_SLOTS,
         EntityKind::Line => LINE_SLOTS,
@@ -623,6 +650,7 @@ mod tests {
         EntityKind::Selection,
         EntityKind::Site,
         EntityKind::Level,
+        EntityKind::Sketch,
     ];
 
     #[test]

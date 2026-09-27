@@ -202,3 +202,89 @@ was drawn on, so a level elevation edit moves everything on it as a transform on
   fixes this.
 - No doors yet. A door can be a notch in the wall's outer profile (the profile becomes
   a U-shaped outline) — again no boolean needed.
+
+## 9. Edit Mode data model: the `Sketch` entity
+
+Edit Mode edits the 2D **profile** of an element: move, insert, and delete points,
+edges, and faces; split a face with a line; several disjoint faces in one element;
+subtractive "hole" faces that may reach outside the material; and a thickness **per
+face**. The profile is one entity, a `Sketch`, stored as plain data in its params:
+
+```rust
+pub struct Sketch { pub points: Vec<SketchPoint>, pub faces: Vec<SketchFace> }
+pub struct SketchPoint { pub id: u32, pub uv: [f64; 2] }
+pub struct SketchFace { pub id: u32, pub points: Vec<u32>, pub kind: SketchFaceKind }
+pub enum SketchFaceKind { Solid { thickness: f64 }, Void { depth: Option<f64> } }
+pub enum SketchDirection { Below, Above }
+// Params::Sketch { sketch: Sketch, direction: SketchDirection }; slot 0 = plane (Level)
+```
+
+- **Coordinates** are `(u, v)` meters in the plane's frame. The plane is a Level today
+  (a future face frame fits the same slot).
+- **Ids** of points and faces are local to the sketch and stable across edits: a
+  selection or a provenance name keeps pointing at the same thing. New ids are the
+  largest existing id plus one; an id is never reused within the sketch.
+- **Faces** are closed loops of point ids. **Edges** are derived: consecutive loop
+  points (last to first included). Two faces share an edge when both loops contain the
+  same unordered point pair, so moving a shared point or edge moves both faces
+  (planar-graph semantics).
+- **Face kinds.** `Solid { thickness }` is material from the plane to `thickness`
+  meters away from it. `Void { depth }` removes material from the plane to `depth`
+  meters away (`None`: through everything). A void deeper than the material cuts
+  through; a void shallower than it makes a **pocket** (an indentation). A void may
+  extend outside the material (it only removes what it overlaps) or lie fully outside
+  (no effect). Where a void and a solid overlap within the void's depth, the void wins.
+- **Direction.** `Below` hangs the material under the plane (a floor plate: its top is
+  at the level elevation); `Above` stands it on the plane (for later wall and roof use).
+  The direction is set at creation; `UpdateSketch` keeps it.
+- **One edit = one command.** The app computes the edited sketch with the library's
+  topology operations (`vim_design_lib::sketch::ops`) and stores it with one
+  `UpdateSketch` — one undo step; coalesced updates merge a drag into one step.
+- **Validity, two tiers.** The commands reject a structurally invalid sketch
+  (`InvalidSketch`: duplicate ids, a loop over a missing point, fewer than three
+  distinct points or an immediately repeated point, a non-finite coordinate, a
+  thickness or depth that is not finite and positive). Geometry the kernel cannot use
+  — a loop that crosses or touches itself, zero area — is accepted and reported as a
+  per-entity evaluation error (the previous mesh stays). `sketch::validate` and
+  `validate_face` give the same answers live, for UI feedback.
+
+**Layered evaluation.** At each point of the plane, the solid interval is
+`[0, thickest solid face covering it]` and the removed interval is
+`[0, deepest void covering it]`. Every distinct thickness and depth is a layer
+boundary; for the layer between boundaries `a < b`:
+
+```text
+footprint = union(solid faces with thickness >= b) - union(void faces with depth >= b or None)
+```
+
+Each polygon of the footprint (with its holes) becomes a prism from depth `a` to `b`.
+A polygon that repeats unchanged in the next layer extends its prism instead, so a
+plain plate or a plate with through holes is a single prism. The element's geometry is
+the set of prisms; stacked prisms (pockets, faces of different thickness) touch along
+internal faces. The 2D booleans run in `i_overlay` (robust polygon booleans in pure
+Rust, 64-bit integer engine); slivers under the tolerance area are dropped. A sketch
+with no material left has no mesh (not an error).
+
+**Provenance.** Generated faces are named from the stable sketch ids: a side face by
+the sketch face and point pair of the boundary edge that sweeps it
+(`SketchSide { face, a, b }`, `a < b`), a cap by its depth in micrometers and whether
+it faces the plane (`SketchCap { depth_um, toward_plane }`).
+
+**Topology operations** (`sketch::ops`, pure functions, typed `SketchError`, never
+panic; every result is structurally valid and has no unused points):
+
+| Operation | Semantics |
+|---|---|
+| `add_face(sketch, uv_loop, kind)` | New face (next face id) from a loop; duplicates dropped, loop normalized counter-clockwise; a vertex within 1 µm of an existing point reuses it (corner-to-corner faces share edges). A vertex on the middle of an existing edge is not inserted into it. |
+| `move_points` / `set_point` / `move_edges` / `move_faces` | Translate the union of the addressed points once; faces sharing a moved point follow. |
+| `insert_point_on_edge(sketch, a, b, t)` | New point (next point id) at `t ∈ (0, 1)` from `a`, inserted into **every** loop that has edge `a`-`b` in either direction. |
+| `split_faces(sketch, start, end)` | Every stretch of the segment that runs through a face's interior (an entry crossing then an exit crossing) splits that face: the crossing points are inserted into all loops sharing those boundary edges, and the face becomes two faces sharing the new edge, with the same kind. The face keeps its id for the part **left** of the drawn direction; the right part gets a new id. A non-convex face entered and left several times is split at **every** stretch. Segment parts outside faces, and stretches along a boundary, are ignored; `NothingToSplit` if no face was split. |
+| `delete_faces(sketch, ids)` | Remove the faces, then points no face uses. |
+| `delete_edges(sketch, pairs)` | Merge each edge's two points into the edge's **first** point in loop order, read in the lowest-id face that has the edge; the kept point keeps its position. Loops drop immediate repeats; faces with fewer than three points are removed, then unused points. |
+| `delete_points(sketch, ids)` | Remove the points; each loop reconnects the neighbours; faces with fewer than three points are removed, then unused points. |
+| `validate(sketch)` / `validate_face(sketch, id)` | Structural checks plus simple-polygon checks (crossing, touching, repeated point, zero area). |
+| `edges`, `face_polygon`, `next_point_id`, `next_face_id` | Derived helpers (unique undirected edges with their faces; a face's (u, v) polygon; the next ids). |
+
+**Compatibility.** `Sketch` was added by appending variants at the end of the
+serialized enums, so documents saved before it load and resave byte-identically (a
+saved authoring project is kept as a regression fixture).

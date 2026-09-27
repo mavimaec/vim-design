@@ -20,6 +20,7 @@ use crate::delta::Delta;
 use crate::id::EntityId;
 use crate::selection::{PredicateAst, SelectionScope};
 use crate::status::VimStatus;
+use crate::sketch::{Sketch, SketchDirection};
 use crate::subref::{EdgeTarget, FaceTarget, SubRef, SubRefSet};
 
 /// The closed set of user-level commands — the full requirements list
@@ -445,6 +446,26 @@ pub enum Command {
     DeleteCylinder {
         extrusion: EntityId,
     },
+    // -- Sketch -----------------------------------------------------------
+    /// Create a sketch on a construction plane. Rejected with
+    /// `InvalidSketch` when the sketch is structurally invalid; geometric
+    /// problems (a self-crossing loop) are per-entity evaluation errors.
+    CreateSketch {
+        plane: EntityId,
+        sketch: Sketch,
+        direction: SketchDirection,
+    },
+    /// Replace a sketch's points and faces (its plane and direction are
+    /// kept). One `SetParams` delta: one undo step, and consecutive
+    /// coalesced updates (a drag) merge into one.
+    UpdateSketch {
+        id: EntityId,
+        sketch: Sketch,
+        coalesce: bool,
+    },
+    DeleteSketch {
+        id: EntityId,
+    },
 }
 
 /// Serde default for `DeleteElement::sweep_orphans` — sweeping is the
@@ -530,6 +551,9 @@ impl Command {
             Command::CreateCylinder { .. } => "CreateCylinder",
             Command::UpdateCylinder { .. } => "UpdateCylinder",
             Command::DeleteCylinder { .. } => "DeleteCylinder",
+            Command::CreateSketch { .. } => "CreateSketch",
+            Command::UpdateSketch { .. } => "UpdateSketch",
+            Command::DeleteSketch { .. } => "DeleteSketch",
         }
     }
 
@@ -557,6 +581,7 @@ impl Command {
             | Command::UpdateInstance { id, coalesce, .. }
             | Command::UpdateSelection { id, coalesce, .. }
             | Command::UpdateSite { id, coalesce, .. }
+            | Command::UpdateSketch { id, coalesce, .. }
             | Command::UpdateLevel { id, coalesce, .. } => (*coalesce, *id),
             Command::UpdateCylinder {
                 extrusion, coalesce, ..
@@ -1429,6 +1454,39 @@ fn run(ctx: &mut Ctx<'_>, command: &Command) -> Result<(), VimStatus> {
             ..
         } => update_cylinder(ctx, *extrusion, *center, *radius, *height),
         Command::DeleteCylinder { extrusion } => delete_cylinder(ctx, *extrusion),
+
+        // -- Sketch --------------------------------------------------------
+        Command::CreateSketch {
+            plane,
+            sketch,
+            direction,
+        } => {
+            crate::sketch::validate_structure(sketch).map_err(|_| VimStatus::InvalidSketch)?;
+            ctx.create(
+                Params::Sketch {
+                    sketch: sketch.clone(),
+                    direction: *direction,
+                },
+                vec![SlotValue::One(Some(*plane))],
+            )?;
+            Ok(())
+        }
+        Command::UpdateSketch { id, sketch, .. } => {
+            let record = ctx.expect_kind(*id, EntityKind::Sketch)?;
+            crate::sketch::validate_structure(sketch).map_err(|_| VimStatus::InvalidSketch)?;
+            let direction = match record.params {
+                Params::Sketch { direction, .. } => direction,
+                _ => return Err(VimStatus::ParamsKindMismatch),
+            };
+            ctx.set_params(
+                *id,
+                Params::Sketch {
+                    sketch: sketch.clone(),
+                    direction,
+                },
+            )
+        }
+        Command::DeleteSketch { id } => ctx.delete(*id, EntityKind::Sketch),
     }
 }
 
@@ -1545,6 +1603,7 @@ fn sweepable(kind: EntityKind) -> bool {
             | EntityKind::Revolve
             | EntityKind::Solid
             | EntityKind::Chamfer
+            | EntityKind::Sketch
     )
 }
 
@@ -1798,13 +1857,13 @@ fn delete_level_cascade(ctx: &mut Ctx<'_>, level: EntityId) -> Result<(), VimSta
     // so every element of the level is in the dependent closure).
     let mut sweep_candidates = std::collections::BTreeSet::new();
     for id in &remaining {
-        if let Some(record) = ctx.doc.graph_ref().get(*id) {
-            if record.kind() == EntityKind::Element {
-                sweep_candidates.extend(sweepable_input_closure(
-                    ctx.doc.graph_ref(),
-                    record.referenced(),
-                ));
-            }
+        if let Some(record) = ctx.doc.graph_ref().get(*id)
+            && record.kind() == EntityKind::Element
+        {
+            sweep_candidates.extend(sweepable_input_closure(
+                ctx.doc.graph_ref(),
+                record.referenced(),
+            ));
         }
     }
     while !remaining.is_empty() {

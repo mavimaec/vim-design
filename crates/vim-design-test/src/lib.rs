@@ -564,7 +564,9 @@ pub fn mesh_volume(mesh: &Mesh) -> f64 {
         [f64::from(v[0]), f64::from(v[1]), f64::from(v[2])]
     };
     mesh.indices
-        .chunks_exact(3)
+        .as_chunks::<3>()
+        .0
+        .iter()
         .map(|tri| {
             let (a, b, c) = (p(tri[0]), p(tri[1]), p(tri[2]));
             // det(a, b, c) / 6
@@ -589,7 +591,7 @@ fn quantized(p: [f32; 3]) -> [i64; 3] {
 pub fn assert_watertight(mesh: &Mesh) {
     use std::collections::HashMap;
     let mut edge_counts: HashMap<([i64; 3], [i64; 3]), i64> = HashMap::new();
-    for tri in mesh.indices.chunks_exact(3) {
+    for tri in mesh.indices.as_chunks::<3>().0 {
         let corners = [
             quantized(mesh.positions[tri[0] as usize]),
             quantized(mesh.positions[tri[1] as usize]),

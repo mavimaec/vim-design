@@ -177,16 +177,25 @@ impl Engine {
                     ),
                 )
             })?;
-        let Evaluated::Solid { solid, .. } = value else {
-            return Err(EvalDiag::new(
-                EvalErrorKind::UnresolvedSubRef,
-                format!(
-                    "owner entity {} did not evaluate to a solid",
-                    subref.owner.0
-                ),
-            ));
+        // A sketch owner is a set of prisms: a path resolves across all
+        // of them (one name may cover faces of several prisms).
+        let solids: Vec<&KernelSolid> = match value {
+            Evaluated::Solid { solid, .. } => vec![solid],
+            Evaluated::SolidSet(members) => members.iter().map(|(_, s, _)| s).collect(),
+            _ => {
+                return Err(EvalDiag::new(
+                    EvalErrorKind::UnresolvedSubRef,
+                    format!(
+                        "owner entity {} did not evaluate to a solid",
+                        subref.owner.0
+                    ),
+                ));
+            }
         };
-        let (faces, edges) = kernel::match_counts(solid, &subref.path);
+        let (faces, edges) = solids
+            .iter()
+            .map(|solid| kernel::match_counts(solid, &subref.path))
+            .fold((0, 0), |(f, e), (df, de)| (f + df, e + de));
         if subref.path.is_edge() {
             if edges > 0 {
                 return Ok(SubRefResolution::Edges(edges));
@@ -361,12 +370,11 @@ impl Engine {
         //    frame moved but whose (level-local) geometry did not.
         if !frames_changed.is_empty() {
             for (owner, entry) in &self.meshes {
-                if let Some(level) = entry.base_level {
-                    if frames_changed.contains(&level)
-                        && !self.changed_meshes.contains(owner)
-                    {
-                        self.transform_dirty.insert(*owner);
-                    }
+                if let Some(level) = entry.base_level
+                    && frames_changed.contains(&level)
+                    && !self.changed_meshes.contains(owner)
+                {
+                    self.transform_dirty.insert(*owner);
                 }
             }
         }
@@ -446,7 +454,8 @@ impl Engine {
                 EntityKind::Extrusion
                 | EntityKind::Revolve
                 | EntityKind::Solid
-                | EntityKind::Chamfer => !consumed.contains(id),
+                | EntityKind::Chamfer
+                | EntityKind::Sketch => !consumed.contains(id),
                 _ => false,
             })
             .map(|(id, _)| *id)
@@ -498,6 +507,16 @@ impl Engine {
                 None => {
                     // No solid value available (upstream error with no
                     // stale geometry): retain whatever mesh exists (§6.4).
+                }
+                Some(Ok(mesh)) if mesh.indices.is_empty() => {
+                    // No material left (a sketch whose voids remove
+                    // everything, or with no solid faces): the owner has
+                    // no mesh. Tombstone the previous one; not an error.
+                    if self.meshes.remove(&id).is_some() {
+                        self.changed_meshes.remove(&id);
+                        self.removed_meshes.insert(id);
+                    }
+                    self.transform_dirty.remove(&id);
                 }
                 Some(Ok(mesh)) => {
                     *self.tess_counts.entry(id).or_insert(0) += 1;
@@ -717,13 +736,9 @@ fn build_owner_mesh(
             assignments.get(&id),
             chordal_tolerance,
         ),
+        // An empty set (no material) yields an empty mesh, which the
+        // caller turns into a tombstone.
         Evaluated::SolidSet(members) => {
-            if members.is_empty() {
-                return Some(Err(EvalDiag::new(
-                    EvalErrorKind::Degenerate,
-                    "element has no evaluable member solids",
-                )));
-            }
             members.iter().try_for_each(|(member, solid, material)| {
                 append_solid(
                     &mut mesh,

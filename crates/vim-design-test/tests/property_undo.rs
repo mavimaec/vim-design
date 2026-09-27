@@ -4,7 +4,8 @@
 //! restores the final save.
 
 use proptest::prelude::*;
-use vim_design_lib::{Command, Document, EntityId, EntityKind};
+use vim_design_lib::sketch::{Sketch, SketchDirection, SketchFaceKind, ops};
+use vim_design_lib::{Command, Document, EntityId, EntityKind, Params};
 
 /// Abstract operations; indexes are resolved against the entities that
 /// exist when the op runs (mod count), so every generated sequence is
@@ -28,6 +29,10 @@ enum Op {
     CreateLevel(i16),
     CreateElement { member: usize, level: usize },
     DeleteElement { pick: usize, sweep: bool },
+    // Sketches: creation on a level, then random edits through the
+    // topology operations, each stored with one UpdateSketch.
+    CreateSketch { level: usize, x: i8, w: u8, h: u8, void: bool },
+    EditSketch { pick: usize, op: u8, a: usize, b: usize, x: i8, coalesce: bool },
     UpdateLevelElevation { pick: usize, elevation: i16, coalesce: bool },
     AttachCp { cp: usize, level: usize, detach: bool },
     DeleteLevelCascade(usize),
@@ -64,7 +69,55 @@ fn op_strategy() -> impl Strategy<Value = Op> {
         // invert mechanically — stress both flag values.
         2 => (any::<usize>(), any::<bool>())
             .prop_map(|(pick, sweep)| Op::DeleteElement { pick, sweep }),
+        2 => (any::<usize>(), any::<i8>(), 1u8..40, 1u8..40, any::<bool>())
+            .prop_map(|(level, x, w, h, void)| Op::CreateSketch { level, x, w, h, void }),
+        4 => (any::<usize>(), 0u8..7, any::<usize>(), any::<usize>(), any::<i8>(), any::<bool>())
+            .prop_map(|(pick, op, a, b, x, coalesce)| Op::EditSketch { pick, op, a, b, x, coalesce }),
     ]
+}
+
+fn stored_sketch(doc: &Document, id: EntityId) -> Option<Sketch> {
+    doc.entity(id).and_then(|record| match &record.params {
+        Params::Sketch { sketch, .. } => Some(sketch.clone()),
+        _ => None,
+    })
+}
+
+/// Apply one random topology operation; `None` when it does not apply.
+fn edit_sketch(sketch: &Sketch, op: u8, a: usize, b: usize, x: i8) -> Option<Sketch> {
+    let offset = f64::from(x) * 0.05;
+    let point = |i: usize| sketch.points.get(i % sketch.points.len().max(1)).map(|p| p.id);
+    let face = |i: usize| sketch.faces.get(i % sketch.faces.len().max(1)).map(|f| f.id);
+    let edge = |i: usize| {
+        let all = vim_design_lib::sketch::edges(sketch);
+        all.get(i % all.len().max(1)).map(|e| (e.a, e.b))
+    };
+    let result = match op {
+        0 => ops::move_points(sketch, &[point(a)?], [offset, 0.0]),
+        1 => {
+            let (p, q) = edge(a)?;
+            ops::insert_point_on_edge(sketch, p, q, 0.25 + f64::from(b as u8 % 50) / 100.0)
+        }
+        2 => ops::split_faces(sketch, [offset, -50.0], [offset + 0.3, 50.0]),
+        3 => ops::delete_faces(sketch, &[face(a)?]),
+        4 => ops::delete_edges(sketch, &[edge(a)?]),
+        5 => ops::delete_points(sketch, &[point(a)?]),
+        _ => ops::add_face(
+            sketch,
+            &[
+                [offset, offset],
+                [offset + 1.0, offset],
+                [offset + 1.0, offset + 1.0],
+                [offset, offset + 1.0],
+            ],
+            if b.is_multiple_of(2) {
+                SketchFaceKind::Solid { thickness: 0.1 + f64::from(b as u8 % 5) * 0.1 }
+            } else {
+                SketchFaceKind::Void { depth: if b.is_multiple_of(3) { None } else { Some(0.15) } }
+            },
+        ),
+    };
+    result.ok()
 }
 
 /// Ids of a given kind, in deterministic (ascending) order.
@@ -165,6 +218,7 @@ fn run_op(doc: &mut Document, op: &Op) {
                     Some(EntityKind::Face) => Command::DeleteFace { id },
                     Some(EntityKind::Circle) => Command::DeleteCircle { id },
                     Some(EntityKind::Extrusion) => Command::DeleteExtrusion { id },
+                    Some(EntityKind::Sketch) => Command::DeleteSketch { id },
                     _ => fallback,
                 },
                 None => fallback,
@@ -220,6 +274,7 @@ fn run_op(doc: &mut Document, op: &Op) {
         Op::CreateElement { member, level } => {
             let mut producers = ids_of_kind(doc, EntityKind::Extrusion);
             producers.extend(ids_of_kind(doc, EntityKind::Revolve));
+            producers.extend(ids_of_kind(doc, EntityKind::Sketch));
             producers.sort_unstable();
             let levels = ids_of_kind(doc, EntityKind::Level);
             match (pick(&producers, *member), pick(&levels, *level)) {
@@ -229,6 +284,51 @@ fn run_op(doc: &mut Document, op: &Op) {
                     level,
                 },
                 _ => fallback,
+            }
+        }
+        Op::CreateSketch { level, x, w, h, void } => {
+            let levels = ids_of_kind(doc, EntityKind::Level);
+            let x0 = f64::from(*x) * 0.1;
+            let (w, h) = (f64::from(*w) * 0.1, f64::from(*h) * 0.1);
+            let rect = [[x0, 0.0], [x0 + w, 0.0], [x0 + w, h], [x0, h]];
+            let sketch = ops::add_face(&Sketch::default(), &rect, SketchFaceKind::Solid { thickness: 0.3 })
+                .ok()
+                .and_then(|s| {
+                    if *void {
+                        let hole = [
+                            [x0 + w * 0.25, h * 0.25],
+                            [x0 + w * 0.75, h * 0.25],
+                            [x0 + w * 0.75, h * 0.75],
+                            [x0 + w * 0.25, h * 0.75],
+                        ];
+                        ops::add_face(&s, &hole, SketchFaceKind::Void { depth: Some(0.1) }).ok()
+                    } else {
+                        Some(s)
+                    }
+                });
+            match (pick(&levels, *level), sketch) {
+                (Some(plane), Some(sketch)) => Command::CreateSketch {
+                    plane,
+                    sketch,
+                    direction: SketchDirection::Below,
+                },
+                _ => fallback,
+            }
+        }
+        Op::EditSketch { pick: p, op, a, b, x, coalesce } => {
+            let sketches = ids_of_kind(doc, EntityKind::Sketch);
+            let edited = pick(&sketches, *p).and_then(|id| {
+                stored_sketch(doc, id)
+                    .and_then(|s| edit_sketch(&s, *op, *a, *b, *x))
+                    .map(|sketch| (id, sketch))
+            });
+            match edited {
+                Some((id, sketch)) => Command::UpdateSketch {
+                    id,
+                    sketch,
+                    coalesce: *coalesce,
+                },
+                None => fallback,
             }
         }
         Op::DeleteElement { pick: p, sweep } => {

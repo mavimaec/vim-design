@@ -13,6 +13,7 @@ monstertruck-modeling = { workspace = true, features = ["fillet"] }
 monstertruck-geometry = { workspace = true }
 monstertruck-solid = { workspace = true }
 monstertruck-meshing = { workspace = true }
+i_overlay = { workspace = true }
 serde = { workspace = true }
 postcard = { workspace = true }
 # Dev/debug JSON export (docs/ARCHITECTURE.md §10); not part of wasm builds.

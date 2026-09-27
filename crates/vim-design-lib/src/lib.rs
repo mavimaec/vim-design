@@ -20,6 +20,7 @@ pub mod id;
 pub mod kernel;
 pub mod selection;
 pub mod serialization;
+pub mod sketch;
 pub mod status;
 pub mod subref;
 

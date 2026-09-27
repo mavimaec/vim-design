@@ -11,7 +11,7 @@ members = [
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-rust-version = "1.85"
+rust-version = "1.88"
 
 [workspace.dependencies]
 vim-design-lib = { path = "crates/vim-design-lib" }
@@ -21,6 +21,10 @@ monstertruck-modeling = "=0.4.0"
 monstertruck-geometry = "=0.4.0"
 monstertruck-solid = "=0.4.0"
 monstertruck-meshing = "=0.4.0"
+
+# Robust 2D polygon booleans for sketch profiles (pure Rust, no default
+# features: no rayon).
+i_overlay = { version = "9.0", default-features = false }
 
 # Serialization (docs/ARCHITECTURE.md §10).
 serde = { version = "1", features = ["derive"] }

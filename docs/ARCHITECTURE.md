@@ -89,6 +89,21 @@ Plus two kinds from the authoring-tool direction (2026-08-23, see
   with a level-less element is malformed). Element deletion sweeps its orphaned
   construction inputs by default (AUTHORING.md §4). Frame bases must follow the
   deterministic basis-stability rule (AUTHORING.md §3 — the frame analog of §3.4).
+- **`Sketch`** — a self-contained 2D profile on a construction plane (slot 0 `plane`,
+  required, accepts `Level`; the accepted-kinds list is the extension point for a
+  future face frame). Its params hold the whole profile — sketch-local point and face
+  ids, (u, v) coordinates in the plane's frame, closed face loops of point ids, and a
+  kind per face: `Solid { thickness }` or `Void { depth: Option }` — plus a
+  `direction` (`Below` / `Above`: the side of the plane the material hangs on). Edges
+  are derived (consecutive loop points; a shared edge is the same unordered point
+  pair in two loops). It evaluates directly to prisms by layered 2D booleans (see
+  AUTHORING.md §9) and is an `Element` member or a standalone mesh owner. An edit is
+  one `UpdateSketch` (one `SetParams` delta; drags coalesce). Structural validity
+  (unique ids, loops over existing points with ≥ 3 distinct points, finite
+  coordinates, finite positive thickness/depth) is checked by the commands
+  (`InvalidSketch`); geometric validity (a self-crossing loop, zero area) is a
+  per-entity evaluation error. Prism faces are provenance-named from the stable
+  sketch ids (`SketchSide`, `SketchCap`, §3.4).
 
 > Note: `Element`/`Instance` commands (`CreateElement`, `CreateInstance`, …) extend the
 > command list in the requirements; they fall out of the performance requirement (§8 of

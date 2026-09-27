@@ -654,6 +654,74 @@ pub fn extrude_solid(
     })
 }
 
+/// One boundary loop of a prism profile: points on one plane and a
+/// provenance name per edge (`names[i]` names the edge from `points[i]`
+/// to the next point, wrapping; `None` leaves that side unnamed).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PrismLoop {
+    pub points: Vec<[f64; 3]>,
+    pub names: Vec<Option<ProvenancePath>>,
+}
+
+/// Build a prism: the planar profile `outer` minus `holes`, extruded by
+/// `direction`. Every face is named by the caller: a lateral face by the
+/// name of the profile edge that sweeps it, the profile-side cap by
+/// `start_cap`, the far cap by `end_cap`. The solid carries no sweep
+/// model, so provenance queries do not expand on it; single paths
+/// resolve through its face names.
+pub fn prism_solid(
+    outer: &PrismLoop,
+    holes: &[PrismLoop],
+    direction: [f64; 3],
+    start_cap: ProvenancePath,
+    end_cap: ProvenancePath,
+    tol: f64,
+) -> Result<KernelSolid, KernelError> {
+    guard(|| {
+        // Each edge's source is its 1-based index into `names`; the
+        // sweep classifier then names each lateral face by that index.
+        let mut names: Vec<Option<ProvenancePath>> = Vec::new();
+        let mut to_wire = |profile: &PrismLoop| -> WireSpec {
+            let n = profile.points.len();
+            let mut curves = Vec::with_capacity(n);
+            let mut sources = Vec::with_capacity(n);
+            for i in 0..n {
+                let (Some(start), Some(end)) =
+                    (profile.points.get(i), profile.points.get((i + 1) % n))
+                else {
+                    continue;
+                };
+                curves.push(CurveSpec::Segment {
+                    start: *start,
+                    end: *end,
+                });
+                names.push(profile.names.get(i).cloned().flatten());
+                sources.push(EntityId(names.len() as u64));
+            }
+            WireSpec::with_sources(curves, sources)
+        };
+        let outer_wire = to_wire(outer);
+        let hole_wires: Vec<WireSpec> = holes.iter().map(&mut to_wire).collect();
+        let face = make_face(&outer_wire, &hole_wires, None, tol)?;
+        let mut solid = extrude_solid(&face, direction, tol)?;
+        solid.provenance = solid
+            .provenance
+            .iter()
+            .map(|path| match path {
+                Some(ProvenancePath::Side { source }) => usize::try_from(source.0)
+                    .ok()
+                    .and_then(|index| index.checked_sub(1))
+                    .and_then(|index| names.get(index).cloned().flatten()),
+                Some(ProvenancePath::CapStart) => Some(start_cap.clone()),
+                Some(ProvenancePath::CapEnd) => Some(end_cap.clone()),
+                _ => None,
+            })
+            .collect();
+        solid.model = None;
+        Ok(solid)
+    })
+}
+
 /// Revolve a face about the axis line (`origin`, `axis_direction`) by
 /// `angle_radians`. `|angle| >= 2π` produces a closed solid of
 /// revolution; smaller angles a partial solid with planar caps. Profiles
@@ -1492,10 +1560,10 @@ pub fn chamfer_solid(
                     best = Some((d, path));
                 }
             }
-            if let Some((d, path)) = best {
-                if d <= distance * 4.0 {
-                    *slot = path.clone();
-                }
+            if let Some((d, path)) = best
+                && d <= distance * 4.0
+            {
+                *slot = path.clone();
             }
         }
 
@@ -1558,12 +1626,11 @@ fn adjacent_face_paths(
             .boundaries()
             .iter()
             .any(|w| w.edge_iter().any(|e| e.id() == id));
-        if touches {
-            if let Some(Some(path)) = provenance.get(index) {
-                if !adjacent.contains(path) {
-                    adjacent.push(path.clone());
-                }
-            }
+        if touches
+            && let Some(Some(path)) = provenance.get(index)
+            && !adjacent.contains(path)
+        {
+            adjacent.push(path.clone());
         }
     }
     match adjacent.as_slice() {
@@ -1656,32 +1723,29 @@ fn flatten_polygon(polygon: &PolygonMesh) -> Result<RawMesh, KernelError> {
 
     // Fill any missing normals from the geometry of the first triangle
     // that references the vertex.
-    for triangle in indices.chunks_exact(3) {
-        if let [a, b, c] = triangle {
-            let (a, b, c) = (*a as usize, *b as usize, *c as usize);
-            let needs = [a, b, c]
-                .iter()
-                .any(|&i| normals_opt.get(i).is_some_and(|n| n.is_none()));
-            if !needs {
-                continue;
-            }
-            let (Some(pa), Some(pb), Some(pc)) =
-                (positions.get(a), positions.get(b), positions.get(c))
-            else {
-                continue;
-            };
-            let to64 = |p: &[f32; 3]| {
-                let [x, y, z] = *p;
-                [f64::from(x), f64::from(y), f64::from(z)]
-            };
-            let n = cross(sub(to64(pb), to64(pa)), sub(to64(pc), to64(pa)));
-            let n = normalized(n, 0.0).unwrap_or([0.0, 0.0, 1.0]);
-            for i in [a, b, c] {
-                if let Some(slot) = normals_opt.get_mut(i) {
-                    if slot.is_none() {
-                        *slot = Some(n);
-                    }
-                }
+    for &[a, b, c] in indices.as_chunks::<3>().0 {
+        let (a, b, c) = (a as usize, b as usize, c as usize);
+        let needs = [a, b, c]
+            .iter()
+            .any(|&i| normals_opt.get(i).is_some_and(|n| n.is_none()));
+        if !needs {
+            continue;
+        }
+        let (Some(pa), Some(pb), Some(pc)) = (positions.get(a), positions.get(b), positions.get(c))
+        else {
+            continue;
+        };
+        let to64 = |p: &[f32; 3]| {
+            let [x, y, z] = *p;
+            [f64::from(x), f64::from(y), f64::from(z)]
+        };
+        let n = cross(sub(to64(pb), to64(pa)), sub(to64(pc), to64(pa)));
+        let n = normalized(n, 0.0).unwrap_or([0.0, 0.0, 1.0]);
+        for i in [a, b, c] {
+            if let Some(slot) = normals_opt.get_mut(i)
+                && slot.is_none()
+            {
+                *slot = Some(n);
             }
         }
     }
