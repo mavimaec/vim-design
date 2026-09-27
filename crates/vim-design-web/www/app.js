@@ -46,14 +46,25 @@ const LONG_PRESS_VIBRATE_MS = 12;
 const INSERT_RING_MS = 450;
 // Edit Mode pick radius (CSS px) for points and edges.
 const EDIT_PICK_PX = { mouse: 10, pen: 14, touch: 22 };
+// Two-finger touch: the gesture is classified once its combined travel
+// reaches TOUCH_COMMIT_PX (CSS px) — pan, zoom, or (3D) twist, whichever
+// leads the others by TOUCH_DOMINANCE; an ambiguous start waits up to
+// TOUCH_COMMIT_MAX_PX, then takes the leader. The class is locked until
+// a finger lifts. A twist must clearly dominate: its travel is weighted
+// down by TOUCH_TWIST_WEIGHT.
+const TOUCH_COMMIT_PX = 12;
+const TOUCH_COMMIT_MAX_PX = 40;
+const TOUCH_DOMINANCE = 1.6;
+const TOUCH_TWIST_WEIGHT = 0.6;
+/** Orbit angle per pointer pixel (the camera's orbit rate). */
+const ORBIT_RAD_PER_PX = 0.0065;
 // Edit Mode stepper increments (meters).
 const FACE_THICKNESS_STEP_M = 0.05;
 const VOID_DEPTH_STEP_M = 0.05;
-/** Edit HUD: a top-anchored point is a square this much wider than a
- *  round handle, with an up tick of this length (CSS px). */
-const TOP_ANCHOR_HANDLE_SCALE = 1.05;
-const TOP_ANCHOR_TICK_PX = 7;
 const WALL_TOP_OFFSET_STEP_M = 0.05;
+/** Openings mode: the size steppers' step, and a new niche's depth (m). */
+const OPENING_STEP_M = 0.1;
+const OPENING_NICHE_DEPTH_M = 0.1;
 /** Workplane offset stepper step and slider range (meters). */
 const WORKPLANE_OFFSET_STEP_M = 0.05;
 const WORKPLANE_OFFSET_RANGE_M = 6.0;
@@ -266,7 +277,7 @@ async function main() {
           snapEnabled: snapEnabled,
           snapStep: snapStep,
           activeLevel: levels.activeId,
-          wireframe: app.wireframe(),
+          renderMode: app.render_mode(),
           thickness: app.plate_thickness_setting(),
           shape: app.shape(),
           wall: JSON.parse(app.wall_settings_json()),
@@ -290,7 +301,8 @@ async function main() {
     const w = session.wall;
     app.set_wall_settings(Number(w.height), Number(w.thickness), w.flip === true);
   }
-  if (session.wireframe === true) app.set_wireframe(true);
+  if (typeof session.renderMode === "string") app.set_render_mode(session.renderMode);
+  else if (session.wireframe === true) app.set_wireframe(true); // older sessions
 
   // -- restore the persisted document ------------------------------------------
   const stored = store.get(DOC_KEY);
@@ -336,7 +348,7 @@ async function main() {
     saveTimer = 0;
     const rev = app.revision();
     if (rev === savedRevision) return true;
-    if (app.edit_active()) return false; // saved when the session ends
+    if (app.edit_active() || app.openings_active()) return false; // saved when the session ends
     if (autosaveBlocked) {
       const msg = "Autosave is off: storage is full and your old project could not be backed up. Use Export to keep your work.";
       if (msg !== lastSaveError) toast(msg, { kind: "error", ms: LONG_ERROR_TOAST_MS });
@@ -358,7 +370,7 @@ async function main() {
     }
   };
   const scheduleSave = () => {
-    if (app.revision() === savedRevision || app.edit_active()) return;
+    if (app.revision() === savedRevision || app.edit_active() || app.openings_active()) return;
     clearTimeout(saveTimer);
     saveTimer = setTimeout(saveNow, SAVE_DEBOUNCE_MS);
   };
@@ -433,16 +445,21 @@ async function main() {
   const editPickPx = (type) => (EDIT_PICK_PX[type] ?? EDIT_PICK_PX.touch) * dpr;
   let editState = { active: false };
   const editing = () => editState.active === true;
+  // Openings mode (placing windows and doors): its own Edit Mode.
+  let openingsState = { active: false };
+  const inOpenings = () => openingsState.active === true;
+  /** Any Edit Mode chrome: a profile (floor, wall run) or openings. */
+  const inEditChrome = () => editing() || inOpenings();
   const isDrawing = () =>
-    (stats.tool === "wall" && !editing()) ||
+    (stats.tool === "wall" && !inEditChrome()) ||
     (editing() && ["solid", "void", "split"].includes(editState.tool));
-  /** The Window / Door tools: a tap on a wall opens its Edit Mode. */
-  const isOpeningTool = () => !editing() && (stats.tool === "window" || stats.tool === "door");
 
   const pointers = new Map(); // id -> {x, y, type} (client px)
   let mode = "none"; // none | press | nav | pan | place | pinch | pinch-rest
   let press = null; // {x, y, dev, type, button, moved, anchored}
-  let pinch = null; // {d, mid, angle}
+  // Two-finger navigation: classify once, then lock (see TOUCH_*).
+  let pinch = null; // {start, prev, cls: null | "pan" | "zoom" | "twist"}
+  let lastTouchClass = null; // for tests
   let lastTap = null;
   let hoverType = "mouse";
   // The touch tap that opened a sheet (see the ghost-click shield).
@@ -461,6 +478,41 @@ async function main() {
       angle: Math.atan2(by - ay, bx - ax),
     };
   };
+
+  const wrapAngle = (a) => (a > Math.PI ? a - 2 * Math.PI : a < -Math.PI ? a + 2 * Math.PI : a);
+  /** Two fingers: accumulate until the travel commits, classify ONCE
+   *  (pan = the fingers move together, zoom = they spread or close about
+   *  the pinch centre, twist = they turn — 3D only, orbits), then lock
+   *  that class until a finger lifts. Nothing mixes. */
+  function twoFingerMove(now) {
+    const p = pinch;
+    if (!p || now.d < 1) return;
+    const k = canvas.width / canvas.getBoundingClientRect().width; // device px per CSS px
+    if (!p.cls) {
+      const s0 = p.start;
+      const pan = Math.hypot(now.mid[0] - s0.mid[0], now.mid[1] - s0.mid[1]) / k;
+      const zoom = Math.abs(now.d - s0.d) / k;
+      const twist = stats.view === "3d" ? Math.abs(wrapAngle(now.angle - s0.angle)) * (s0.d / 2) / k : 0;
+      const travel = 2 * pan + zoom + twist; // both fingers' combined travel, roughly
+      if (travel < TOUCH_COMMIT_PX) return;
+      const ranked = [["pan", pan], ["zoom", zoom], ["twist", twist * TOUCH_TWIST_WEIGHT]].sort((a, b) => b[1] - a[1]);
+      const clear = ranked[0][1] >= TOUCH_DOMINANCE * ranked[1][1];
+      if (!clear && travel < TOUCH_COMMIT_MAX_PX) return; // ambiguous: wait a little longer
+      p.cls = ranked[0][0];
+      lastTouchClass = p.cls;
+      // The motion so far belongs to the class: apply it from the start.
+      p.prev = s0;
+    }
+    if (p.cls === "pan") {
+      app.pan(p.prev.mid[0], p.prev.mid[1], now.mid[0], now.mid[1]);
+    } else if (p.cls === "zoom") {
+      // Anchored at the initial pinch centre, never panning.
+      app.zoom_at(p.prev.d / now.d, p.start.mid[0], p.start.mid[1]);
+    } else {
+      app.orbit(-wrapAngle(now.angle - p.prev.angle) / ORBIT_RAD_PER_PX, 0);
+    }
+    p.prev = now;
+  }
 
   canvas.addEventListener("contextmenu", (e) => e.preventDefault());
 
@@ -481,8 +533,10 @@ async function main() {
         clearTimeout(longPressTimer);
         app.edit_gesture_cancel();
       }
+      if (mode === "open-drag") app.openings_drag_end();
       mode = "pinch";
-      pinch = pinchState();
+      const st = pinchState();
+      pinch = { start: st, prev: st, cls: null };
       requestRender();
       return;
     }
@@ -500,6 +554,8 @@ async function main() {
       touchPlacing = e.pointerType !== "mouse";
       app.sketch_hover(dev[0], dev[1], tolPx(e.pointerType));
       requestRender();
+    } else if (inOpenings()) {
+      mode = "open-press";
     } else if (editing()) {
       // Tap = select, drag on an item = move, drag on empty = marquee,
       // hold on an edge (Points mode) = insert a point.
@@ -526,6 +582,9 @@ async function main() {
       } else if (editing() && e.pointerType !== "touch") {
         app.edit_hover(dev[0], dev[1], editPickPx(e.pointerType));
         requestRender();
+      } else if (inOpenings() && e.pointerType !== "touch") {
+        app.openings_hover(dev[0], dev[1], editPickPx(e.pointerType));
+        requestRender();
       }
       return;
     }
@@ -533,18 +592,7 @@ async function main() {
     p.x = e.clientX;
     p.y = e.clientY;
     if (mode === "pinch" && pointers.size >= 2) {
-      const now = pinchState();
-      if (pinch && now.d > 1) {
-        app.zoom_at(pinch.d / now.d, now.mid[0], now.mid[1]);
-        app.pan(pinch.mid[0], pinch.mid[1], now.mid[0], now.mid[1]);
-        if (stats.view === "3d") {
-          let da = now.angle - pinch.angle;
-          if (da > Math.PI) da -= 2 * Math.PI;
-          if (da < -Math.PI) da += 2 * Math.PI;
-          app.orbit(-da / 0.0065, 0);
-        }
-      }
-      pinch = now;
+      twoFingerMove(pinchState());
       requestRender();
       return;
     }
@@ -555,6 +603,17 @@ async function main() {
     const r = canvas.getBoundingClientRect();
     const s = canvas.width / r.width;
     const prevDev = [(prev.x - r.left) * s, (prev.y - r.top) * s];
+    if (mode === "open-press" && press.moved) {
+      // On an opening: move it; elsewhere: navigate.
+      mode = app.openings_drag_begin(press.dev[0], press.dev[1], editPickPx(press.type)) ? "open-drag" : "nav";
+      if (mode === "nav") canvas.classList.add("grabbing");
+    }
+    if (mode === "open-drag") {
+      const res = JSON.parse(app.openings_drag_move(dev[0], dev[1]));
+      if (res.result === "rejected") showReason(res.reason);
+      refresh();
+      return;
+    }
     if (mode === "edit-press" && press.moved && !press.consumed) {
       clearTimeout(longPressTimer);
       const kind = app.edit_drag_begin(press.dev[0], press.dev[1], editPickPx(press.type), press.additive);
@@ -616,14 +675,18 @@ async function main() {
         app.sketch_leave();
       }
       if (press.type === "touch") app.sketch_leave();
-    } else if (mode === "press" && press && !cancelled) {
+    } else if ((mode === "press" || mode === "open-press") && press && !cancelled) {
       handleTap(press);
+    } else if (mode === "open-drag") {
+      app.openings_drag_end();
+      lastReason = "";
+      refresh();
     } else if (mode.startsWith("edit") && press) {
       clearTimeout(longPressTimer);
       if (cancelled) {
         app.edit_gesture_cancel();
-      } else if (mode === "edit-press" && !press.consumed && ["window", "door"].includes(editState.tool)) {
-        const res = JSON.parse(app.edit_place_preset(press.dev[0], press.dev[1]));
+      } else if (mode === "edit-press" && !press.consumed && editState.tool === "extend") {
+        const res = JSON.parse(app.edit_extend(press.dev[0], press.dev[1]));
         if (res.result === "rejected") toast(res.reason, { kind: "error" });
       } else if (mode === "edit-press" && !press.consumed) {
         app.edit_tap(press.dev[0], press.dev[1], editPickPx(press.type), press.additive);
@@ -661,16 +724,12 @@ async function main() {
 
   function handleTap(p) {
     const now = performance.now();
-    if (isOpeningTool()) {
-      // Window / Door tool: the tap picks the wall; its Edit Mode opens
-      // with the preset armed.
-      const kind = stats.tool;
-      const wall = app.pick_wall(p.dev[0], p.dev[1], wallPickPx(p.type));
-      if (wall >= 0) {
-        resumeTool = kind;
-        beginWallEdit(wall, kind);
-      }
-      else toast(`Tap a wall to add a ${kind} to it`, { ms: 1800 });
+    if (inOpenings()) {
+      // Openings mode: select an opening, or place the preset on a wall.
+      const res = JSON.parse(app.openings_tap(p.dev[0], p.dev[1], editPickPx(p.type), wallPickPx(p.type)));
+      if (res.result === "rejected") toast(res.reason, { kind: "error" });
+      else if (res.result === "cleared" && openingsState.count === 0) toast("Tap a wall to place an opening", { ms: 1800 });
+      refresh();
       return;
     }
     if (stats.tool === "hole") {
@@ -772,7 +831,8 @@ async function main() {
   function drawHud() {
     const ctx = hctx;
     const edit = editing();
-    if (!isDrawing() && !edit && rings.length === 0) {
+    const opening = inOpenings();
+    if (!isDrawing() && !edit && !opening && rings.length === 0) {
       if (hudActive) ctx.clearRect(0, 0, hud.width, hud.height);
       hudActive = false;
       lastHud = { active: false };
@@ -781,6 +841,7 @@ async function main() {
     hudActive = true;
     ctx.clearRect(0, 0, hud.width, hud.height);
     if (edit) drawEditHud(ctx);
+    if (opening) drawOpeningsHud(ctx);
     drawRings(ctx);
     if (!isDrawing()) {
       lastHud = { active: false };
@@ -939,8 +1000,32 @@ async function main() {
     }
   }
 
+  /** Openings mode overlay: every opening on every wall, outlined; the
+   *  selected one filled. */
+  function drawOpeningsHud(ctx) {
+    let h;
+    try { h = JSON.parse(app.openings_hud_json()); } catch { return; }
+    if (!h.active) return;
+    ctx.lineJoin = "round";
+    for (const it of h.items) {
+      if (it.pts.length < 2) continue;
+      ctx.beginPath();
+      it.pts.forEach(([x, y], i) => (i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)));
+      ctx.closePath();
+      const a = it.sel ? 0.32 : it.hover ? 0.22 : 0.12;
+      ctx.fillStyle = it.kind === "door" ? `rgba(22,163,74,${a})` : `rgba(47,111,237,${a})`;
+      ctx.fill();
+      ctx.setLineDash(it.niche ? [5 * dpr, 4 * dpr] : []);
+      ctx.strokeStyle = it.kind === "door" ? "#16a34a" : HUD.accent;
+      ctx.lineWidth = (it.sel ? 3.2 : it.hover ? 2.4 : 1.6) * dpr;
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+  }
+
   /** Edit Mode overlay: the profile's faces (solid filled, void
-   *  dotted), edges, point handles, hover/selection, marquee, snap. */
+   *  dotted), edges, point handles, hover/selection, marquee, snap; a
+   *  wall run's footprint (mitered). */
   function drawEditHud(ctx) {
     let h;
     try { h = JSON.parse(app.edit_hud_json()); } catch { return; }
@@ -955,6 +1040,19 @@ async function main() {
     const facesMode = h.mode === "faces";
     ctx.lineJoin = "round";
     ctx.lineCap = "round";
+    // A wall run's footprint: the thickened line (a ring pair when closed).
+    if (h.footprint && h.footprint.length) {
+      ctx.beginPath();
+      for (const ring of h.footprint) {
+        ring.forEach(([x, y], i) => (i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)));
+        ctx.closePath();
+      }
+      ctx.fillStyle = rgbaAccent(0.18);
+      ctx.fill("evenodd");
+      ctx.strokeStyle = rgbaAccent(0.55);
+      ctx.lineWidth = 1.2 * dpr;
+      ctx.stroke();
+    }
     for (const f of h.faces) {
       if (f.pts.length < 3) continue;
       path(f.pts);
@@ -1002,26 +1100,12 @@ async function main() {
       const [x, y] = p.p;
       const pr = p.hover && !p.sel ? r * 1.35 : r;
       ctx.beginPath();
-      if (p.top) {
-        // Top-anchored (a wall point that follows the wall height): a
-        // square handle with a tick pointing up.
-        const q = pr * TOP_ANCHOR_HANDLE_SCALE;
-        ctx.rect(x - q, y - q, 2 * q, 2 * q);
-      } else {
-        ctx.arc(x, y, pr, 0, Math.PI * 2);
-      }
+      ctx.arc(x, y, pr, 0, Math.PI * 2);
       ctx.fillStyle = p.sel ? accent : "#fff";
       ctx.fill();
       ctx.lineWidth = 2 * dpr;
       ctx.strokeStyle = accent;
       ctx.stroke();
-      if (p.top) {
-        const q = pr * TOP_ANCHOR_HANDLE_SCALE;
-        ctx.beginPath();
-        ctx.moveTo(x, y - q);
-        ctx.lineTo(x, y - q - TOP_ANCHOR_TICK_PX * dpr);
-        ctx.stroke();
-      }
     }
     for (const [x1, y1, x2, y2] of h.guides ?? []) {
       ctx.beginPath();
@@ -1114,20 +1198,20 @@ async function main() {
       const hold = editState.mode === "points" ? " · hold an edge to add a point" : "";
       return `${tap} ${noun} to select · drag to move · drag empty space to box-select${hold}`;
     }
-    if (editing() && editState.tool === "window") {
+    if (inOpenings()) {
+      if (openingsState.selected) return COARSE ? "Drag the opening along its wall · set its size below" : `Drag the opening along its wall · ${tap.toLowerCase()} another wall to place more`;
+      if (openingsState.preset === "door") {
+        const d = PRESETS.door;
+        return `${tap} a wall to place a door (${fmtDim(d.width)} × ${fmtDim(d.height)} m)`;
+      }
       const w = PRESETS.window;
-      return `${tap} the wall to place a window (${fmtDim(w.width)} × ${fmtDim(w.height)} m, sill ${fmtDim(w.sill)} m)`;
+      return `${tap} a wall to place a window (${fmtDim(w.width)} × ${fmtDim(w.height)} m, sill ${fmtDim(w.sill)} m)`;
     }
-    if (editing() && editState.tool === "door") {
-      const d = PRESETS.door;
-      return `${tap} the wall to place a door (${fmtDim(d.width)} × ${fmtDim(d.height)} m)`;
+    if (editing() && editState.tool === "extend") {
+      return `${tap} where the wall goes on: a point after its nearest end`;
     }
     if (editing() && editState.tool === "split") {
       return `${tap} two points: a line across the faces to split`;
-    }
-    if (isOpeningTool()) {
-      const what = stats.tool === "door" ? "doors" : "windows";
-      return stats.walls === 0 ? `Draw some walls first — ${what} go into walls` : `${tap} a wall to add ${what} to it`;
     }
     if (stats.tool === "hole") {
       return stats.platesOnLevel === 0
@@ -1155,6 +1239,7 @@ async function main() {
 
   function renderChrome() {
     editState = JSON.parse(app.edit_state_json());
+    renderViewCluster();
     renderEditChrome();
     $("undo").disabled = !stats.canUndo;
     $("redo").disabled = !stats.canRedo;
@@ -1173,15 +1258,7 @@ async function main() {
     const drawing = isDrawing();
     document.body.classList.toggle("drawing", drawing);
     canvas.classList.toggle("drawing", drawing);
-    const opening = isOpeningTool();
-    $("drawbar").hidden = !drawing && !opening;
-    // Window / Door: only the opening choice (there is nothing to draw).
-    $("opening-row").hidden = !opening;
-    for (const id of ["shape-row", "wall-settings", "draw-actions", "draw-reason"]) $(id).hidden = opening;
-    for (const b of document.querySelectorAll("#opening-toggle button")) {
-      b.classList.toggle("on", b.dataset.opening === stats.tool);
-    }
-    if (opening) $("wall-height-mode").hidden = true;
+    $("drawbar").hidden = !drawing;
     if (drawing) {
       const h = JSON.parse(app.hud_json());
       lastHud = h;
@@ -1218,6 +1295,8 @@ async function main() {
   }
 
   // Top bar -------------------------------------------------------------------
+  // ONE history, one control: the same Undo / Redo in every mode (inside
+  // an Edit Mode they stop at the session's entry).
   $("undo").addEventListener("click", () => { if (app.undo()) refresh(); });
   $("redo").addEventListener("click", () => { if (app.redo()) refresh(); });
   for (const b of document.querySelectorAll("#view-toggle button")) {
@@ -1321,20 +1400,14 @@ async function main() {
     if (tool === "hole" && stats.platesOnLevel === 0) {
       toast("Draw a floor plate on this level first — holes are cut into plates", { ms: 3200 });
     }
-    if ((tool === "window" || tool === "door") && stats.walls === 0) {
-      toast(`Draw some walls first — ${tool}s are cut into walls`, { ms: 3200 });
-    }
     renderChrome();
     requestRender();
     return true;
   }
-  // The Window tool button keeps the last opening kind (window / door).
+  // The Window tool opens Openings mode with the last preset used.
   let openingTool = "window";
   for (const b of document.querySelectorAll(".tool[data-tool]")) {
-    b.addEventListener("click", () => setTool(b.dataset.tool === "window" ? openingTool : b.dataset.tool));
-  }
-  for (const b of document.querySelectorAll("#opening-toggle button")) {
-    b.addEventListener("click", () => { openingTool = b.dataset.opening; setTool(openingTool); });
+    b.addEventListener("click", () => (b.dataset.tool === "window" ? beginOpenings(openingTool) : setTool(b.dataset.tool)));
   }
   $("snap-toggle").addEventListener("click", () => {
     snapEnabled = !snapEnabled;
@@ -1348,6 +1421,53 @@ async function main() {
     fitView();
     requestRender();
     sessionSave();
+  });
+
+  // Render mode: shaded, shaded + wireframe, wireframe (the triangle
+  // edges: the real mesh topology). Session state.
+  const RENDER_LABEL = { shaded: "Shaded", "shaded-wire": "Shaded + wireframe", wire: "Wireframe" };
+  function renderViewCluster() {
+    const mode = app.render_mode();
+    $("render-btn").classList.toggle("on", mode !== "shaded");
+    $("render-btn").title = `Render mode: ${RENDER_LABEL[mode]}`;
+    for (const b of document.querySelectorAll("#render-menu button")) {
+      b.classList.toggle("on", b.dataset.render === mode);
+      b.setAttribute("aria-checked", String(b.dataset.render === mode));
+    }
+    // While a wireframe shows, the triangle count of the focus (the
+    // selection or the element being edited) or of the model.
+    const badge = $("tri-badge");
+    badge.hidden = mode === "shaded";
+    if (!badge.hidden) {
+      const st = JSON.parse(app.stats_json());
+      const focus = st.focusTriangles;
+      const name = focus == null ? "Model"
+        : editing() ? editState.name
+        : inOpenings() ? openingsState.selected?.wallName ?? "Wall"
+        : JSON.parse(app.selected_json())?.name;
+      const n = focus ?? st.triangles;
+      badge.textContent = `${name} · ${n.toLocaleString("en-US")} triangle${n === 1 ? "" : "s"}`;
+    }
+  }
+  const closeRenderMenu = () => { $("render-menu").hidden = true; $("render-btn").setAttribute("aria-expanded", "false"); };
+  $("render-btn").addEventListener("click", (e) => {
+    e.stopPropagation();
+    const menu = $("render-menu");
+    menu.hidden = !menu.hidden;
+    $("render-btn").setAttribute("aria-expanded", String(!menu.hidden));
+  });
+  for (const b of document.querySelectorAll("#render-menu button")) {
+    b.addEventListener("click", () => {
+      app.set_render_mode(b.dataset.render);
+      closeRenderMenu();
+      stats = JSON.parse(app.stats_json());
+      renderViewCluster();
+      requestRender();
+      sessionSave();
+    });
+  }
+  document.addEventListener("pointerdown", (e) => {
+    if (!$("render-menu").hidden && !$("render-menu").contains(e.target) && !$("render-btn").contains(e.target)) closeRenderMenu();
   });
 
   // Drawing bar ---------------------------------------------------------------------
@@ -1487,22 +1607,29 @@ async function main() {
     renderChrome();
     requestRender();
   }
-  /** Enter Edit Mode on a wall: its elevation profile, openings, anchors
-   *  (a legacy wall is converted); `preset` arms the Window or Door tool. */
-  function beginWallEdit(id, preset = null) {
+  /** Enter Edit Mode on a wall's run, in plan: its points and segments
+   *  (legacy walls are converted). */
+  function beginWallEdit(id) {
     if (!app.edit_begin_wall(id)) {
-      toast("This wall cannot be edited as a shape", { kind: "error" });
+      toast("This wall cannot be edited", { kind: "error" });
       return;
     }
     enterEditChrome();
-    if (preset) {
-      app.edit_set_tool(preset);
-      refreshEdit();
-    }
+    fitView(); // the run, clear of the edit chrome
+    requestRender();
   }
-  // The Window / Door tool that opened a wall's Edit Mode comes back after
-  // it, ready for the next wall.
-  let resumeTool = null;
+  /** Enter Openings mode: place, move, and size windows and doors on any
+   *  wall. */
+  function beginOpenings(preset = openingTool) {
+    if (inEditChrome()) return;
+    if (!app.openings_begin(preset)) {
+      toast("Add a level first (Menu → Levels)", { kind: "error" });
+      return;
+    }
+    openingTool = preset;
+    if (stats.walls === 0) toast("Draw some walls first — windows and doors go into walls", { ms: 3200 });
+    enterEditChrome();
+  }
   /** Enter Edit Mode on a floor plate (a legacy plate is converted). */
   function beginEdit(id, tool = null) {
     if (!app.edit_begin(id)) {
@@ -1515,45 +1642,35 @@ async function main() {
   function enterEditChrome() {
     if (!$("sheet").hidden) closeSheet(false);
     closePopover();
-    app.edit_set_mode(editState.mode ?? "faces");
+    // A floor plate keeps the selection mode used last (a run starts in
+    // Points, openings have none).
+    const st = JSON.parse(app.edit_state_json());
+    if (st.active && st.target === "floor") app.edit_set_mode(editState.mode ?? "faces");
     refreshEdit();
   }
   function exitEditChrome() {
-    if (resumeTool) {
-      const t = resumeTool;
-      resumeTool = null;
-      app.set_tool(t);
-    }
     refreshEdit();
     renderTreePanel();
     refresh();
     saveNow();
   }
   function renderEditChrome() {
-    const on = editing();
+    openingsState = JSON.parse(app.openings_state_json());
+    const on = inEditChrome();
     document.body.classList.toggle("editing", on);
     $("edit-bar").hidden = !on;
     $("edit-dock").hidden = !on;
     $("edit-panel").hidden = !on;
-    const wallEdit = on && editState.target === "wall";
-    document.body.classList.toggle("edit-wall", wallEdit);
+    const run = editing() && editState.target === "run";
+    document.body.classList.toggle("edit-run", run);
+    document.body.classList.toggle("edit-openings", inOpenings());
     if (!on) return;
-    $("edit-name").textContent = editState.name;
-    // A wall is edited in its elevation: the first view is "Wall".
-    const first = $("edit-view-toggle").firstElementChild;
-    const [view, label] = wallEdit ? ["elevation", "Wall"] : ["plan", "Plan"];
-    if (first.dataset.view !== view) { first.dataset.view = view; first.textContent = label; }
-    const anchor = editState.anchor ?? { selected: 0, top: 0 };
-    $("edit-anchor-row").hidden = !(wallEdit && anchor.selected > 0);
-    for (const b of document.querySelectorAll("#edit-anchor button")) {
-      const all = b.dataset.anchor === "top" ? anchor.top === anchor.selected : anchor.top === 0;
-      b.classList.toggle("on", anchor.selected > 0 && all);
-    }
-    $("edit-undo").disabled = !editState.canUndo;
-    $("edit-redo").disabled = !editState.canRedo;
     for (const b of document.querySelectorAll("#edit-view-toggle button")) {
       b.classList.toggle("on", b.dataset.view === stats.view);
     }
+    if (inOpenings()) { renderOpeningsChrome(); return; }
+    $("edit-caption").textContent = "Editing";
+    $("edit-name").textContent = editState.name;
     for (const b of document.querySelectorAll("[data-edit-mode]")) {
       b.classList.toggle("on", b.dataset.editMode === editState.mode && editState.tool === "select");
     }
@@ -1561,15 +1678,15 @@ async function main() {
       b.classList.toggle("on", b.dataset.editTool === editState.tool);
     }
     $("edit-delete").disabled = !editState.canDelete;
+    if (run) { renderRunPanel(); return; }
     // Thickness panel: the selected faces, or the defaults for new faces.
     const panel = editState.panel;
     const sel = panel.target === "selection";
     $("edit-panel").classList.toggle("target-new", !sel);
-    const pts = wallEdit && !sel ? anchor.selected : 0;
     $("edit-panel-title").textContent = sel
       ? `${editState.selection} face${editState.selection === 1 ? "" : "s"} selected`
-      : pts ? `${pts} point${pts === 1 ? "" : "s"} selected` : "New faces";
-    $("edit-panel-note").textContent = sel ? "" : pts ? "thickness: for new faces" : "select faces to change them";
+      : "New faces";
+    $("edit-panel-note").textContent = sel ? "" : "select faces to change them";
     const solid = panel.solid, voidP = panel.void;
     $("edit-solid-row").hidden = !solid;
     $("edit-void-row").hidden = !voidP;
@@ -1588,34 +1705,97 @@ async function main() {
     const shapeRow = $("shape-toggle");
     shapeRow.hidden = editState.tool === "split";
   }
+  /** The wall run panel: thickness, side, closed, height mode. */
+  function renderRunPanel() {
+    const r = editState.run;
+    if (!r) return;
+    $("edit-panel").classList.remove("target-new");
+    $("edit-panel-title").textContent = `Wall run · ${r.walls} wall${r.walls === 1 ? "" : "s"}`;
+    $("edit-panel-note").textContent = `${r.points} points · ${r.closed ? "closed" : "open"}`;
+    guardValue($("run-thickness"), r.thickness.toFixed(2));
+    $("run-flip").classList.toggle("on", r.flip);
+    $("run-flip").setAttribute("aria-pressed", String(r.flip));
+    $("run-closed").classList.toggle("on", r.closed);
+    $("run-closed").setAttribute("aria-pressed", String(r.closed));
+    $("run-closed").disabled = !r.closed && r.points < 3;
+    for (const b of document.querySelectorAll("#run-mode button")) b.classList.toggle("on", b.dataset.runMode === r.mode);
+    $("run-fixed-line").hidden = r.mode !== "fixed";
+    $("run-upto-line").hidden = r.mode !== "upto";
+    guardValue($("run-height"), r.height.toFixed(2));
+    guardValue($("run-offset"), r.topOffset.toFixed(2));
+    const picker = $("run-top");
+    const planes = JSON.parse(app.wall_settings_json()).planes;
+    const key = planes.map((p) => `${p.id}:${p.path}`).join("|");
+    if (picker.dataset.key !== key) { picker.dataset.key = key; planeOptions(picker, planes, r.topPlane); }
+    if (r.topPlane != null) guardValue(picker, String(r.topPlane));
+  }
+  /** Openings mode chrome: the preset, and the selected opening's size. */
+  function renderOpeningsChrome() {
+    const o = openingsState;
+    $("edit-caption").textContent = "Placing";
+    $("edit-name").textContent = "Windows and doors";
+    for (const b of document.querySelectorAll("[data-opening-preset]")) b.classList.toggle("on", b.dataset.openingPreset === o.preset);
+    $("edit-delete").disabled = !o.selected;
+    const wallBtn = $("edit-view-toggle").querySelector('[data-view="elevation"]');
+    wallBtn.disabled = o.faced == null;
+    const sel = o.selected;
+    $("edit-panel").classList.toggle("target-new", !sel);
+    const noun = sel ? (sel.kind === "door" ? "Door" : "Window") : null;
+    $("edit-panel-title").textContent = sel ? `${noun} in ${sel.wallName}` : `${o.count} opening${o.count === 1 ? "" : "s"}`;
+    $("edit-panel-note").textContent = sel ? `${fmtM(sel.offset)} from the wall start` : "tap an opening to change it";
+    for (const row of document.querySelectorAll("#edit-panel .edit-row.openings-only")) row.hidden = !sel;
+    if (!sel) return;
+    guardValue($("opening-width"), sel.width.toFixed(2));
+    guardValue($("opening-height"), sel.height.toFixed(2));
+    guardValue($("opening-sill"), sel.sill.toFixed(2));
+    $("opening-sill-line").hidden = sel.kind === "door";
+    const through = sel.depth == null;
+    $("opening-through").classList.toggle("on", through);
+    $("opening-through").setAttribute("aria-pressed", String(through));
+    $("opening-depth-stepper").classList.toggle("dim", through);
+    guardValue($("opening-depth"), (sel.depth ?? OPENING_NICHE_DEPTH_M).toFixed(2));
+  }
+  let lastReason = "";
+  /** A drag's refusal, once per message. */
+  const showReason = (reason) => {
+    if (reason !== lastReason) toast(reason, { kind: "error" });
+    lastReason = reason;
+  };
   function guardValue(input, v) {
     if (document.activeElement !== input && input.value !== v) input.value = v;
   }
   $("edit-confirm").addEventListener("click", () => editConfirm());
   $("edit-cancel").addEventListener("click", () => editCancel());
   function editConfirm() {
+    if (inOpenings()) {
+      const changed = app.openings_confirm();
+      exitEditChrome();
+      if (changed) toast("Openings saved", { kind: "ok", ms: 1600 });
+      return;
+    }
     const res = JSON.parse(app.edit_confirm());
     exitEditChrome();
     if (res.deleted) {
-      toast(`${res.name} deleted — it had no faces left`, { action: { label: "Undo", fn: () => { if (app.undo()) refresh(); } } });
+      toast(`${res.name} deleted — it had no faces left`);
     } else if (res.changed) {
       toast(`${res.name} saved`, { kind: "ok", ms: 1600 });
     }
   }
   async function editCancel() {
-    if (editState.canUndo) {
+    const openings = inOpenings();
+    if (openings ? openingsState.canUndo : editState.canUndo) {
       const ok = await confirmDialog({
         title: "Discard your changes?",
-        message: `Everything you changed in ${editState.name} since you started editing will be undone.`,
+        message: openings
+          ? "Every window and door you placed or changed since you started will be undone."
+          : `Everything you changed in ${editState.name} since you started editing will be undone.`,
         ok: "Discard", danger: true,
       });
       if (!ok) return;
     }
-    app.edit_cancel();
+    if (openings) app.openings_cancel(); else app.edit_cancel();
     exitEditChrome();
   }
-  $("edit-undo").addEventListener("click", () => { if (app.undo()) refreshEdit(); });
-  $("edit-redo").addEventListener("click", () => { if (app.redo()) refreshEdit(); });
   for (const b of document.querySelectorAll("#edit-view-toggle button")) {
     b.addEventListener("click", () => {
       app.set_view_mode(b.dataset.view);
@@ -1623,6 +1803,86 @@ async function main() {
       sessionSave();
     });
   }
+  // Wall run settings (one undo step each; typing coalesces).
+  const runSet = (o) => {
+    const res = JSON.parse(app.edit_run_settings(
+      o.thickness ?? NaN, o.flip === undefined ? -1 : o.flip ? 1 : 0, o.closed === undefined ? -1 : o.closed ? 1 : 0,
+      o.mode ?? "", o.plane ?? -1, o.offset ?? NaN, o.height ?? NaN));
+    if (res.result === "rejected") toast(res.reason, { kind: "error" });
+    refresh();
+  };
+  const RUN_STEP = { thickness: WALL_THICKNESS_STEP_M, height: WALL_HEIGHT_STEP_M, offset: WALL_TOP_OFFSET_STEP_M };
+  for (const b of document.querySelectorAll("[data-run-step]")) {
+    b.addEventListener("click", () => {
+      const r = editState.run;
+      if (!r) return;
+      const f = b.dataset.runStep;
+      const cur = { thickness: r.thickness, height: r.height, offset: r.topOffset }[f];
+      const v = Math.round((cur + Number(b.dataset.step) * RUN_STEP[f]) * 100) / 100;
+      runSet(f === "thickness" ? { thickness: v } : f === "height" ? { mode: "fixed", height: v } : { mode: "upto", offset: v });
+      app.edit_end_gesture();
+    });
+  }
+  for (const [id, f] of [["run-thickness", "thickness"], ["run-height", "height"], ["run-offset", "offset"]]) {
+    $(id).addEventListener("change", (e) => {
+      const v = parseNum(e.target.value);
+      if (Number.isFinite(v)) runSet(f === "thickness" ? { thickness: v } : f === "height" ? { mode: "fixed", height: v } : { mode: "upto", offset: v });
+      app.edit_end_gesture();
+    });
+  }
+  $("run-flip").addEventListener("click", () => runSet({ flip: !editState.run?.flip }));
+  $("run-closed").addEventListener("click", () => runSet({ closed: !editState.run?.closed }));
+  for (const b of document.querySelectorAll("#run-mode button")) {
+    b.addEventListener("click", () => {
+      const r = editState.run;
+      if (!r || r.mode === b.dataset.runMode) return;
+      if (b.dataset.runMode === "fixed") runSet({ mode: "fixed" });
+      else {
+        const planes = JSON.parse(app.wall_settings_json()).planes;
+        const base = planes.find((p) => p.id === r.base)?.elevation ?? 0;
+        runSet({ mode: "upto", plane: planeAbove(planes, base) ?? -1 });
+      }
+    });
+  }
+  $("run-top").addEventListener("change", (e) => runSet({ mode: "upto", plane: Number(e.target.value) }));
+
+  // Openings mode: preset, and the selected opening's size (typing and
+  // stepping coalesce per field until the change ends).
+  for (const b of document.querySelectorAll("[data-opening-preset]")) {
+    b.addEventListener("click", () => {
+      openingTool = b.dataset.openingPreset;
+      app.openings_set_preset(openingTool);
+      refresh();
+    });
+  }
+  const openingSet = (o) => {
+    const res = JSON.parse(app.openings_set(o.width ?? NaN, o.height ?? NaN, o.sill ?? NaN, o.depth ?? NaN));
+    if (res.result === "rejected") toast(res.reason, { kind: "error" });
+    refresh();
+  };
+  for (const b of document.querySelectorAll("[data-opening-step]")) {
+    b.addEventListener("click", () => {
+      const sel = openingsState.selected;
+      if (!sel) return;
+      const f = b.dataset.openingStep;
+      const cur = f === "depth" ? (sel.depth ?? OPENING_NICHE_DEPTH_M) : sel[f];
+      openingSet({ [f]: Math.round((cur + Number(b.dataset.step) * OPENING_STEP_M) * 100) / 100 });
+      app.end_gesture();
+    });
+  }
+  for (const f of ["width", "height", "sill", "depth"]) {
+    $(`opening-${f}`).addEventListener("change", (e) => {
+      const v = parseNum(e.target.value);
+      if (Number.isFinite(v)) openingSet({ [f]: v });
+      app.end_gesture();
+    });
+  }
+  $("opening-through").addEventListener("click", () => {
+    const sel = openingsState.selected;
+    if (sel) openingSet({ depth: sel.depth == null ? OPENING_NICHE_DEPTH_M : -1 });
+    app.end_gesture();
+  });
+
   for (const b of document.querySelectorAll("[data-edit-mode]")) {
     b.addEventListener("click", () => {
       app.edit_set_tool("select");
@@ -1637,14 +1897,12 @@ async function main() {
       refreshEdit();
     });
   }
-  for (const b of document.querySelectorAll("#edit-anchor button")) {
-    b.addEventListener("click", () => {
-      app.edit_set_anchor(b.dataset.anchor === "top");
-      refreshEdit();
-    });
-  }
   $("edit-delete").addEventListener("click", () => editDelete());
   function editDelete() {
+    if (inOpenings()) {
+      if (app.openings_delete()) refresh();
+      return;
+    }
     const res = JSON.parse(app.edit_delete());
     if (res.result === "rejected") toast(res.reason, { kind: "error" });
     refreshEdit();
@@ -1710,6 +1968,12 @@ async function main() {
       return;
     }
     if (!$("dialog-backdrop").hidden) return;
+    if (inOpenings()) {
+      if (e.key === "Enter") { e.preventDefault(); editConfirm(); }
+      else if (e.key === "Escape") { e.preventDefault(); app.openings_tap(-1e9, -1e9, 0, 0); refresh(); }
+      else if (e.key === "Delete" || e.key === "Backspace") { e.preventDefault(); editDelete(); }
+      return;
+    }
     if (editing() && !isDrawing()) {
       if (e.key === "Enter") { e.preventDefault(); editConfirm(); }
       else if (e.key === "Escape") { e.preventDefault(); app.edit_tap(-1e9, -1e9, 0, false); refreshEdit(); }
@@ -1736,13 +2000,13 @@ async function main() {
       e.preventDefault();
       deleteElement(app.selection());
     }
-    if (mod || e.altKey || editing()) return;
+    if (mod || e.altKey || inEditChrome()) return;
     const k = e.key.toLowerCase();
     if (k === "v" || k === "s") setTool("select");
     else if (k === "f") setTool("plate");
     else if (k === "h") setTool("hole");
     else if (k === "w") setTool("wall");
-    else if (k === "n") setTool(openingTool);
+    else if (k === "n") beginOpenings(openingTool);
     else if (k === "r" && isDrawing()) { app.set_shape(stats.shape === "rect" ? "polygon" : "rect"); stats = JSON.parse(app.stats_json()); renderChrome(); requestRender(); }
     else if (k === "p") { app.set_view_mode("plan"); stats = JSON.parse(app.stats_json()); renderChrome(); requestRender(); }
     else if (k === "3") { app.set_view_mode("3d"); stats = JSON.parse(app.stats_json()); renderChrome(); requestRender(); }
@@ -1760,6 +2024,7 @@ async function main() {
     }
     else if (sheetPage === "properties") closeSheet(false);
     renderTreePanel();
+    renderViewCluster();
     requestRender();
   }
 
@@ -1798,9 +2063,7 @@ async function main() {
     if (app.delete_element(id)) {
       if (sheetPage === "properties") closeSheet(false);
       refresh();
-      toast(`Deleted ${name}`, {
-        action: { label: "Undo", fn: () => { if (app.undo()) refresh(); } },
-      });
+      toast(`Deleted ${name}`);
     }
   }
 
@@ -1820,12 +2083,14 @@ async function main() {
     else if (sheetPage && sheetPage !== page) sheetStack.push(sheetPage);
     sheetPage = page;
     sheet.hidden = false;
+    document.body.classList.add("sheet-open");
     sheet.classList.toggle("compact", page === "properties");
     renderSheet();
   }
   function closeSheet(deselect = true) {
     const was = sheetPage;
     sheet.hidden = true;
+    document.body.classList.remove("sheet-open");
     sheetPage = null;
     sheetStack = [];
     sheetBody.replaceChildren();
@@ -2021,35 +2286,52 @@ async function main() {
   function renderTreePanel() {
     const panel = $("tree-panel");
     // Hidden in the focused flows (Edit Mode, a wall's elevation for windows).
-    const show = treeOpen && innerWidth >= TREE_DEFAULT_OPEN_MIN_PX && !editing();
+    const show = treeOpen && innerWidth >= TREE_DEFAULT_OPEN_MIN_PX && !inEditChrome();
     panel.hidden = !show;
     $("tree-btn").classList.toggle("on", show || sheetPage === "model");
     $("tree-btn").setAttribute("aria-pressed", String(show || sheetPage === "model"));
     if (show) renderTree($("tree-body"));
   }
-  /** Keep a fitted view clear of the open Model panel (desktop): shift
-   *  it right by half the covered width and zoom out to match. */
-  function clearOfTreePanel() {
-    const panel = $("tree-panel");
-    if (panel.hidden || app.view_mode() === "elevation") return;
+  /** Tell the app which canvas margins the page's panels cover (the
+   *  bars, docks, the Model panel, the edit panel, the sheet), so a fit
+   *  frames the free part of the view. A panel counts on the edge it is
+   *  attached to. */
+  function updateViewInsets() {
     const r = canvas.getBoundingClientRect();
-    const covered = Math.max(0, panel.getBoundingClientRect().right - r.left);
-    if (covered <= 0 || covered >= r.width) return;
     const k = canvas.width / r.width;
-    const cx = canvas.width / 2, cy = canvas.height / 2;
-    app.pan(cx, cy, cx + (covered * k) / 2, cy);
-    app.zoom_at(r.width / (r.width - covered), cx + (covered * k) / 2, cy);
+    const ins = { left: 0, top: 0, right: 0, bottom: 0 }; // CSS px
+    // (The small Fit / View pill sits in a corner: it does not count.)
+    for (const id of ["topbar", "edit-bar", "toolbar", "edit-dock", "tree-panel", "edit-panel", "sheet", "drawbar"]) {
+      const node = $(id);
+      // (Fixed panels have no offsetParent: ask the layout directly.)
+      if (!node || node.hidden || getComputedStyle(node).display === "none") continue;
+      const b = node.getBoundingClientRect();
+      if (b.width === 0 || b.height === 0) continue;
+      // A wide bar belongs to the top or bottom, a tall one to a side, a
+      // small panel to its nearest edge.
+      const wide = b.width >= r.width * 0.5, tall = b.height >= r.height * 0.5;
+      if (wide && tall) continue;
+      const gap = { left: b.left - r.left, right: r.right - b.right, top: b.top - r.top, bottom: r.bottom - b.bottom };
+      const edge = wide ? (gap.top < gap.bottom ? "top" : "bottom")
+        : tall ? (gap.left < gap.right ? "left" : "right")
+        : Object.keys(gap).reduce((a, e) => (gap[e] < gap[a] ? e : a));
+      const cover = { left: b.right - r.left, right: r.right - b.left, top: b.bottom - r.top, bottom: r.bottom - b.top }[edge];
+      ins[edge] = Math.max(ins[edge], cover);
+    }
+    app.set_view_insets(ins.left * k, ins.top * k, ins.right * k, ins.bottom * k);
   }
-  /** Fit the view to the model (clear of the Model panel). */
+  /** Fit the view to the focus (the selection, the element edited, or
+   *  the model), clear of the panels. */
   function fitView() {
+    updateViewInsets();
     app.zoom_fit();
-    clearOfTreePanel();
   }
 
   /** Select an element from the tree: select, frame, show properties. */
   function pickFromTree(id) {
     if (sheetPage === "model") closeSheet(false);
-    if (app.frame_element(id)) clearOfTreePanel();
+    updateViewInsets();
+    app.frame_element(id);
     selectElement(id);
     renderLevelChip();
     renderTreePanel();
@@ -2102,13 +2384,6 @@ async function main() {
         },
       }));
     }
-    const wire = el("label", { class: "switch" }, el("input", { type: "checkbox", id: "wireframe-toggle" }), el("span"));
-    wire.querySelector("input").checked = app.wireframe();
-    wire.querySelector("input").addEventListener("change", (e) => {
-      app.set_wireframe(e.target.checked);
-      requestRender();
-      sessionSave();
-    });
     sheetBody.replaceChildren(
       group("Project",
         setRowText(row({ ico: "file", label: "", testid: "menu-new", onclick: newProject }), "New project"),
@@ -2123,9 +2398,6 @@ async function main() {
       ),
       group("Snap step",
         el("div", { class: "field" }, el("span", { class: "field-label", html: `${icon("magnet")} Grid (m)` }), snapSeg),
-      ),
-      group("Display",
-        el("div", { class: "field" }, el("label", { for: "wireframe-toggle", text: "Wireframe" }), wire),
       ),
       group(null,
         setRowText(row({ ico: "info", chev: true, testid: "menu-about", onclick: () => openSheet("about") }), "About", ""),
@@ -2310,11 +2582,11 @@ async function main() {
         el("div", { class: "btn-row", style: "margin-bottom:10px" },
           el("button", {
             type: "button", class: "btn", id: "prop-add-window",
-            html: `${icon("plus")} Window`, onclick: () => beginWallEdit(e.id, "window"),
+            html: `${icon("plus")} Window`, onclick: () => beginOpenings("window"),
           }),
           el("button", {
             type: "button", class: "btn", id: "prop-add-door",
-            html: `${icon("plus")} Door`, onclick: () => beginWallEdit(e.id, "door"),
+            html: `${icon("plus")} Door`, onclick: () => beginOpenings("door"),
           })),
       );
     }
@@ -2426,7 +2698,7 @@ async function main() {
           onclick: () => {
             if (app.delete_opening(e.id, f.id)) {
               refresh();
-              toast(`${label} removed`, { action: { label: "Undo", fn: () => { if (app.undo()) refresh(); } } });
+              toast(`${label} removed`);
             }
           },
         }),
@@ -2448,7 +2720,7 @@ async function main() {
           onclick: () => {
             if (app.delete_hole(e.id, h.wire)) {
               refresh();
-              toast(`${noun} ${h.index} removed`, { action: { label: "Undo", fn: () => { if (app.undo()) refresh(); } } });
+              toast(`${noun} ${h.index} removed`);
             }
           },
         }),
@@ -2527,12 +2799,11 @@ async function main() {
   async function deleteWorkplane(id) {
     const w = JSON.parse(app.workplane_json(id));
     if (!w) return;
-    const undo = { label: "Undo", fn: () => { if (app.undo()) refresh(); } };
     const result = app.delete_workplane(id);
     if (result === "deleted") {
       if (sheetPage === "workplane") closeSheet(false);
       refresh();
-      toast(`Workplane "${w.name}" deleted`, { action: undo });
+      toast(`Workplane "${w.name}" deleted`);
     } else if (result === "has_dependents") {
       const ok = await confirmDialog({
         title: `Delete workplane "${w.name}"?`,
@@ -2542,7 +2813,7 @@ async function main() {
       if (ok && app.delete_workplane_cascade(id)) {
         if (sheetPage === "workplane") closeSheet(false);
         refresh();
-        toast(`Workplane "${w.name}" and its contents deleted`, { action: undo });
+        toast(`Workplane "${w.name}" and its contents deleted`);
       }
     } else {
       toast(`Could not delete the workplane (${result})`, { kind: "error" });
@@ -2650,7 +2921,7 @@ async function main() {
       const result = app.delete_level(lvl.id);
       if (result === "deleted") {
         refresh();
-        toast(`Level "${name}" deleted`, { action: { label: "Undo", fn: () => { if (app.undo()) refresh(); } } });
+        toast(`Level "${name}" deleted`);
       } else if (result === "has_dependents") {
         const info = JSON.parse(app.levels_json()).levels.find((l) => l.id === lvl.id);
         const ok = await confirmDialog({
@@ -2661,7 +2932,7 @@ async function main() {
         });
         if (ok && app.delete_level_cascade(lvl.id)) {
           refresh();
-          toast(`Level "${name}" and its elements deleted`, { action: { label: "Undo", fn: () => { if (app.undo()) refresh(); } } });
+          toast(`Level "${name}" and its elements deleted`);
         }
       } else {
         toast(`Could not delete the level (${result})`, { kind: "error" });
@@ -2839,6 +3110,9 @@ async function main() {
     editProfile: () => JSON.parse(app.edit_profile_json()),
     editHud: () => JSON.parse(app.edit_hud_json()),
     tree: () => JSON.parse(app.tree_json()),
+    touchClass: () => lastTouchClass,
+    gesture: () => ({ pointers: pointers.size, mode }),
+    camera: () => JSON.parse(app.camera_json()),
     wallSettings: () => JSON.parse(app.wall_settings_json()),
     hud: () => JSON.parse(app.hud_json()),
     selected: () => JSON.parse(app.selected_json()),

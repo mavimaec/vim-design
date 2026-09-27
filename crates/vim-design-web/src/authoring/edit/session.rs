@@ -51,10 +51,6 @@ pub struct EditSession<P: ProfileModel> {
     pub new_thickness: f64,
     pub new_void_depth: f64,
     pub new_void_through: bool,
-    /// Wall profiles: points anchored to the wall's TOP reference (they
-    /// follow the wall height) — a mirror of the wall's `top_points`,
-    /// reloaded with the profile. Unused for floor plates.
-    pub top_points: BTreeSet<PointId>,
 }
 
 impl<P: ProfileModel> EditSession<P> {
@@ -72,7 +68,6 @@ impl<P: ProfileModel> EditSession<P> {
             new_thickness: DEFAULT_SOLID_THICKNESS_M,
             new_void_depth: DEFAULT_VOID_DEPTH_M,
             new_void_through: true,
-            top_points: BTreeSet::new(),
         }
     }
 
@@ -99,7 +94,6 @@ impl<P: ProfileModel> EditSession<P> {
         self.drag = None;
         let view = self.model.view();
         self.selection.prune(&view);
-        self.top_points.retain(|id| view.point(*id).is_some());
         if self.hover.is_some() {
             self.hover = None;
         }
@@ -167,12 +161,6 @@ impl<P: ProfileModel> EditSession<P> {
         }
         d.preview?;
         Ok(Some(self.move_edit(d.delta)))
-    }
-
-    /// The points of the selection (a point, an edge's two points, or a
-    /// face's loop) — what an anchor change applies to.
-    pub fn selected_points(&self) -> BTreeSet<PointId> {
-        super::interact::moving_points(&self.model.view(), &self.selection)
     }
 
     /// The edit deleting the current selection.
@@ -260,24 +248,5 @@ mod tests {
         s.set_mode(SelectMode::Faces);
         assert!(s.selection.is_empty(), "switching modes clears the selection");
         assert!(matches!(s.move_edit([1.0, 0.0]), Edit::MoveFaces { .. }));
-    }
-
-    #[test]
-    fn anchors_follow_the_selection_and_the_profile() {
-        let mut s = session();
-        let top_right = corner(&s, [4.0, 4.0]);
-        s.set_mode(SelectMode::Edges);
-        let top_left = corner(&s, [0.0, 4.0]);
-        s.tap(Some(Hit::Edge { edge: crate::authoring::edit::EdgeKey::new(top_left, top_right), uv: [2.0, 4.0] }), false);
-        let ids = s.selected_points();
-        assert_eq!(ids.len(), 2, "an edge anchors both its points");
-        s.top_points = ids;
-        // Deleting a point drops it from the anchors.
-        s.set_mode(SelectMode::Points);
-        s.tap(Some(Hit::Point(top_left)), false);
-        let del = s.delete_edit().expect("delete");
-        let next = s.model.apply(&del).expect("apply");
-        s.set_model(next);
-        assert_eq!(s.top_points.len(), 1);
     }
 }

@@ -299,8 +299,19 @@ pub struct Renderer {
     fade: [f32; 4],
     edge_eye: [f32; 4],
     backend: &'static str,
+    /// Draw the triangle edges (the mesh topology) over the scene.
     pub wireframe: bool,
+    /// Draw the shaded triangles (off: wireframe only).
+    pub shaded: bool,
+    /// Draw the feature-edge layer.
+    pub feature_edges: bool,
+    /// Color of the triangle-edge wireframe (alpha-blended).
+    pub wire_color: [f32; 4],
 }
+
+/// Default wireframe color: a dark slate, translucent so dense curved
+/// meshes stay readable.
+pub const DEFAULT_WIRE_COLOR: [f32; 4] = [0.04, 0.05, 0.07, 0.42];
 
 fn f32s_to_bytes(data: &[f32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len() * 4);
@@ -759,6 +770,9 @@ impl Renderer {
             edge_eye: [0.0; 4],
             backend,
             wireframe: true,
+            shaded: true,
+            feature_edges: true,
+            wire_color: DEFAULT_WIRE_COLOR,
         })
     }
 
@@ -1077,7 +1091,7 @@ impl Renderer {
         let mut globals = [0f32; 32];
         globals[..16].copy_from_slice(&view_proj.to_cols_array());
         globals[16..20].copy_from_slice(&[0.45, -0.55, 0.72, f32::from(gamma_encode)]);
-        globals[20..24].copy_from_slice(&[0.04, 0.05, 0.07, 0.42]);
+        globals[20..24].copy_from_slice(&self.wire_color);
         globals[24..28].copy_from_slice(&self.fade);
         globals[28..32].copy_from_slice(&self.edge_eye);
         self.queue
@@ -1085,7 +1099,7 @@ impl Renderer {
         let mut any_edges = false;
         for (i, (id, m)) in draws.iter().enumerate() {
             let style = self.styles.get(id).copied().unwrap_or(self.default_style);
-            any_edges |= style.edge[3] > 0.0;
+            any_edges |= style.edge[3] > 0.0 && self.feature_edges;
             let mut data = [0f32; 28];
             data[..16].copy_from_slice(&m.to_cols_array());
             data[16..20].copy_from_slice(&style.tint);
@@ -1150,7 +1164,7 @@ impl Renderer {
 
             pass.set_pipeline(&self.fill_pipeline);
             pass.set_bind_group(0, &self.globals_bind, &[]);
-            for (i, (id, _)) in draws.iter().enumerate() {
+            for (i, (id, _)) in draws.iter().enumerate().filter(|_| self.shaded) {
                 let Some(mesh) = self.meshes.get(id) else { continue };
                 pass.set_bind_group(1, &self.model_bind, &[(i as u32) * MODEL_STRIDE as u32]);
                 pass.set_vertex_buffer(0, mesh.vertices.slice(..));

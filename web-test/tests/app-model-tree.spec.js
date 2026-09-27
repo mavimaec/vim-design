@@ -413,11 +413,10 @@ test("walls up to a plane: new walls and properties; the top level drags the hei
   expect(ws.effectiveHeight).toBeNull();
   await page.locator('#wall-mode-toggle button[data-wall-mode="fixed"]').click();
 
-  // A window in the bottom wall (the Window tool).
+  // A window in the bottom wall (the Window tool: Openings mode).
   const bottom = made.find((w) => w.start[1] === -2 && w.end[1] === -2);
-  await tool(page, "window");
+  await page.locator('.tool[data-tool="window"]').click();
   await tapWorld(page, 0, -1.92);
-  await tapWall(page, bottom.id, 2.0, 1.5);
   await page.locator("#edit-confirm").click();
   expect(voidsOf(await wallById(page, bottom.id))).toHaveLength(1);
 
@@ -463,124 +462,7 @@ test("walls up to a plane: new walls and properties; the top level drags the hei
   expect(errors).toEqual([]);
 });
 
-test("wall Edit Mode: window, door, niche, gable apex (anchor Top, drag); volume + bbox; ✗ byte-identical; ✓ one undo; reload", async ({ page }) => {
-  const errors = await openApp(page);
-  // One free-standing wall, 6 m long (drawn left to right: material on
-  // the +y side), 2.7 m high, 0.2 m thick.
-  await tool(page, "wall");
-  await shape(page, "polygon");
-  await tapWorld(page, -3, 0);
-  await tapWorld(page, 3, 0);
-  await page.locator("#finish-draw").click();
-  const [wall] = await walls(page);
-  expect(wall.length).toBeCloseTo(6, 9);
-  await tool(page, "select");
-  await tapWorld(page, 0, 0.1);
-  expect((await stats(page)).selection).toBe(wall.id);
-  const before = await savedBytes(page);
-
-  // Session 1: a window, then ✗ — the document is byte-identical.
-  await page.locator("#prop-edit").click();
-  expect(await editState(page)).toMatchObject({ active: true, target: "wall", tool: "select" });
-  await editTool(page, "window");
-  await tapWall(page, wall.id, 1.5, 1.5);
-  expect(voidsOf(await wallById(page, wall.id))).toHaveLength(1);
-  await page.locator("#edit-cancel").click();
-  await page.locator("#dialog-ok").click();
-  expect(await savedBytes(page)).toBe(before);
-
-  // Session 2: window + door + niche + gable apex, then ✓.
-  await tapWorld(page, 0, 0.1);
-  await page.locator("#prop-edit").click();
-  await editTool(page, "window");
-  await tapWall(page, wall.id, 1.5, 1.5);
-  await editTool(page, "door");
-  await tapWall(page, wall.id, 4.5, 1.0);
-  // Niche: a rectangle void, then a depth of 0.1 m (under the thickness).
-  await editTool(page, "void");
-  await shape(page, "rect");
-  await tapWall(page, wall.id, 2.6, 0.5);
-  await tapWall(page, wall.id, 3.4, 1.5);
-  await editMode(page, "faces");
-  await tapWall(page, wall.id, 3.0, 1.0);
-  let es = await editState(page);
-  expect(es.panel.void).toMatchObject({ count: 1, through: true });
-  await page.locator("#edit-depth").fill("0.1");
-  await page.locator("#edit-depth").press("Enter");
-  let w = await wallById(page, wall.id);
-  const byNoun = (w) => {
-    const vs = voidsOf(w);
-    return {
-      door: vs.filter((f) => Math.min(...f.outline.map((p) => p[1])) < 0),
-      niche: vs.filter((f) => f.depth != null),
-      window: vs.filter((f) => f.depth == null && Math.min(...f.outline.map((p) => p[1])) >= 0),
-    };
-  };
-  let n = byNoun(w);
-  expect([n.window.length, n.door.length, n.niche.length]).toEqual([1, 1, 1]);
-  expect(n.niche[0].depth).toBeCloseTo(0.1, 9);
-
-  // Gable: hold on the top edge (Points mode) -> a new point, anchored
-  // to the top (it lies between two top-anchored corners); drag it up.
-  await editMode(page, "points");
-  await longPressClient(page, await wallClient(page, wall.id, 3.0, 2.7));
-  es = await editState(page);
-  expect(es.anchor).toEqual({ selected: 1, top: 1 });
-  await expect(page.locator('#edit-anchor button[data-anchor="top"]')).toHaveClass(/on/);
-  // Anchor Bottom and back to Top (each one step, the point stays put).
-  await page.locator('#edit-anchor button[data-anchor="bottom"]').click();
-  expect((await editState(page)).anchor).toEqual({ selected: 1, top: 0 });
-  await page.locator('#edit-anchor button[data-anchor="top"]').click();
-  expect((await editState(page)).anchor).toEqual({ selected: 1, top: 1 });
-  await dragClient(page, await wallClient(page, wall.id, 3.0, 2.7), await wallClient(page, wall.id, 3.0, 3.7));
-  const prof = await profile(page);
-  expect(prof.points.some((p) => Math.abs(p.uv[0] - 3) < 1e-6 && Math.abs(p.uv[1] - 3.7) < 1e-6), "the apex at 3.7 m").toBe(true);
-  const hud = await page.evaluate(() => window.__author.editHud());
-  expect(hud.points.filter((p) => p.top)).toHaveLength(3);
-  // Fit: the whole gable in view.
-  await page.evaluate(() => { window.__author.app.zoom_fit(); window.__author.refresh(); });
-  await shot(page, "wall-edit");
-  await page.locator("#edit-confirm").click();
-  expect((await editState(page)).active).toBe(false);
-
-  // The element: a gable 3.7 m high, net volume = 0.2 × (solid − window −
-  // door part inside the wall) − the niche's 0.1 m pocket.
-  w = await wallById(page, wall.id);
-  expect(w.bbox[1][2]).toBeCloseTo(3.7, 4);
-  const solidArea = 6 * 2.7 + 0.5 * 6 * 1.0;
-  const expected = 0.2 * (solidArea - 1.2 * 1.2 - 0.9 * 2.1) - 0.8 * 1.0 * 0.1;
-  expect(w.volume).toBeCloseTo(expected, 3);
-  expect(w.topPoints).toHaveLength(3);
-
-  // ✓ is one main undo step; redo brings it back.
-  await page.locator("#undo").click();
-  expect(await savedBytes(page)).toBe(before);
-  await page.locator("#redo").click();
-  const after = await savedBytes(page);
-
-  // The height follows the apex's anchor: a taller wall lifts the gable.
-  await tapWorld(page, 0, 0.1);
-  await page.locator("#prop-height").fill("3.0");
-  await page.locator("#prop-height").press("Enter");
-  expect((await wallById(page, wall.id)).bbox[1][2]).toBeCloseTo(4.0, 4);
-  await page.locator("#undo").click();
-  await page.locator("#sheet-close").click();
-
-  // Reload keeps the wall as edited.
-  await page.evaluate(() => window.__author.saveNow());
-  await page.reload();
-  await page.waitForFunction(() => window.__author?.ready === true, null, { timeout: 90_000 });
-  expect(await savedBytes(page)).toBe(after);
-  n = byNoun(await wallById(page, wall.id));
-  expect([n.window.length, n.door.length, n.niche.length]).toEqual([1, 1, 1]);
-  await page.locator('#view-toggle button[data-view="3d"]').click();
-  await page.locator("#fit-btn").click();
-  await shot(page, "wall-door-window");
-  expect((await stats(page)).errors).toEqual([]);
-  expect(errors).toEqual([]);
-});
-
-test("legacy walls (v2 fixture): shown and selectable; the pencil converts one with its window; ✗ undoes it, ✓ keeps it; the Window tool converts too", async ({ page }) => {
+test("legacy walls (v2 fixture): shown and selectable; the pencil converts them (with their windows) into the run's plan Edit Mode; ✗ undoes it, ✓ keeps it; Openings mode converts too", async ({ page }) => {
   const errors = await openApp(page);
   await importFixture(page, FIXTURE_V2);
   if (mobile()) {
@@ -595,45 +477,46 @@ test("legacy walls (v2 fixture): shown and selectable; the pencil converts one w
   expect(w1.windows).toHaveLength(1);
   const bytes = await savedBytes(page);
 
-  // The pencil converts it inside the session.
+  // The pencil converts the level's legacy walls inside the session and
+  // edits their run: the room is one closed run of four walls.
   await tool(page, "select");
   await tapWorld(page, 4, 0.1);
   expect((await stats(page)).selection).toBe(w1.id);
   await expect(page.locator("#prop-legacy-note")).toBeVisible();
   await page.locator("#prop-edit").click();
   let es = await editState(page);
-  expect(es).toMatchObject({ active: true, target: "wall" });
+  expect(es).toMatchObject({ active: true, target: "run" });
+  expect(es.run).toMatchObject({ walls: 4, closed: true, thickness: 0.2 });
   expect(es.canUndo, "the conversion is not an edit to step back over").toBe(false);
   let w = await wallById(page, w1.id);
   expect([w.legacy, w.name, w.levelId]).toEqual([false, "Wall 1", w1.levelId]);
   expect(w.height).toBeCloseTo(2.7, 9);
-  expect(w.thickness).toBeCloseTo(0.2, 9);
   expect(w.length).toBeCloseTo(7.8, 9);
   const [win] = voidsOf(w);
   expect(win.depth).toBe(null);
   expect(sortedOutline(win.outline)).toEqual(sortedOutline([[2, 0.9], [3.2, 0.9], [3.2, 1.9], [2, 1.9]]));
-  // ✗: back to the legacy wall, byte for byte.
+  // ✗: back to the legacy walls, byte for byte.
   await page.locator("#edit-cancel").click();
   expect(await savedBytes(page)).toBe(bytes);
   expect((await wallById(page, w1.id)).legacy).toBe(true);
 
-  // ✓: the converted wall stays (one main undo step reverts it).
+  // ✓: the converted walls stay; undo steps back over the conversion.
   await tapWorld(page, 4, 0.1);
   await page.locator("#prop-edit").click();
   await page.locator("#edit-confirm").click();
-  expect((await wallById(page, w1.id)).legacy).toBe(false);
+  expect((await walls(page)).every((x) => !x.legacy)).toBe(true);
   expect((await stats(page)).errors).toEqual([]);
   await page.locator("#undo").click();
   expect(await savedBytes(page)).toBe(bytes);
 
-  // The Window tool on a legacy wall converts it and arms the preset.
-  const w2 = ws[1];
-  await tool(page, "window");
+  // Openings mode converts a legacy wall when an opening goes into it.
+  await page.locator('.tool[data-tool="window"]').click();
   await tapWorld(page, 7.9, 3);
-  es = await editState(page);
-  expect(es).toMatchObject({ active: true, target: "wall", tool: "window", name: w2.name });
-  expect((await wallById(page, w2.id)).legacy).toBe(false);
+
+  expect((await wallById(page, ws[1].id)).legacy).toBe(false);
+  expect(voidsOf(await wallById(page, ws[1].id))).toHaveLength(2);
   await page.locator("#edit-cancel").click();
+  await page.locator("#dialog-ok").click();
   expect(await savedBytes(page)).toBe(bytes);
 
   // Legacy walls keep working: delete one, undo.

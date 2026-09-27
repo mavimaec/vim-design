@@ -581,7 +581,7 @@ body.drawing #edit-panel { display: none; }
 
 /* Drawing inside Edit Mode: only the shape toggle and the actions. */
 body.editing #thickness-stepper, body.editing #flip-toggle,
-body.editing #wall-settings, body.editing #wall-height-mode, body.editing #opening-row { display: none !important; }
+body.editing #wall-settings, body.editing #wall-height-mode { display: none !important; }
 
 @media (max-width: 520px) {
   #edit-bar { gap: 4px; }
@@ -665,11 +665,13 @@ body.editing #tree-panel { display: none !important; }
   padding: 0 8px; font: inherit; font-size: 14px; color: var(--text);
 }
 #wall-height-mode { flex-wrap: wrap; }
-.wall-only { display: none !important; }
-body.edit-wall .wall-only { display: flex !important; }
+/* Edit chromes: floor plates, wall runs, openings share the bar, the
+   dock, and the panel; each shows its own tools and rows. */
+.run-only, .openings-only { display: none !important; }
+body.edit-run .run-only, body.edit-openings .openings-only { display: flex !important; }
+.edit-row.run-only, .edit-row.openings-only { flex-direction: column; }
+body.edit-run .floor-only, body.edit-openings .floor-only, body.edit-openings .profile-only { display: none !important; }
 @media (max-width: 520px) {
-  /* Phones: a wall's dock trades Solid/Split for Window/Door. */
-  body.edit-wall .floor-extra { display: none !important; }
   #wall-height-mode .stepper-label { display: none; }
   .plane-picker { max-width: 150px; }
 }
@@ -705,6 +707,88 @@ body.edit-wall .wall-only { display: flex !important; }
 .lvl-add-plane .ico { width: 16px; height: 16px; }
 .popover .pop-item.pop-plane { padding-left: calc(10px + var(--depth, 1) * 16px); font-size: 14px; }
 .popover .pop-item.pop-plane .swatch { border-radius: 50%; width: 10px; height: 10px; }
-#opening-row { justify-content: center; }
-#opening-toggle button { min-width: 112px; }
 .tree-row.plane .tree-meta, .tree-row.level .tree-meta { flex: none; }
+
+/* ---- History (one Undo / Redo control) --------------------------------------------------- */
+/* The same two buttons float over whichever bar is shown (top bar or
+   edit bar), at the same place: both bars end with a button of the same
+   width and keep a slot for them. */
+:root { --bar-pad: 6px; --bar-gap: 6px; --bar-btn: 44px; }
+#topbar, #edit-bar { padding: 0 var(--bar-pad); gap: var(--bar-gap); }
+#menu-btn, #edit-confirm { width: var(--bar-btn); }
+.history-slot { width: calc(var(--bar-btn) * 2 + 4px); height: 1px; flex: none; }
+#history {
+  position: fixed; z-index: 21;
+  top: calc(var(--gap) + var(--st) + (var(--top-h) - var(--bar-btn) - 4px) / 2);
+  right: calc(var(--gap) + var(--sr) + var(--bar-pad) + var(--bar-btn) + var(--bar-gap));
+  display: flex; gap: 0; padding: 2px;
+  background: var(--surface-solid); border-radius: 13px;
+  box-shadow: var(--shadow-sm);
+}
+#history .icon-btn { width: var(--bar-btn); height: var(--bar-btn); }
+@media (max-width: 520px) {
+  :root { --bar-pad: 4px; --bar-gap: 4px; --bar-btn: 40px; }
+}
+
+/* ---- View cluster (Fit, render mode) ------------------------------------------------------- */
+/* Phones: a small pill under the top bar at the right (the hint moves
+   left to make room); desktop: bottom right. */
+#view-cluster {
+  position: fixed; z-index: 22;
+  right: calc(var(--gap) + var(--sr));
+  top: calc(var(--gap) + var(--st) + var(--top-h) + 6px);
+  display: flex; flex-direction: row; gap: 2px; padding: 3px;
+  background: var(--surface); border-radius: 14px; box-shadow: var(--shadow);
+  backdrop-filter: saturate(1.4) blur(10px); -webkit-backdrop-filter: saturate(1.4) blur(10px);
+  user-select: none; -webkit-user-select: none;
+}
+.cluster-btn {
+  width: 46px; height: 42px; border: 0; border-radius: 11px; background: transparent;
+  display: grid; place-items: center; align-content: center; gap: 1px;
+  color: var(--text); font: inherit; font-size: 10.5px; font-weight: 600;
+}
+.cluster-btn .ico { width: 20px; height: 20px; }
+.cluster-btn:hover { background: var(--surface-2); }
+.cluster-btn:active, .cluster-btn.on { background: var(--accent-soft); color: var(--accent); }
+.render-menu {
+  position: fixed; z-index: 23;
+  right: calc(var(--gap) + var(--sr));
+  top: calc(var(--gap) + var(--st) + var(--top-h) + 58px);
+  display: grid; padding: 4px; min-width: 190px;
+  background: var(--surface-solid); border-radius: 12px; box-shadow: var(--shadow);
+}
+.render-menu[hidden] { display: none; }
+.render-menu button {
+  border: 0; background: transparent; border-radius: 8px; text-align: left;
+  padding: 10px 12px; font: inherit; font-size: 14.5px; color: var(--text);
+}
+.render-menu button:hover { background: var(--surface-2); }
+.render-menu button.on { background: var(--accent-soft); color: var(--accent); font-weight: 650; }
+.tri-badge {
+  position: fixed; z-index: 21;
+  right: calc(var(--gap) + var(--sr));
+  top: calc(var(--gap) + var(--st) + var(--top-h) + 58px);
+  padding: 5px 10px; border-radius: 999px;
+  background: rgba(31, 41, 64, 0.88); color: #fff; font-size: 12.5px; font-weight: 600;
+  font-variant-numeric: tabular-nums; pointer-events: none; white-space: nowrap;
+}
+.tri-badge[hidden] { display: none; }
+@media (min-width: 760px) {
+  /* Desktop: bottom right, beside the properties panel when it is open. */
+  #view-cluster { top: auto; bottom: calc(var(--gap) + var(--sb)); flex-direction: row; }
+  .render-menu { top: auto; right: calc(var(--gap) + var(--sr)); bottom: calc(var(--gap) + var(--sb) + 60px); }
+  .tri-badge { top: auto; right: calc(var(--gap) + var(--sr) + 112px); bottom: calc(var(--gap) + var(--sb) + 14px); }
+  body.sheet-open #view-cluster { right: calc(var(--gap) + var(--sr) + 372px + 10px); }
+  body.sheet-open .render-menu { right: calc(var(--gap) + var(--sr) + 372px + 10px); }
+  body.sheet-open .tri-badge { right: calc(var(--gap) + var(--sr) + 372px + 10px + 112px); }
+}
+.edit-row.run-only, .edit-row.openings-only { gap: 6px; align-items: stretch; }
+.edit-row.run-only[hidden], .edit-row.openings-only[hidden] { display: none !important; }
+.edit-row-line[hidden] { display: none; }
+#opening-depth-stepper.dim { opacity: 0.45; }
+@media (max-width: 759px) {
+  /* The hint leaves the view pill its corner. */
+  .hint { left: calc(var(--gap) + var(--sl)); transform: none; max-width: calc(100vw - 2 * var(--gap) - 108px); }
+  #toasts { top: calc(var(--gap) + var(--st) + var(--top-h) + 60px); }
+  body.editing .tri-badge, .render-menu:not([hidden]) ~ .tri-badge { top: calc(var(--gap) + var(--st) + var(--top-h) + 58px); }
+}

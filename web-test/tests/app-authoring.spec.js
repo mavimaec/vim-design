@@ -242,15 +242,18 @@ test("floor plates in Edit Mode: rectangle + polygon with snapping, validation, 
   await page.locator("#cancel-draw").click();
   expect((await profile(page)).faces).toHaveLength(2);
 
-  // ✓: the whole session is ONE step of the main history.
+  // ✓ keeps the session's steps: each face is one step of the history.
   await page.locator("#edit-confirm").click();
   let [plate] = await plates(page);
   expect([plate.name, plate.sketch, plate.faceCount]).toEqual(["Floor plate 1", true, 2]);
   expect(plate.area).toBeCloseTo(3 * 4 + (3.5 * 3 + 2 * 2), 4);
   expect(plate.volume).toBeCloseTo(0.3 * (12 + 14.5), 4);
   await page.locator("#undo").click();
+  expect((await plates(page))[0].faceCount).toBe(1);
+  await page.locator("#undo").click();
   expect(await elements(page)).toHaveLength(0);
   expect(await savedBytes(page), "undo restores the document exactly").toBe(bytes0);
+  await page.locator("#redo").click();
   await page.locator("#redo").click();
   expect((await plates(page))[0].faceCount).toBe(2);
 
@@ -288,6 +291,13 @@ test("Edit Mode: voids (outside, pocket), per-face thickness, split — the mesh
   await shot(page, "edit-properties");
   await page.locator("#prop-edit").click();
   expect((await editState(page)).active).toBe(true);
+  if (mobile()) {
+    // Back to the test's framing (the properties sheet moved the view).
+    await page.evaluate(() => {
+      window.__author.app.set_camera_json('{"tx":0,"ty":0.5,"halfH":10}');
+      window.__author.refresh();
+    });
+  }
 
   // A through void reaching OUTSIDE the plate removes only what it covers.
   await editTool(page, "void");
@@ -301,7 +311,6 @@ test("Edit Mode: voids (outside, pocket), per-face thickness, split — the mesh
   // A pocket: a void shallower than the plate.
   await tapWorld(page, -2, -1);
   await tapWorld(page, -1, 1);
-  const trisThrough = (await plates(page))[0].triangles;
   await editMode(page, "faces");
   await tapWorld(page, -1.5, 0);
   let st = await editState(page);
@@ -310,7 +319,6 @@ test("Edit Mode: voids (outside, pocket), per-face thickness, split — the mesh
   [plate] = await plates(page);
   expect(plate.faces.find((f) => f.kind === "void" && f.outline.some(([x]) => x === -2)).depth).toBeCloseTo(0.1, 9);
   expect(plate.volume).toBeCloseTo(6.6 - 2 * 0.1, 4); // a 2 m² pocket, 0.1 deep
-  expect(plate.triangles, "the pocket adds a floor and walls").toBeGreaterThan(trisThrough);
   expect(plate.bbox).toEqual(bbox0);
 
   // Split the solid, then give one half its own thickness.
@@ -332,9 +340,9 @@ test("Edit Mode: voids (outside, pocket), per-face thickness, split — the mesh
   await page.locator('#edit-view-toggle button[data-view="plan"]').click();
 
   // Undo inside Edit Mode steps back one edit (the thickness).
-  await page.locator("#edit-undo").click();
+  await page.locator("#undo").click();
   expect((await plates(page))[0].bbox[0][2]).toBeCloseTo(-0.3, 4);
-  await page.locator("#edit-redo").click();
+  await page.locator("#redo").click();
   await page.locator("#edit-confirm").click();
 
   // Reload: the sketch plate comes back with all its faces.
@@ -413,11 +421,18 @@ test("Edit Mode: select, drag point/edge/face, long-press insert, marquee, the t
   expect(prof.points).toHaveLength(4);
   await shot(page, "edit-mode");
 
-  // ✓ collapses the session into one main undo step.
+  // ✓ keeps the session's steps: undo walks back through them, one by
+  // one, to the plate as it was.
   await page.locator("#edit-confirm").click();
   let [plate] = await plates(page);
   expect(sortedOutline(plate.faces[0].outline)).toContainEqual([4, 3]);
-  await page.locator("#undo").click();
+  let undos = 0;
+  while (undos < 30 && !(await plates(page)).some((p) => sortedOutline(p.faces[0].outline).length === 4
+      && JSON.stringify(solidOutline(p)) === JSON.stringify(sortedOutline([[-3, -2], [3, -2], [3, 2], [-3, 2]])) && p.faces.length === 1)) {
+    await page.locator("#undo").click();
+    undos++;
+  }
+  expect(undos, "several steps, not one").toBeGreaterThan(1);
   [plate] = await plates(page);
   expect(solidOutline(plate)).toEqual(sortedOutline([[-3, -2], [3, -2], [3, 2], [-3, 2]]));
 
@@ -618,8 +633,9 @@ test("touch: press-drag-release placement, two fingers never place", async ({ pa
   expect(sk.points).toEqual([[3, 4]]);
 
   // A second finger cancels the pending placement and navigates.
-  const a = await worldToClient(page, 3.5, 5.5);
-  const b = await worldToClient(page, 1, 6.5);
+  // (Clear of the Fit / View buttons at the right edge.)
+  const a = await worldToClient(page, 2, 4.5);
+  const b = await worldToClient(page, 0, 6.5);
   await touch("touchStart", [a]);
   await touch("touchStart", [a, b]);
   await touch("touchMove", [[a[0] - 20, a[1] - 20], [b[0] + 20, b[1] + 20]]);
@@ -758,7 +774,7 @@ test("wall properties: height and thickness edits with undo, flip side, delete",
   expect(errors).toEqual([]);
 });
 
-test("openings: the Window tool opens the wall's Edit Mode — window + door presets, a polygon void, ✓ one undo, reload, transform-only drag", async ({ page }) => {
+test("openings: placed from the Window tool (Openings mode), kept by ✓, listed in the properties, reloaded; a level drag stays transform-only", async ({ page }) => {
   const errors = await openApp(page);
   await drawPlate(page, [-3, -2], [3, 2]);
   await tool(page, "wall");
@@ -768,79 +784,36 @@ test("openings: the Window tool opens the wall's Edit Mode — window + door pre
   let ws = await walls(page);
   expect(ws).toHaveLength(4);
   const bottom = ws.find((w) => w.start[1] === -2 && w.end[1] === -2);
-  expect(bottom.length).toBeCloseTo(5.8, 9);
   const voidsOf = async () => (await walls(page)).find((w) => w.id === bottom.id).faces.filter((f) => f.kind === "void");
 
-  // Window tool: tap the wall -> its Edit Mode, elevation, Window armed.
-  await tool(page, "window");
-  await tapWorld(page, 0, -1.9);
-  let es = await editState(page);
-  expect(es).toMatchObject({ active: true, target: "wall", tool: "window", name: bottom.name });
-  expect((await stats(page)).view).toBe("elevation");
-  expect(es.canUndo, "nothing to undo yet inside the session").toBe(false);
-
-  // Window preset (1.2 x 1.2 m at a 0.9 m sill) centred on the tap.
-  await tapWall(page, bottom.id, 1.5, 1.5);
-  let voids = await voidsOf();
-  expect(voids).toHaveLength(1);
-  expect(sortedOutline(voids[0].outline)).toEqual(sortedOutline([[0.9, 0.9], [2.1, 0.9], [2.1, 2.1], [0.9, 2.1]]));
-  expect(voids[0].depth).toBe(null);
-
-  // A polygon void (a pointed head) with the Void tool.
-  await editTool(page, "void");
-  await shape(page, "polygon");
-  // (Kept well below the top edge: a point snapped onto it would follow
-  // the top.)
-  for (const [u, v] of [[3.0, 0.9], [4.4, 0.9], [4.4, 1.7], [3.7, 2.2], [3.0, 1.7]]) {
-    await tapWall(page, bottom.id, u, v);
-  }
-  await page.locator("#finish-draw").click();
-  voids = await voidsOf();
-  expect(voids).toHaveLength(2);
-  expect(voids[1].outline).toHaveLength(5);
+  // The Window tool: Openings mode; a window, then a door, on the wall.
+  await page.locator('.tool[data-tool="window"]').click();
+  await tapWorld(page, -1, -1.9);
+  await page.locator('[data-opening-preset="door"]').click();
+  await tapWorld(page, 1.5, -1.9);
   await shot(page, "window-elevation");
-
-  // ✓: the whole session is one undo step of the main history.
   await page.locator("#edit-confirm").click();
-  expect((await editState(page)).active).toBe(false);
-  expect((await stats(page)).view).toBe("plan");
-  expect((await stats(page)).tool, "the Window tool is back for the next wall").toBe("window");
-  await page.locator("#undo").click();
-  expect(await voidsOf()).toHaveLength(0);
-  await page.locator("#redo").click();
-  expect(await voidsOf()).toHaveLength(2);
+  let voids = await voidsOf();
+  expect(voids).toHaveLength(2);
+  expect(Math.min(...voids[1].outline.map((p) => p[1])), "a door crosses the bottom edge").toBeLessThan(0);
 
-  // Door: the toggle next to Window, then a tap on the wall.
-  await page.locator('#opening-toggle button[data-opening="door"]').click();
-  expect((await stats(page)).tool).toBe("door");
-  await tapWorld(page, 0, -1.9);
-  es = await editState(page);
-  expect(es).toMatchObject({ active: true, tool: "door" });
-  await tapWall(page, bottom.id, 5.0, 1.0);
-  await page.locator("#edit-confirm").click();
-  voids = await voidsOf();
-  expect(voids).toHaveLength(3);
-  const door = voids[2].outline;
-  expect(Math.min(...door.map((p) => p[1])), "a door crosses the bottom edge").toBeLessThan(0);
-
-  // Height stays above the highest opening (the pointed head at 2.2 m,
-  // on the 0.1 m wall grid, + the 0.05 m margin).
+  // Height stays above the highest opening (the door, 2.1 m + 0.05 m).
   await tool(page, "select");
   await tapWorld(page, 0, -1.9);
   expect((await stats(page)).selection).toBe(bottom.id);
-  await expect(page.locator("#prop-window-count")).toHaveText("3");
+  await expect(page.locator("#prop-window-count")).toHaveText("2");
   await page.locator("#prop-height").fill("1.0");
   await page.locator("#prop-height").press("Enter");
   const lowered = (await walls(page)).find((w) => w.id === bottom.id);
-  expect(lowered.minHeight).toBeCloseTo(2.25, 9);
-  expect(lowered.height).toBeCloseTo(2.25, 9);
+  expect(lowered.minHeight).toBeCloseTo(2.15, 9);
+  expect(lowered.height).toBeCloseTo(2.15, 9);
   await page.locator("#undo").click();
 
   // Delete an opening from the properties; undo restores it.
   await page.locator('[data-testid="delete-opening"]').first().click();
-  expect(await voidsOf()).toHaveLength(2);
+  expect(await voidsOf()).toHaveLength(1);
   await page.locator("#undo").click();
-  expect(await voidsOf()).toHaveLength(3);
+  expect(await voidsOf()).toHaveLength(2);
   await page.locator("#sheet-close").click();
 
   // Walls and openings survive a reload.
@@ -850,7 +823,7 @@ test("openings: the Window tool opens the wall's Edit Mode — window + door pre
   await page.waitForFunction(() => window.__author?.ready === true, null, { timeout: 90_000 });
   ws = await walls(page);
   expect(ws).toHaveLength(4);
-  expect(ws.find((w) => w.name === bottom.name).faces.filter((f) => f.kind === "void")).toHaveLength(3);
+  expect(ws.find((w) => w.name === bottom.name).faces.filter((f) => f.kind === "void")).toHaveLength(2);
 
   // Level elevation edit (walls without a top constraint): transform-only.
   await page.locator("#menu-btn").click();

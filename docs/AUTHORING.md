@@ -455,3 +455,111 @@ H)` and `wall::stored_profile(effective, top_points, H)` convert between the two
 **Compatibility.** Workplanes and walls were added by appending variants at the end
 of the serialized enums; documents saved before (including Sketch floor plates) load
 and resave byte-identically (kept as regression fixtures).
+
+## 11. Wall runs
+
+A **`WallRun`** is a wall drawn as a thickened polyline: one entity for a whole chain of
+wall segments, with exact joins at any angle. It is the wall the wall tool draws; the
+single-segment `Wall` of §10 stays and evaluates unchanged.
+
+```rust
+// Params::WallRun {
+//     points: Vec<RunPoint>,           // RunPoint { id: u32, uv: [f64; 2] } on the base plane
+//     closed: bool,                    // a segment from the last point back to the first
+//     thickness_m: f64,                // material to the LEFT of the direction of travel
+//     height_m: f64,                   // the top reference when `top` is unwired
+//     top_offset_m: f64,               // added to the top plane when `top` is wired
+//     openings: Vec<Opening>,
+//     profiles: Vec<SegmentProfile>,
+// }
+// Opening { id, segment, offset_m, sill_m, width_m, height_m, kind: Window | Door,
+//           depth_m: Option<f64> }
+// SegmentProfile { segment, profile: Sketch, top_points: Vec<u32> }
+// slot 0 = base (required): Level | Workplane;  slot 1 = top (optional): Level | Workplane
+```
+
+- **Segments.** Segment k runs from point k to point k + 1 (and, when closed, from the
+  last point to the first). A segment is named by its **start point id**; openings and
+  profiles refer to segments by that id. Point and opening ids are run-local and stable.
+- **Top reference H** as for walls: `height_m`, or the top plane's height above the base
+  plus `top_offset_m` (`wall_run::run_top_height(doc, run)` from params).
+- **Joins.** The footprint is the reference polyline offset by the thickness with miter
+  joins: two segments meet exactly on the bisector through their shared point, at any
+  angle. On the outside of a turn whose miter would reach more than
+  `MITER_LIMIT` (4) thicknesses from the corner, the corner is beveled (the chord between
+  the two offset-line ends, split at its midpoint). Open ends are square. A run that
+  folds back on itself is an error.
+- **Join zones and the clear span.** Near each join a segment is a wedge. Along the
+  reference line, the wedge reaches from the segment end to the far end of the join cut.
+  `wall_run::segment_clear_span(run, segment) -> (min, max)` is the span between the two
+  zones: openings must lie in it. Within a join zone a custom profile must be a band from
+  the base to one straight top edge (a gable slope may run through the zone; an apex may
+  not).
+- **Openings.** A window is the rectangle `offset_m .. offset_m + width_m` along the
+  reference line from the segment start, `sill_m .. sill_m + height_m` up from the base.
+  A door starts at the base (its sill is ignored) and its void extends below the base, so
+  it always cuts the bottom edge. `depth_m: None` goes through; `Some(d)` is a niche `d`
+  deep from the reference face. Openings in one segment must not overlap.
+- **Segment profiles.** A `Sketch` in the segment's elevation (u along the reference line
+  from the segment start, v up), with `top_points` measured from H as for walls. Its
+  solid faces are wall material (their thickness is ignored: the run's thickness
+  applies); its void faces are extra openings. A segment without a profile is the plain
+  rectangle up to H.
+- **Faces.** `RunFace { segment, part }`: `Reference` (on the reference line),
+  `Opposite`, `Top`, `Bottom`, `Start`, `End` (a square end or the join face),
+  `Opening { opening }` (the reveals), `NicheBack { depth_um }`, `ProfileVoid { face }`.
+- **Evaluation.** Per segment: the two join wedges are planar polyhedra (the footprint
+  clipped at the clear span, under the band's top plane), and the middle is the segment
+  profile over the clear span with its openings, built as layered prisms (§9) in the
+  segment's vertical frame. The direct planar mesher removes the faces where pieces and
+  segments touch, so a straight run is 12 triangles, a 90-degree corner 20, a closed
+  rectangle 32. Evaluation takes about 0.2 ms per segment (0.4 ms with three openings)
+  in a release build.
+- **Validity.** The commands reject (`InvalidWallRun`) too few points (two; three when
+  closed), duplicate ids, non-finite values, a thickness or height that is not positive,
+  an opening on an unknown segment or with an invalid size, and an invalid segment
+  profile (`wall_run::validate_structure`). `wall_run::validate` also checks the
+  geometry: no zero-length segment, no self-crossing reference line, no fold-back join,
+  a clear span on every segment, openings inside their clear span and not overlapping,
+  no overlapping material (parallel segments closer than the thickness). A run that fails
+  it still commits; its evaluation is a per-entity error and the previous mesh stays.
+- **Factoring and cascades** as for walls: a base-only run on a root level (or on a
+  workplane under it) is level-local, so a drag of that level is transform-only; a run
+  with a top is evaluated in world space. It is an `Element` member (or a standalone
+  mesh owner) and the orphan sweep collects it. Deleting its base plane deletes it;
+  deleting only its top plane (`DeleteLevel { cascade: true }`,
+  `DeleteWorkplaneCascade`) **disconnects** it: `height_m` becomes its current H (at
+  least `MIN_DISCONNECTED_WALL_HEIGHT_M`) and the top slot is emptied, in the same undo
+  step. The same rule applies to `Wall`.
+
+Commands: `CreateWallRun { base, top: Option, points, closed, thickness_m, height_m,
+top_offset_m, openings, profiles }`, `UpdateWallRun { id, base, top: Option<Option>,
+points, closed, thickness_m, height_m, top_offset_m, openings, profiles (all Option),
+coalesce }` (the merged result is validated like a create), `DeleteWallRun { id }`.
+
+**Editing** (`wall_run::ops`, pure functions of `WallRunData`, typed `WallRunError`;
+each result is checked with `validate`, and a value an operation does not change is
+copied bit for bit):
+
+| Operation | Effect |
+|---|---|
+| `move_points(run, ids, delta)`, `set_point(run, id, uv)` | move points; openings keep their offsets |
+| `move_edges(run, segments, delta)` | move both end points of each segment |
+| `insert_point(run, segment, offset_m, H) -> (run, id)` | split a segment; openings go to the part they lie in (an opening across the point is an error); a custom profile splits at the point |
+| `delete_points(run, ids)` | the neighbouring segments merge; each opening keeps its plan position on the merged segment, or the edit is an error; merged segments lose their custom profile |
+| `delete_edges(run, segments)` | each segment's end point merges into its FIRST point; the segment's openings and profile go; the next segment's openings keep their plan position or the edit is an error |
+| `extend(run, Start \| End, uv) -> (run, id)` | add a point at one end of an open run |
+| `set_closed(run, closed)` | close, or open (the closing segment, with its openings and profile, goes) |
+| `add_opening(run, opening) -> (run, id)` | the opening gets the next free id |
+| `move_opening(run, id, [along, up])` | clamped to the clear span; a window's sill clamps at the base, a door stays on it |
+| `set_opening(run, opening)`, `delete_opening(run, id)` | replace or remove by id |
+
+`wall_run::from_walls(doc, &[wall]) -> Result<(WallRunData, base, top), FromWallsError>`
+converts a chain of `Wall`s (each starting where the previous one ends, one base and
+top, one thickness) into a run: rectangular voids become openings (a void that reaches
+the base is a door), and a wall whose remaining profile is not the plain rectangle keeps
+it as a segment profile. `WallRunData::into_params` gives the `Params`.
+
+**Compatibility.** `WallRun`, `RunFace`, `DeleteWorkplaneCascade`, and the wall-run
+commands were appended at the end of their serialized enums; the saved fixtures of the
+earlier milestones (v1, v2, v3) load, evaluate, and resave byte-identically.

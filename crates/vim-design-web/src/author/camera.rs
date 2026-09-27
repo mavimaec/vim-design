@@ -35,6 +35,15 @@ const MIN_DISTANCE: f32 = 1.0;
 const MAX_DISTANCE: f32 = 600.0;
 const MIN_HALF_H: f32 = 0.5;
 const MAX_HALF_H: f32 = 400.0;
+/// Navigation stays near the model: the visible half-height (or the 3D
+/// distance's equivalent) is at most `VIEW_RANGE_FACTOR` times the
+/// model's radius plus `MIN_VIEW_RANGE_M`, and the view centre stays
+/// within the model's radius times `PAN_MARGIN_FACTOR` plus
+/// `MIN_PAN_MARGIN_M` of its centre.
+pub const VIEW_RANGE_FACTOR: f32 = 3.0;
+pub const MIN_VIEW_RANGE_M: f32 = 12.0;
+pub const PAN_MARGIN_FACTOR: f32 = 1.5;
+pub const MIN_PAN_MARGIN_M: f32 = 8.0;
 /// Elevation view: the eye sits this far in front of the wall face it
 /// looks at, so everything nearer the viewer is clipped away.
 const ELEVATION_EYE_GAP_M: f32 = 0.02;
@@ -254,6 +263,22 @@ impl Camera {
             FOV_Y
         };
         self.distance = (radius / (fov / 2.0).sin() * 1.05).clamp(MIN_DISTANCE, MAX_DISTANCE);
+    }
+
+    /// Keep the view near a model of `radius` around `center`: cap the
+    /// zoom-out and pull the view centre back within the pan margin.
+    pub fn clamp_to(&mut self, center: Vec3, radius: f32) {
+        let range = radius.max(0.0) * VIEW_RANGE_FACTOR + MIN_VIEW_RANGE_M;
+        self.plan_half_h = self.plan_half_h.min(range).max(MIN_HALF_H);
+        self.elevation_half_h = self.elevation_half_h.min(range).max(MIN_HALF_H);
+        self.distance = self.distance.min(range / (FOV_Y / 2.0).tan()).max(MIN_DISTANCE);
+        let margin = radius.max(0.0) * PAN_MARGIN_FACTOR + MIN_PAN_MARGIN_M;
+        let off = glam::Vec2::new(self.target.x - center.x, self.target.y - center.y);
+        if off.length() > margin {
+            let o = off.normalize() * margin;
+            self.target.x = center.x + o.x;
+            self.target.y = center.y + o.y;
+        }
     }
 
     /// Switch views keeping the framing roughly continuous.

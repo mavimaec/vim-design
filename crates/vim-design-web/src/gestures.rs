@@ -7,6 +7,14 @@
 //! entities, a slider drag touches several control points per event — so
 //! the app records the document's undo depth at each gesture start and
 //! undoes/redoes whole gestures. Result: one user action = one undo step.
+//!
+//! There is ONE linear history. An Edit Mode is a [`Gestures::begin_session`]
+//! span of it: every edit inside is an ordinary step; leaving with ✓
+//! ([`Gestures::end_session`]) keeps the steps as they are; ✗
+//! ([`Gestures::cancel_session`]) undoes back to the entry and drops them
+//! (no redo). While a session is open, undo stops at its entry and redo
+//! only replays the session's own steps, so undo never changes other
+//! elements from inside a session.
 
 use vim_design_lib::Document;
 
@@ -18,19 +26,20 @@ pub struct Gestures {
     redo_counts: Vec<usize>,
     /// The open continuous gesture (slider drag, typing into a field).
     current: Option<String>,
-    /// An open transaction (Edit Mode): see [`Gestures::begin_transaction`].
-    transaction: Option<Transaction>,
+    /// An open Edit Mode session: see [`Gestures::begin_session`].
+    session: Option<Session>,
 }
 
-/// State saved when a transaction opens.
-struct Transaction {
-    /// Document undo depth at entry.
+/// State saved when a session opens.
+struct Session {
+    /// Document undo depth at entry (✗ returns here).
     depth: usize,
-    /// In-transaction undo never goes below this depth (≥ `depth`): steps
-    /// before it belong to the transaction but are not user edits.
+    /// In-session undo never goes below this depth (≥ `depth`): a step
+    /// that prepares the session (a legacy conversion) is not undone from
+    /// inside it; after ✓ it is an ordinary step.
     floor: usize,
-    /// Gesture marks at entry (restored on commit and rollback).
-    marks: Vec<usize>,
+    /// Redo entries from before the session: never replayed inside it.
+    redo_floor: usize,
 }
 
 impl Gestures {
@@ -53,7 +62,7 @@ impl Gestures {
             self.current = Some(name.to_owned());
         }
         // Any new command invalidates the document's redo stack.
-        self.redo_counts.clear();
+        self.clear_redo();
         continuing
     }
 
@@ -70,8 +79,15 @@ impl Gestures {
     /// leave a stray gesture mark or clear the redo counts.
     pub fn one_shot(&mut self, depth: usize) {
         self.marks.push(depth);
-        self.redo_counts.clear();
+        self.clear_redo();
         self.current = None;
+    }
+
+    fn clear_redo(&mut self) {
+        self.redo_counts.clear();
+        if let Some(s) = self.session.as_mut() {
+            s.redo_floor = 0;
+        }
     }
 
     /// Forget the redo history. Used after a failed multi-command
@@ -79,61 +95,59 @@ impl Gestures {
     /// rolled-back steps on the document's redo stack): the app's redo
     /// must never replay them.
     pub fn invalidate_redo(&mut self) {
-        self.redo_counts.clear();
+        self.clear_redo();
         self.current = None;
     }
 
-    /// Open a transaction: gestures inside it undo/redo one by one, but
-    /// never past the entry point; [`Self::commit_transaction`] turns
-    /// them into ONE gesture, [`Self::rollback_transaction`] reverts them.
-    pub fn begin_transaction(&mut self, doc: &Document) {
-        if self.transaction.is_none() {
+    /// Open an Edit Mode session at the current depth: its edits are
+    /// ordinary steps; undo inside stops at the entry.
+    pub fn begin_session(&mut self, doc: &Document) {
+        if self.session.is_none() {
             let depth = doc.undo_depth();
-            self.transaction = Some(Transaction { depth, floor: depth, marks: self.marks.clone() });
+            self.session = Some(Session { depth, floor: depth, redo_floor: self.redo_counts.len() });
             self.current = None;
         }
     }
 
-    pub fn in_transaction(&self) -> bool {
-        self.transaction.is_some()
+    pub fn in_session(&self) -> bool {
+        self.session.is_some()
     }
 
-    /// Raise the transaction's undo floor to the current depth: what was
-    /// done so far (e.g. a conversion that prepares the edit) cannot be
-    /// undone step by step, but commit and rollback still include it.
-    pub fn set_transaction_floor(&mut self, doc: &Document) {
-        if let Some(t) = self.transaction.as_mut() {
-            t.floor = doc.undo_depth();
-            // The steps below the floor must not be undone one by one.
-            self.marks.retain(|m| *m < t.depth);
+    /// Raise the session's undo floor to the current depth: what was done
+    /// so far (a conversion that prepares the edit) is not undone from
+    /// inside the session; ✗ still reverts it, and after ✓ it is one
+    /// ordinary undo step like the edits.
+    pub fn set_session_floor(&mut self, doc: &Document) {
+        if let Some(s) = self.session.as_mut() {
+            s.floor = doc.undo_depth();
         }
     }
 
-    /// Close the transaction keeping its changes as a single undo step.
+    /// ✓: close the session keeping its steps as they are (no collapse).
     /// Returns whether anything changed.
-    pub fn commit_transaction(&mut self, doc: &Document) -> bool {
-        let Some(t) = self.transaction.take() else { return false };
-        self.marks = t.marks;
+    pub fn end_session(&mut self, doc: &Document) -> bool {
+        let Some(s) = self.session.take() else { return false };
         self.current = None;
-        let changed = doc.undo_depth() > t.depth;
-        if changed {
-            self.marks.push(t.depth);
-            self.redo_counts.clear();
-        }
-        changed
+        doc.undo_depth() > s.depth
     }
 
-    /// Close the transaction reverting the document to its entry state.
-    /// The transaction's redo history is dropped.
-    pub fn rollback_transaction(&mut self, doc: &mut Document) {
-        let Some(t) = self.transaction.take() else { return };
-        while doc.undo_depth() > t.depth {
+    /// ✗: close the session undoing back to its entry; its steps are
+    /// dropped (they cannot be redone).
+    pub fn cancel_session(&mut self, doc: &mut Document) {
+        let Some(s) = self.session.take() else { return };
+        let changed = doc.undo_depth() > s.depth;
+        while doc.undo_depth() > s.depth {
             if doc.undo().is_err() {
                 break;
             }
         }
-        self.marks = t.marks;
-        self.redo_counts.clear();
+        self.marks.retain(|m| *m < s.depth);
+        if changed {
+            self.redo_counts.clear();
+        } else {
+            // Undone session steps may sit above the earlier redo entries.
+            self.redo_counts.truncate(s.redo_floor);
+        }
         self.current = None;
     }
 
@@ -142,9 +156,9 @@ impl Gestures {
         while self.marks.last().is_some_and(|m| *m >= depth) {
             self.marks.pop();
         }
-        // Inside a transaction, never undo past its entry point.
-        if let Some(t) = &self.transaction
-            && self.marks.last().is_none_or(|m| *m < t.floor)
+        // Inside a session, never undo past its entry point.
+        if let Some(s) = &self.session
+            && self.marks.last().is_none_or(|m| *m < s.floor)
         {
             return false;
         }
@@ -163,6 +177,9 @@ impl Gestures {
     }
 
     pub fn redo(&mut self, doc: &mut Document) -> bool {
+        if !self.can_redo() {
+            return false;
+        }
         let Some(steps) = self.redo_counts.pop() else {
             return false;
         };
@@ -178,14 +195,17 @@ impl Gestures {
     }
 
     pub fn can_undo(&self) -> bool {
-        match &self.transaction {
-            Some(t) => self.marks.last().is_some_and(|m| *m >= t.floor),
+        match &self.session {
+            Some(s) => self.marks.last().is_some_and(|m| *m >= s.floor),
             None => !self.marks.is_empty(),
         }
     }
 
     pub fn can_redo(&self) -> bool {
-        !self.redo_counts.is_empty()
+        match &self.session {
+            Some(s) => self.redo_counts.len() > s.redo_floor,
+            None => !self.redo_counts.is_empty(),
+        }
     }
 }
 
@@ -250,13 +270,13 @@ mod tests {
     }
 
     #[test]
-    fn transaction_commit_collapses_into_one_step() {
+    fn a_session_keeps_its_steps_and_stops_undo_at_its_entry() {
         let mut doc = Document::new();
         let mut g = Gestures::default();
         let depth = doc.undo_depth();
         let id = cp(&mut doc);
         g.one_shot(depth);
-        g.begin_transaction(&doc);
+        g.begin_session(&doc);
         for x in [1.0, 2.0, 3.0] {
             set_x(&mut doc, &mut g, id, x);
         }
@@ -269,53 +289,80 @@ mod tests {
         assert_eq!(x_of(&doc, id), 0.0);
         assert!(!g.can_undo() && !g.undo(&mut doc), "the entry point is a wall");
         assert!(g.redo(&mut doc) && g.redo(&mut doc) && g.redo(&mut doc));
-        assert!(g.commit_transaction(&doc));
-        // Outside: one undo reverts the whole session.
+        assert!(g.end_session(&doc));
+        // Outside: the same steps, one by one (no collapse), then the
+        // creation before the session.
         assert!(g.undo(&mut doc));
-        assert_eq!(x_of(&doc, id), 0.0);
-        assert!(g.redo(&mut doc));
-        assert_eq!(x_of(&doc, id), 3.0);
+        assert_eq!(x_of(&doc, id), 2.0);
         assert!(g.undo(&mut doc) && g.undo(&mut doc));
-        assert!(doc.entity(id).is_none(), "then the creation before it");
-    }
-
-    #[test]
-    fn transaction_rollback_restores_the_entry_state() {
-        let mut doc = Document::new();
-        let mut g = Gestures::default();
-        let depth = doc.undo_depth();
-        let id = cp(&mut doc);
-        g.one_shot(depth);
-        g.begin_transaction(&doc);
-        set_x(&mut doc, &mut g, id, 5.0);
-        set_x(&mut doc, &mut g, id, 6.0);
-        g.undo(&mut doc);
-        g.rollback_transaction(&mut doc);
         assert_eq!(x_of(&doc, id), 0.0);
-        assert!(!g.can_redo(), "the session's redo is dropped");
-        assert!(g.can_undo(), "earlier history is intact");
-        // An empty session commits nothing.
-        g.begin_transaction(&doc);
-        assert!(!g.commit_transaction(&doc));
         assert!(g.undo(&mut doc));
         assert!(doc.entity(id).is_none());
     }
 
     #[test]
-    fn transaction_floor_keeps_preparation_out_of_step_undo() {
+    fn cancel_restores_the_entry_state_and_drops_the_steps() {
         let mut doc = Document::new();
         let mut g = Gestures::default();
         let depth = doc.undo_depth();
         let id = cp(&mut doc);
         g.one_shot(depth);
-        g.begin_transaction(&doc);
+        g.begin_session(&doc);
+        set_x(&mut doc, &mut g, id, 5.0);
+        set_x(&mut doc, &mut g, id, 6.0);
+        g.undo(&mut doc);
+        g.cancel_session(&mut doc);
+        assert_eq!(x_of(&doc, id), 0.0);
+        assert!(!g.can_redo(), "the session's steps cannot be redone");
+        assert!(g.can_undo(), "earlier history is intact");
+        // An empty session changes nothing.
+        g.begin_session(&doc);
+        assert!(!g.end_session(&doc));
+        assert!(g.undo(&mut doc));
+        assert!(doc.entity(id).is_none());
+    }
+
+    #[test]
+    fn redo_from_before_a_session_is_not_replayed_inside_it() {
+        let mut doc = Document::new();
+        let mut g = Gestures::default();
+        let depth = doc.undo_depth();
+        let id = cp(&mut doc);
+        g.one_shot(depth);
+        set_x(&mut doc, &mut g, id, 1.0);
+        assert!(g.undo(&mut doc));
+        g.begin_session(&doc);
+        assert!(!g.can_redo() && !g.redo(&mut doc), "the earlier redo belongs outside");
+        g.cancel_session(&mut doc);
+        assert!(g.can_redo(), "an empty session keeps the earlier redo");
+        assert!(g.redo(&mut doc));
+        assert_eq!(x_of(&doc, id), 1.0);
+    }
+
+    #[test]
+    fn the_session_floor_keeps_preparation_out_of_session_undo() {
+        let mut doc = Document::new();
+        let mut g = Gestures::default();
+        let depth = doc.undo_depth();
+        let id = cp(&mut doc);
+        g.one_shot(depth);
+        g.begin_session(&doc);
         set_x(&mut doc, &mut g, id, 1.0); // preparation (a conversion)
-        g.set_transaction_floor(&doc);
+        g.set_session_floor(&doc);
         set_x(&mut doc, &mut g, id, 2.0);
         assert!(g.undo(&mut doc));
         assert_eq!(x_of(&doc, id), 1.0);
         assert!(!g.can_undo() && !g.undo(&mut doc), "the preparation is below the floor");
-        g.rollback_transaction(&mut doc);
-        assert_eq!(x_of(&doc, id), 0.0, "rollback includes the preparation");
+        assert!(g.redo(&mut doc));
+        assert!(g.end_session(&doc));
+        // After ✓ the preparation is an ordinary step.
+        assert!(g.undo(&mut doc) && g.undo(&mut doc));
+        assert_eq!(x_of(&doc, id), 0.0);
+        // And ✗ reverts it with the edits.
+        g.begin_session(&doc);
+        set_x(&mut doc, &mut g, id, 7.0);
+        g.set_session_floor(&doc);
+        g.cancel_session(&mut doc);
+        assert_eq!(x_of(&doc, id), 0.0);
     }
 }

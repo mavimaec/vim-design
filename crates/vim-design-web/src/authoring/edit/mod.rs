@@ -126,6 +126,11 @@ pub enum Edit {
     DeleteEdges(Vec<EdgeKey>),
     DeleteFaces(Vec<FaceId>),
     SetKind { faces: Vec<FaceId>, kind: FaceKind },
+    /// Wall runs: a new point after the last one (`at_end`) or before the
+    /// first.
+    Extend { at_end: bool, uv: P2 },
+    /// Wall runs: close the loop or open it.
+    SetClosed(bool),
 }
 
 /// Why an edit was refused. `message` is the short toast text.

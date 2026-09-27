@@ -7,7 +7,9 @@
 pub mod edit;
 pub mod geom;
 pub mod model;
+pub mod openings;
 pub mod ops;
+pub mod runs;
 pub mod sketch;
 pub mod snap;
 pub mod walls;

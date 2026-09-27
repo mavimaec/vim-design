@@ -37,12 +37,7 @@
     <button id="tree-btn" class="icon-btn" type="button" title="Model: levels and elements" aria-label="Model tree" aria-pressed="false">
       <svg class="ico" viewBox="0 0 24 24"><path d="M5 4.5h6M5 4.5v15M5 12h4.5M5 19.5h4.5"/><rect x="11.5" y="2.5" width="8" height="4" rx="1.2"/><rect x="11.5" y="10" width="8" height="4" rx="1.2"/><rect x="11.5" y="17.5" width="8" height="4" rx="1.2"/></svg>
     </button>
-    <button id="undo" class="icon-btn" type="button" title="Undo (Ctrl+Z)" aria-label="Undo">
-      <svg class="ico" viewBox="0 0 24 24"><path d="M9 14L4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 010 11H11"/></svg>
-    </button>
-    <button id="redo" class="icon-btn" type="button" title="Redo (Ctrl+Shift+Z)" aria-label="Redo">
-      <svg class="ico" viewBox="0 0 24 24"><path d="M15 14l5-5-5-5"/><path d="M20 9H9.5a5.5 5.5 0 000 11H13"/></svg>
-    </button>
+    <span class="history-slot" aria-hidden="true"></span>
     <button id="menu-btn" class="icon-btn" type="button" title="Menu" aria-label="Menu">
       <svg class="ico" viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
     </button>
@@ -53,26 +48,43 @@
       <svg class="ico" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg>
     </button>
     <div class="edit-title">
-      <span class="edit-caption">Editing</span>
+      <span class="edit-caption" id="edit-caption">Editing</span>
       <span id="edit-name" class="edit-name"></span>
     </div>
     <div class="seg dark" id="edit-view-toggle" role="tablist" aria-label="View">
       <button type="button" data-view="plan" role="tab">Plan</button>
       <button type="button" data-view="3d" role="tab">3D</button>
+      <button type="button" data-view="elevation" role="tab" class="openings-only" title="Face the wall">Wall</button>
     </div>
-    <button id="edit-undo" class="icon-btn on-dark" type="button" title="Undo (Ctrl+Z)" aria-label="Undo">
-      <svg class="ico" viewBox="0 0 24 24"><path d="M9 14L4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 010 11H11"/></svg>
-    </button>
-    <button id="edit-redo" class="icon-btn on-dark" type="button" title="Redo (Ctrl+Shift+Z)" aria-label="Redo">
-      <svg class="ico" viewBox="0 0 24 24"><path d="M15 14l5-5-5-5"/><path d="M20 9H9.5a5.5 5.5 0 000 11H13"/></svg>
-    </button>
+    <span class="history-slot" aria-hidden="true"></span>
     <button id="edit-confirm" class="edit-btn confirm" type="button" title="Done — keep changes (Enter)" aria-label="Done editing">
       <svg class="ico" viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>
     </button>
   </header>
 
+  <!-- One history control, in the same place in every mode. -->
+  <div id="history" role="group" aria-label="History">
+    <button id="undo" class="icon-btn" type="button" title="Undo (Ctrl+Z)" aria-label="Undo">
+      <svg class="ico" viewBox="0 0 24 24"><path d="M9 14L4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 010 11H11"/></svg>
+    </button>
+    <button id="redo" class="icon-btn" type="button" title="Redo (Ctrl+Shift+Z)" aria-label="Redo">
+      <svg class="ico" viewBox="0 0 24 24"><path d="M15 14l5-5-5-5"/><path d="M20 9H9.5a5.5 5.5 0 000 11H13"/></svg>
+    </button>
+  </div>
+
   <nav id="edit-dock" hidden aria-label="Edit tools">
-    <div class="dock-group" role="tablist" aria-label="Select">
+    <!-- Openings mode: the preset a tap on a wall places. -->
+    <div class="dock-group openings-only" role="tablist" aria-label="Opening">
+      <button class="tool" type="button" data-opening-preset="window" title="Place windows: tap a wall">
+        <svg class="ico" viewBox="0 0 24 24"><rect x="5" y="4" width="14" height="16" rx="1"/><path d="M12 4v16M5 12h14"/></svg>
+        <span>Window</span>
+      </button>
+      <button class="tool" type="button" data-opening-preset="door" title="Place doors: tap a wall">
+        <svg class="ico" viewBox="0 0 24 24"><path d="M6 21V3.5h12V21"/><path d="M3.5 21h17"/><circle cx="15" cy="12.5" r="1" class="fill"/></svg>
+        <span>Door</span>
+      </button>
+    </div>
+    <div class="dock-group profile-only" role="tablist" aria-label="Select">
       <button class="tool" type="button" data-edit-mode="points" title="Select points (1)">
         <svg class="ico" viewBox="0 0 24 24"><path d="M5 17L9 6l10 4" class="thin"/><circle cx="5" cy="17" r="2.4" class="fill"/><circle cx="9" cy="6" r="2.4" class="fill"/><circle cx="19" cy="10" r="2.4" class="fill"/></svg>
         <span>Points</span>
@@ -81,29 +93,25 @@
         <svg class="ico" viewBox="0 0 24 24"><path d="M4 18L10 5l10 5"/><path d="M10 5l10 5" stroke-width="3.2"/></svg>
         <span>Edges</span>
       </button>
-      <button class="tool" type="button" data-edit-mode="faces" title="Select faces (3)">
+      <button class="tool floor-only" type="button" data-edit-mode="faces" title="Select faces (3)">
         <svg class="ico" viewBox="0 0 24 24"><path d="M4 18L9 5l11 4-3 10z" class="fill-soft"/></svg>
         <span>Faces</span>
       </button>
     </div>
-    <div class="tool-sep" aria-hidden="true"></div>
-    <button class="tool wall-only" type="button" data-edit-tool="window" title="Place a window: tap the wall">
-      <svg class="ico" viewBox="0 0 24 24"><rect x="5" y="4" width="14" height="16" rx="1"/><path d="M12 4v16M5 12h14"/></svg>
-      <span>Window</span>
+    <div class="tool-sep profile-only" aria-hidden="true"></div>
+    <button class="tool run-only" type="button" data-edit-tool="extend" title="Extend the wall: tap to add a point after its nearest end">
+      <svg class="ico" viewBox="0 0 24 24"><path d="M3 18L10 9"/><circle cx="3" cy="18" r="1.6" class="fill"/><circle cx="10" cy="9" r="1.6" class="fill"/><path d="M10 9l8-3" stroke-dasharray="2.4 2.2"/><path d="M18 3v6M15 6h6"/></svg>
+      <span>Extend</span>
     </button>
-    <button class="tool wall-only" type="button" data-edit-tool="door" title="Place a door: tap the wall">
-      <svg class="ico" viewBox="0 0 24 24"><path d="M6 21V3.5h12V21"/><path d="M3.5 21h17"/><circle cx="15" cy="12.5" r="1" class="fill"/></svg>
-      <span>Door</span>
-    </button>
-    <button class="tool floor-extra" type="button" data-edit-tool="solid" title="Draw a solid face">
+    <button class="tool floor-only" type="button" data-edit-tool="solid" title="Draw a solid face">
       <svg class="ico" viewBox="0 0 24 24"><rect x="4.5" y="4.5" width="15" height="15" rx="1.5" class="fill-soft"/></svg>
       <span>Solid</span>
     </button>
-    <button class="tool" type="button" data-edit-tool="void" title="Draw a void face (a hole or an indentation)">
+    <button class="tool floor-only" type="button" data-edit-tool="void" title="Draw a void face (a hole or an indentation)">
       <svg class="ico" viewBox="0 0 24 24"><rect x="4.5" y="4.5" width="15" height="15" rx="1.5" stroke-dasharray="3 2.6"/></svg>
       <span>Void</span>
     </button>
-    <button class="tool floor-extra" type="button" data-edit-tool="split" title="Split faces with a line">
+    <button class="tool floor-only" type="button" data-edit-tool="split" title="Split faces with a line">
       <svg class="ico" viewBox="0 0 24 24"><rect x="4.5" y="4.5" width="15" height="15" rx="1.5"/><path d="M8 21L16 3"/></svg>
       <span>Split</span>
     </button>
@@ -119,16 +127,90 @@
       <span id="edit-panel-title">New faces</span>
       <span id="edit-panel-note" class="edit-panel-note"></span>
     </div>
-    <div class="edit-row" id="edit-anchor-row" hidden>
+    <!-- Wall run: thickness, side, closed, height mode. -->
+    <div class="edit-row run-only">
       <div class="edit-row-line">
-        <span class="edit-row-label">Anchor</span>
-        <div class="seg small" id="edit-anchor" role="tablist" aria-label="Anchor the selected points">
-          <button type="button" data-anchor="bottom" title="Measured from the wall base">Bottom</button>
-          <button type="button" data-anchor="top" title="Follows the wall height">Top</button>
+        <span class="edit-row-label"><i class="swatch solid"></i>Thickness</span>
+        <div class="stepper">
+          <button type="button" data-run-step="thickness" data-step="-1" aria-label="Thinner">−</button>
+          <input id="run-thickness" type="text" inputmode="decimal" aria-label="Wall thickness (m)" />
+          <span class="unit">m</span>
+          <button type="button" data-run-step="thickness" data-step="1" aria-label="Thicker">+</button>
+        </div>
+      </div>
+      <div class="edit-row-line">
+        <button id="run-flip" class="chip-toggle" type="button" aria-pressed="false" title="Grow the thickness on the other side of the line">Flip side</button>
+        <button id="run-closed" class="chip-toggle" type="button" aria-pressed="false" title="Close the loop, or open it at its last segment">Closed</button>
+      </div>
+    </div>
+    <div class="edit-row run-only">
+      <div class="edit-row-line">
+        <span class="edit-row-label">Height</span>
+        <div class="seg small" id="run-mode" role="tablist" aria-label="Wall height">
+          <button type="button" data-run-mode="fixed">Fixed</button>
+          <button type="button" data-run-mode="upto">Up to</button>
+        </div>
+      </div>
+      <div class="edit-row-line" id="run-fixed-line">
+        <span class="edit-row-label">Height</span>
+        <div class="stepper">
+          <button type="button" data-run-step="height" data-step="-1" aria-label="Lower">−</button>
+          <input id="run-height" type="text" inputmode="decimal" aria-label="Wall height (m)" />
+          <span class="unit">m</span>
+          <button type="button" data-run-step="height" data-step="1" aria-label="Higher">+</button>
+        </div>
+      </div>
+      <div class="edit-row-line" id="run-upto-line">
+        <select id="run-top" class="plane-picker" aria-label="Wall top plane"></select>
+        <div class="stepper">
+          <button type="button" data-run-step="offset" data-step="-1" aria-label="Lower the top">−</button>
+          <input id="run-offset" type="text" inputmode="decimal" aria-label="Top offset (m)" />
+          <span class="unit">m</span>
+          <button type="button" data-run-step="offset" data-step="1" aria-label="Raise the top">+</button>
         </div>
       </div>
     </div>
-    <div class="edit-row" id="edit-solid-row">
+    <!-- Openings mode: the selected opening, or the preset. -->
+    <div class="edit-row openings-only">
+      <div class="edit-row-line">
+        <span class="edit-row-label">Width</span>
+        <div class="stepper">
+          <button type="button" data-opening-step="width" data-step="-1" aria-label="Narrower">−</button>
+          <input id="opening-width" type="text" inputmode="decimal" aria-label="Opening width (m)" />
+          <span class="unit">m</span>
+          <button type="button" data-opening-step="width" data-step="1" aria-label="Wider">+</button>
+        </div>
+      </div>
+      <div class="edit-row-line">
+        <span class="edit-row-label">Height</span>
+        <div class="stepper">
+          <button type="button" data-opening-step="height" data-step="-1" aria-label="Lower">−</button>
+          <input id="opening-height" type="text" inputmode="decimal" aria-label="Opening height (m)" />
+          <span class="unit">m</span>
+          <button type="button" data-opening-step="height" data-step="1" aria-label="Taller">+</button>
+        </div>
+      </div>
+      <div class="edit-row-line" id="opening-sill-line">
+        <span class="edit-row-label">Sill</span>
+        <div class="stepper">
+          <button type="button" data-opening-step="sill" data-step="-1" aria-label="Lower the sill">−</button>
+          <input id="opening-sill" type="text" inputmode="decimal" aria-label="Sill height (m)" />
+          <span class="unit">m</span>
+          <button type="button" data-opening-step="sill" data-step="1" aria-label="Raise the sill">+</button>
+        </div>
+      </div>
+      <div class="edit-row-line">
+        <span class="edit-row-label">Depth</span>
+        <button id="opening-through" class="chip-toggle" type="button" aria-pressed="true" title="Through the wall, or a niche">Through</button>
+        <div class="stepper" id="opening-depth-stepper">
+          <button type="button" data-opening-step="depth" data-step="-1" aria-label="Shallower">−</button>
+          <input id="opening-depth" type="text" inputmode="decimal" aria-label="Niche depth (m)" />
+          <span class="unit">m</span>
+          <button type="button" data-opening-step="depth" data-step="1" aria-label="Deeper">+</button>
+        </div>
+      </div>
+    </div>
+    <div class="edit-row floor-only" id="edit-solid-row">
       <div class="edit-row-line">
         <span class="edit-row-label"><i class="swatch solid"></i>Thickness</span>
         <div class="stepper">
@@ -140,7 +222,7 @@
       </div>
       <input id="edit-thickness-slider" class="edit-slider" type="range" min="0.05" max="1.00" step="0.01" aria-label="Thickness" />
     </div>
-    <div class="edit-row" id="edit-void-row">
+    <div class="edit-row floor-only" id="edit-void-row">
       <div class="edit-row-line">
         <span class="edit-row-label"><i class="swatch void"></i>Depth</span>
         <div class="stepper">
@@ -193,25 +275,30 @@
       <svg class="ico" viewBox="0 0 24 24"><path d="M6 3v8a6 6 0 0012 0V3"/><path d="M6 7h3.5M14.5 7H18"/></svg>
       <span>Snap</span>
     </button>
-    <button id="fit-btn" class="tool" type="button" title="Zoom to fit (double-tap empty space)">
-      <svg class="ico" viewBox="0 0 24 24"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>
+  </nav>
+
+  <!-- View controls, visible in every mode: Fit (the selection, the
+       element being edited, or the model) and the render mode. -->
+  <div id="view-cluster" role="group" aria-label="View">
+    <button id="fit-btn" class="cluster-btn" type="button" title="Fit: frame the selection or the model (double-tap empty space)">
+      <svg class="ico" viewBox="0 0 24 24"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/><circle cx="12" cy="12" r="2.2" class="fill"/></svg>
       <span>Fit</span>
     </button>
-  </nav>
+    <button id="render-btn" class="cluster-btn" type="button" title="Render mode: shaded or wireframe" aria-haspopup="menu" aria-expanded="false">
+      <svg class="ico" viewBox="0 0 24 24"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/><path d="M4 7.5l8 4.5 8-4.5M12 12v9"/></svg>
+      <span>View</span>
+    </button>
+  </div>
+  <div id="render-menu" class="render-menu" role="menu" hidden>
+    <button type="button" role="menuitemradio" data-render="shaded">Shaded</button>
+    <button type="button" role="menuitemradio" data-render="shaded-wire">Shaded + wireframe</button>
+    <button type="button" role="menuitemradio" data-render="wire">Wireframe</button>
+  </div>
+  <div id="tri-badge" class="tri-badge" hidden aria-live="polite"></div>
 
   <div id="hint" class="hint" hidden></div>
 
   <section id="drawbar" hidden aria-label="Drawing">
-    <div class="drawbar-row" id="opening-row" hidden>
-      <div class="seg small" id="opening-toggle" role="tablist" aria-label="Opening">
-        <button type="button" data-opening="window" title="Tap a wall to place a window">
-          <svg class="ico sm" viewBox="0 0 24 24"><rect x="4" y="3.5" width="16" height="17" rx="1"/><path d="M12 3.5v17M4 12h16"/></svg>Window
-        </button>
-        <button type="button" data-opening="door" title="Tap a wall to place a door">
-          <svg class="ico sm" viewBox="0 0 24 24"><path d="M6 21V4h12v17"/><path d="M4 21h16"/><circle cx="15" cy="13" r="0.8"/></svg>Door
-        </button>
-      </div>
-    </div>
     <div class="drawbar-row" id="shape-row">
       <div class="seg small" id="shape-toggle" role="tablist" aria-label="Shape">
         <button type="button" data-shape="polygon" title="Polygon">

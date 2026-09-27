@@ -15,12 +15,12 @@
 use vim_design_lib::entity::slot;
 use vim_design_lib::{Command, Document, EntityId, EntityKind, Params, VimStatus};
 
-use vim_design_lib::sketch::{Sketch, SketchDirection};
+use vim_design_lib::sketch::{Sketch, SketchDirection, SketchFaceKind};
 
 use super::edit::FaceKind;
 use super::edit::profile::sketch_from_faces;
-use super::geom::{P2, normalized_ccw};
-use super::model::{LegacyWallModel, PlateModel};
+use super::geom::{P2, dist, normalized_ccw};
+use super::model::{LegacyWallModel, PlateModel, WallModel};
 use super::walls::WallSeg;
 
 /// Site defaults: downtown Montreal. The default lives in the app, not
@@ -205,6 +205,103 @@ pub fn commit_walls(
         elements.push(one(doc, Command::CreateElement { name, members: vec![wall], level })?);
     }
     Ok(elements)
+}
+
+/// A wall run to (re)build: its points on the base plane, open or
+/// closed, thickness side, thickness, and height mode.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunSpec {
+    pub base: EntityId,
+    pub level: EntityId,
+    pub points: Vec<P2>,
+    pub closed: bool,
+    pub flip: bool,
+    pub thickness: f64,
+    pub height: WallHeight,
+}
+
+/// The top reference height a wall of `height` gets on `base`.
+fn top_height(doc: &Document, base: EntityId, height: &WallHeight) -> f64 {
+    let elevation = |p: EntityId| vim_design_lib::workplane::plane_elevation(doc, p).unwrap_or(0.0);
+    match height.top {
+        Some(top) => elevation(top) + height.top_offset_m - elevation(base),
+        None => height.height_m,
+    }
+}
+
+/// A wall's profile for a new length and thickness: the default
+/// rectangle, with the old wall's void faces (openings) kept where they
+/// still fit — mirrored along the wall when its line was reversed.
+fn resized_profile(old: &WallModel, length: f64, thickness: f64, reversed: bool, h: f64) -> (Sketch, Vec<u32>) {
+    let (mut profile, mut anchors) = vim_design_lib::wall::default_profile(length, thickness);
+    let effective = old.effective();
+    for f in &effective.faces {
+        let SketchFaceKind::Void { depth } = f.kind else { continue };
+        let Ok(poly) = vim_design_lib::sketch::face_polygon(&effective, f.id) else { continue };
+        let poly: Vec<P2> = poly.iter().map(|p| if reversed { [old.length() - p[0], p[1]] } else { *p }).collect();
+        if poly.iter().any(|p| p[0] <= 0.0 || p[0] >= length) {
+            continue; // no longer on the wall
+        }
+        if let Ok((p, a)) = vim_design_lib::wall::ops::add_face(&profile, &anchors, h, &poly, SketchFaceKind::Void { depth }) {
+            (profile, anchors) = (p, a);
+        }
+    }
+    (profile, anchors)
+}
+
+/// Build a run as walls, reusing `existing` (the run's current walls, in
+/// run order): segment i updates the i-th wall (only when it changed),
+/// new segments create walls, extra walls are deleted. Butt joins as in
+/// the wall tool. A changed wall's profile is rebuilt (openings kept);
+/// an unchanged wall keeps its own. Returns the run's elements in order.
+/// The caller wraps this in one gesture.
+pub fn rewrite_run(doc: &mut Document, existing: &[WallModel], spec: &RunSpec) -> Result<Vec<EntityId>, String> {
+    let segs = super::walls::wall_segments(&spec.points, spec.closed, spec.thickness, spec.flip)
+        .map_err(|e| e.message().to_owned())?;
+    let h = top_height(doc, spec.base, &spec.height);
+    let mut out = Vec::with_capacity(segs.len());
+    for (i, seg) in segs.iter().enumerate() {
+        let (start, end) = wall_line(seg);
+        let Some(old) = existing.get(i) else {
+            let made = commit_walls(doc, spec.base, spec.level, std::slice::from_ref(seg), spec.height, spec.thickness)?;
+            out.extend(made);
+            continue;
+        };
+        let same_line = |a: P2, b: P2| dist(a, b) < 1e-9;
+        let unchanged = same_line(old.start, start)
+            && same_line(old.end, end)
+            && (old.thickness() - spec.thickness).abs() < 1e-12
+            && old.base == spec.base
+            && old.top == spec.height.top
+            && (old.top_offset_m - spec.height.top_offset_m).abs() < 1e-12
+            && (spec.height.top.is_some() || (old.height_m - spec.height.height_m).abs() < 1e-12);
+        if !unchanged {
+            let od = old.dir();
+            let nd = [end[0] - start[0], end[1] - start[1]];
+            let reversed = od[0] * nd[0] + od[1] * nd[1] < 0.0;
+            let (profile, top_points) = resized_profile(old, dist(start, end), spec.thickness, reversed, h);
+            ok(
+                doc,
+                Command::UpdateWall {
+                    id: old.wall,
+                    base: Some(spec.base),
+                    top: Some(spec.height.top),
+                    start: Some(start),
+                    end: Some(end),
+                    height_m: Some(spec.height.height_m),
+                    top_offset_m: Some(spec.height.top_offset_m),
+                    profile: Some(profile),
+                    top_points: Some(top_points),
+                    coalesce: false,
+                },
+            )?;
+        }
+        out.push(old.element);
+    }
+    for old in existing.iter().skip(segs.len()) {
+        delete_element(doc, old.element)?;
+    }
+    Ok(out)
 }
 
 /// Convert a legacy (extrusion) wall into a library `Wall` in place: the

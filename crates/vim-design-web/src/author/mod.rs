@@ -25,6 +25,7 @@
 mod camera;
 mod edit;
 mod pick;
+mod openings;
 mod planes;
 mod walls;
 
@@ -81,6 +82,8 @@ const GRID: u32 = 0x1e293b;
 const AXIS_X: u32 = 0xe5484d;
 const AXIS_Y: u32 = 0x2fa36b;
 
+/// The wireframe alone: a strong blue-slate (linear), nearly opaque.
+const WIRE_ONLY_COLOR: [f32; 4] = [0.05, 0.11, 0.32, 0.85];
 /// Grid lines float this far above the active plane so they stay
 /// visible on plate tops (which sit exactly on the plane).
 const GRID_LIFT_M: f32 = 0.002;
@@ -112,10 +115,6 @@ enum Tool {
     Plate,
     Hole,
     Wall,
-    /// Tap a wall: its Edit Mode opens with the window (or door) preset
-    /// armed.
-    Window,
-    Door,
 }
 
 impl Tool {
@@ -125,8 +124,6 @@ impl Tool {
             Tool::Plate => "plate",
             Tool::Hole => "hole",
             Tool::Wall => "wall",
-            Tool::Window => "window",
-            Tool::Door => "door",
         }
     }
 }
@@ -225,6 +222,13 @@ pub struct AuthorApp {
     edit_entry_element: Option<EntityId>,
     /// Floor plane or wall elevation.
     edit_target: EditTarget,
+    /// Canvas margins covered by the page's panels (device px: left,
+    /// top, right, bottom).
+    view_insets: [f32; 4],
+    /// A wall run's Edit Mode (its walls and undo snapshots).
+    run_edit: Option<edit::RunEdit>,
+    /// Openings mode (placing windows and doors).
+    openings: Option<openings::OpeningsSession>,
     snap_enabled: bool,
     snap_step: f64,
     plate_thickness: f64,
@@ -292,6 +296,9 @@ impl AuthorApp {
             edit_sketch: None,
             edit_entry_element: None,
             edit_target: EditTarget::Plane,
+            run_edit: None,
+            openings: None,
+            view_insets: [0.0; 4],
             snap_enabled: true,
             snap_step: 0.25,
             plate_thickness: 0.3,
@@ -373,17 +380,28 @@ impl AuthorApp {
 
     // -- View ---------------------------------------------------------------
 
-    /// "plan", "3d", or (in a wall's Edit Mode) "elevation".
+    /// "plan", "3d", or (in Openings mode) "elevation": head-on to the
+    /// wall being worked on.
     pub fn set_view_mode(&mut self, mode: &str) {
-        // A wall being edited can be seen head-on again.
         if mode == "elevation" {
-            if self.edit_wall_frame().is_some() {
-                self.face_edited_wall();
+            if self.faced_frame().is_some() {
+                if self.camera.mode != ViewMode::Elevation && self.prev_camera.is_none() {
+                    self.prev_camera = Some(self.camera.clone());
+                }
+                self.face_wall();
                 self.refresh_styles();
             }
             return;
         }
         let mode = if mode == "3d" { ViewMode::Orbit } else { ViewMode::Plan };
+        if self.camera.mode == ViewMode::Elevation {
+            // Back from an elevation: the view from before it.
+            if let Some(c) = self.prev_camera.take() {
+                self.camera = c;
+            }
+            self.camera.elevation = None;
+            self.grid_key = None;
+        }
         self.camera.set_mode(mode);
         self.refresh_styles();
     }
@@ -404,34 +422,44 @@ impl AuthorApp {
             (Some(a), Some(b)) if (a - b).length() < 1_000.0 => self.camera.pan_plane(a, b),
             _ => self.camera.pan_pixels(x1 - x0, y1 - y0, h),
         }
+        self.clamp_camera();
     }
 
     /// Zoom by `factor` (< 1 zooms in) toward the canvas point.
     pub fn zoom_at(&mut self, factor: f32, px: f32, py: f32) {
         let anchor = self.view_plane_hit(px, py);
         self.camera.zoom(factor.clamp(0.2, 5.0), anchor);
+        self.clamp_camera();
     }
 
-    /// Frame all geometry (or the active level's square when empty); in
-    /// an elevation view, frame the wall.
+    /// Frame the focus: the element being edited, else the selection,
+    /// else all geometry (the active plane's square when empty); in an
+    /// elevation view, the faced wall.
     pub fn zoom_fit(&mut self) {
         let (w, h) = self.size_f();
         let aspect = w / h;
         if self.camera.mode == ViewMode::Elevation && self.faced_frame().is_some() {
-            self.face_edited_wall();
+            self.face_wall();
             return;
         }
-        match self.renderer.scene_bbox() {
+        let _ = aspect;
+        match self.focus_bbox().or_else(|| self.renderer.scene_bbox()) {
             Some((min, max)) => {
                 let v = |a: [f64; 3]| Vec3::new(a[0] as f32, a[1] as f32, a[2] as f32);
-                self.camera.fit(v(min), v(max), aspect);
+                self.fit_box(v(min), v(max));
             }
             None => {
                 let z = self.active_elevation as f32;
-                self.camera
-                    .fit(Vec3::new(-6.0, -6.0, z), Vec3::new(6.0, 6.0, z), aspect);
+                self.fit_box(Vec3::new(-6.0, -6.0, z), Vec3::new(6.0, 6.0, z));
             }
         }
+    }
+
+    /// The canvas margins (device pixels) covered by the page's panels:
+    /// fitting frames into the rest.
+    pub fn set_view_insets(&mut self, left: f32, top: f32, right: f32, bottom: f32) {
+        let clean = |v: f32| if v.is_finite() { v.max(0.0) } else { 0.0 };
+        self.view_insets = [clean(left), clean(top), clean(right), clean(bottom)];
     }
 
     /// Camera state for session persistence (JSON).
@@ -473,13 +501,41 @@ impl AuthorApp {
         if let Some(mode) = v.get("mode").and_then(|m| m.as_str()) {
             c.mode = if mode == "3d" { ViewMode::Orbit } else { ViewMode::Plan };
         }
+        self.clamp_camera();
         self.refresh_styles();
     }
 
     // -- Display ------------------------------------------------------------
 
+    /// Render mode (session state): "shaded", "shaded-wire" (the
+    /// triangle edges over the shading), or "wire" (the triangle edges
+    /// alone). The wireframe shows the real mesh topology.
+    pub fn set_render_mode(&mut self, mode: &str) {
+        let (shaded, wire) = match mode {
+            "shaded-wire" => (true, true),
+            "wire" => (false, true),
+            _ => (true, false),
+        };
+        self.renderer.shaded = shaded;
+        self.renderer.wireframe = wire;
+        // Alone, the wireframe is stronger and the feature edges would
+        // only hide it.
+        self.renderer.feature_edges = shaded;
+        self.renderer.wire_color = if shaded { crate::render::DEFAULT_WIRE_COLOR } else { WIRE_ONLY_COLOR };
+    }
+
+    pub fn render_mode(&self) -> String {
+        match (self.renderer.shaded, self.renderer.wireframe) {
+            (true, true) => "shaded-wire",
+            (false, _) => "wire",
+            _ => "shaded",
+        }
+        .to_owned()
+    }
+
+    /// Old session flag: the wireframe over the shading.
     pub fn set_wireframe(&mut self, enabled: bool) {
-        self.renderer.wireframe = enabled;
+        self.set_render_mode(if enabled { "shaded-wire" } else { "shaded" });
     }
 
     pub fn wireframe(&self) -> bool {
@@ -488,18 +544,15 @@ impl AuthorApp {
 
     // -- Tools --------------------------------------------------------------
 
-    /// Activate a tool: "select", "plate", "hole", "wall", "window", or
-    /// "door". Drawing tools need an active level (`can_author`). The
-    /// window and door tools have no sketch: the page picks the tapped
-    /// wall and opens its Edit Mode with the preset armed. Returns false
-    /// when refused.
+    /// Activate a tool: "select", "plate", "hole", or "wall". Drawing
+    /// tools need an active level (`can_author`). (Windows and doors have
+    /// their own mode: [`AuthorApp::openings_begin`].) Returns false when
+    /// refused.
     pub fn set_tool(&mut self, tool: &str) -> bool {
         let tool = match tool {
             "plate" => Tool::Plate,
             "hole" => Tool::Hole,
             "wall" => Tool::Wall,
-            "window" => Tool::Window,
-            "door" => Tool::Door,
             _ => Tool::Select,
         };
         if tool != Tool::Select && !self.can_author() {
@@ -681,7 +734,7 @@ impl AuthorApp {
         let preview_uv = sk.preview();
         let preview: Vec<[f32; 2]> = preview_uv.iter().filter_map(|p| proj(*p)).collect();
         // On a wall face: wall-local u along, v up.
-        let facing = matches!(self.edit_target, EditTarget::Wall(_));
+        let facing = self.camera.mode == ViewMode::Elevation;
         let (lu, lv) = if facing { ("u", "v") } else { ("x", "y") };
         let cursor = sk.cursor.as_ref().and_then(|c| {
             proj(c.point).map(|[x, y]| {
@@ -882,9 +935,8 @@ impl AuthorApp {
             self.set_active_plane(level.0 as f64);
         }
         let Some(stats) = self.pick.owner_stats(id) else { return false };
-        let (w, h) = self.size_f();
         let [min, max] = stats.bbox;
-        self.camera.fit(Vec3::from_array(min), Vec3::from_array(max), w / h);
+        self.fit_box(Vec3::from_array(min), Vec3::from_array(max));
         true
     }
 
@@ -1217,6 +1269,8 @@ impl AuthorApp {
             .iter()
             .filter(|e| matches!(e, ElementModel::Plate(_) | ElementModel::SketchPlate(_)) && e.level() == self.active_level)
             .count();
+        let focus: Vec<usize> = self.focus_ids().iter().filter_map(|id| self.pick.owner_stats(*id)).map(|s| s.triangles).collect();
+        let focus_triangles = (!focus.is_empty()).then(|| focus.iter().sum::<usize>());
         serde_json::json!({
             "backend": self.renderer.backend_name(),
             "msaa": self.renderer.sample_count(),
@@ -1233,6 +1287,9 @@ impl AuthorApp {
             "canUndo": self.can_undo(),
             "canRedo": self.can_redo(),
             "wireframe": self.renderer.wireframe,
+            "renderMode": self.render_mode(),
+            // Triangles of the selection (or the element being edited).
+            "focusTriangles": focus_triangles,
             "tool": self.tool.name(),
             "shape": self.current_shape().name(),
             "view": self.camera.mode.name(),
@@ -1244,6 +1301,7 @@ impl AuthorApp {
             "walls": self.model.iter().filter(|e| e.wall_line().is_some()).count(),
             "wallsOnLevel": self.model.iter().filter(|e| e.wall_line().is_some() && e.level() == self.active_level).count(),
             "editing": self.edit.is_some(),
+            "openings": self.openings.is_some(),
             "wall": {
                 "height": self.wall_height,
                 "thickness": self.wall_thickness,
@@ -1304,6 +1362,86 @@ fn describe_load_error(status: VimStatus) -> String {
 }
 
 impl AuthorApp {
+    /// The element the view focuses on: the one being edited, else the
+    /// selection.
+    fn focus_element(&self) -> Option<EntityId> {
+        let opening = self.openings.as_ref().and_then(|o| o.selected).map(|(wall, _)| wall);
+        self.edit.as_ref().and_then(|s| s.element).or(opening).or(self.selection)
+    }
+
+    /// The elements in focus: a wall run being edited (all its walls),
+    /// else the focus element.
+    fn focus_ids(&self) -> Vec<EntityId> {
+        match &self.run_edit {
+            Some(r) => r.elements.clone(),
+            None => self.focus_element().into_iter().collect(),
+        }
+    }
+
+    /// The box Fit frames: the focus elements' bounds.
+    fn focus_bbox(&self) -> Option<([f64; 3], [f64; 3])> {
+        let ids = self.focus_ids();
+        let mut out: Option<([f64; 3], [f64; 3])> = None;
+        for s in ids.iter().filter_map(|id| self.pick.owner_stats(*id)) {
+            let [min, max] = s.bbox;
+            let (min, max) = (min.map(f64::from), max.map(f64::from));
+            out = Some(match out {
+                None => (min, max),
+                Some((a, b)) => (
+                    [a[0].min(min[0]), a[1].min(min[1]), a[2].min(min[2])],
+                    [b[0].max(max[0]), b[1].max(max[1]), b[2].max(max[2])],
+                ),
+            });
+        }
+        out
+    }
+
+    /// Keep the camera near the model (see `camera::VIEW_RANGE_FACTOR`):
+    /// the model's bounds, or the active plane's square when empty.
+    fn clamp_camera(&mut self) {
+        if self.camera.mode == ViewMode::Elevation {
+            return;
+        }
+        let (center, radius) = match self.renderer.scene_bbox() {
+            Some((min, max)) => {
+                let v = |a: [f64; 3]| Vec3::new(a[0] as f32, a[1] as f32, a[2] as f32);
+                let (min, max) = (v(min), v(max));
+                ((min + max) * 0.5, (max - min).length() * 0.5)
+            }
+            None => {
+                let extent = ops::levels_sorted(&self.doc)
+                    .iter()
+                    .find(|l| Some(l.id) == self.active_level)
+                    .map_or(ops::LEVEL_EXTENT_M, |l| l.extent_m);
+                (Vec3::new(0.0, 0.0, self.active_elevation as f32), extent as f32)
+            }
+        };
+        self.camera.clamp_to(center, radius);
+    }
+
+    /// Frame a world box in the part of the canvas the panels leave free
+    /// (see [`AuthorApp::set_view_insets`]).
+    fn fit_box(&mut self, min: Vec3, max: Vec3) {
+        let (w, h) = self.size_f();
+        let [l, t, r, b] = self.view_insets;
+        // Keep at least half the canvas each way, whatever the panels.
+        let (fw, fh) = ((w - l - r).max(w * 0.5), (h - t - b).max(h * 0.5));
+        self.camera.fit(min, max, fw / fh);
+        let k = h / fh;
+        self.camera.plan_half_h *= k;
+        self.camera.distance *= k;
+        // The box centre (now at the canvas centre) moves to the free
+        // area's centre.
+        let (cx, cy) = (w / 2.0, h / 2.0);
+        let (dx, dy) = ((l - r) / 2.0, (t - b) / 2.0);
+        if dx.abs() > 0.5 || dy.abs() > 0.5 {
+            match (self.view_plane_hit(cx, cy), self.view_plane_hit(cx + dx, cy + dy)) {
+                (Some(a), Some(p)) => self.camera.pan_plane(a, p),
+                _ => self.camera.pan_pixels(dx, dy, h),
+            }
+        }
+    }
+
     fn size_f(&self) -> (f32, f32) {
         let (w, h) = self.renderer.size();
         (w as f32, h as f32)
@@ -1422,7 +1560,15 @@ impl AuthorApp {
 
     /// The wall an elevation view faces: the wall being edited.
     fn faced_frame(&self) -> Option<(ElevationFrame, f32, f32)> {
-        self.edit_wall_frame()
+        self.openings_faced_frame()
+    }
+
+    /// Face the faced wall head-on, the whole wall in view.
+    fn face_wall(&mut self) {
+        let Some((frame, length, height)) = self.faced_frame() else { return };
+        let (w, h) = self.size_f();
+        self.camera.enter_elevation(frame, length, height, w / h);
+        self.grid_key = None;
     }
 
     /// The plane the current sketch lives on.
@@ -1483,10 +1629,9 @@ impl AuthorApp {
         }
     }
 
-    /// Snap step in Edit Mode: a wall's face snaps as finely as its
-    /// elevation grid, a floor plate like the plan.
+    /// Snap step in Edit Mode (the plan's).
     fn edit_snap_step(&self) -> f64 {
-        if matches!(self.edit_target, EditTarget::Wall(_)) { ELEVATION_GRID_STEP_M } else { self.snap_step }
+        self.snap_step
     }
 
     fn sketch_count(&self) -> usize {
@@ -1555,6 +1700,7 @@ impl AuthorApp {
     /// the session, not as "other" geometry).
     fn is_edited(&self, element: EntityId) -> bool {
         self.edit.as_ref().and_then(|s| s.element) == Some(element)
+            || self.run_edit.as_ref().is_some_and(|r| r.elements.contains(&element))
     }
 
     fn is_plate(&self, element: EntityId) -> bool {
@@ -1882,6 +2028,8 @@ impl AuthorApp {
         self.tool = Tool::Select;
         self.edit = None;
         self.edit_target = EditTarget::Plane;
+        self.run_edit = None;
+        self.openings = None;
         self.edit_tool = EditTool::Select;
         self.edit_sketch = None;
         self.edit_entry_element = None;
@@ -2118,7 +2266,7 @@ impl AuthorApp {
             let other_level = self.camera.mode == ViewMode::Plan
                 && level.is_some()
                 && level != self.active_level;
-            let edited = self.edit.as_ref().and_then(|s| s.element) == Some(id);
+            let edited = self.is_edited(id);
             let (tint, edge, unlit) = if edited {
                 // The profile overlay is the focus while editing; the
                 // live mesh stays readable under it.

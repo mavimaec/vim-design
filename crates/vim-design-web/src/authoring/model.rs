@@ -1021,4 +1021,70 @@ mod tests {
         assert_eq!(ops::workplanes(&doc).len(), 2);
         assert_eq!(derive(&doc).len(), 3);
     }
+
+    #[test]
+    fn runs_are_recovered_from_their_walls_and_rewritten() {
+        use crate::authoring::runs::chain_of;
+        use crate::authoring::walls;
+        let mut doc = Document::new();
+        let ground = ops::seed_new_project(&mut doc).expect("seed");
+        let fixed = ops::WallHeight { height_m: 2.7, top: None, top_offset_m: 0.0 };
+        // A room drawn clockwise (normalized CCW, grows inward) and a
+        // flipped open run of two segments at 60°.
+        let room = [[0.0, 0.0], [0.0, 3.0], [4.0, 3.0], [4.0, 0.0]];
+        let segs = walls::wall_segments(&room, true, 0.2, false).expect("room");
+        ops::commit_walls(&mut doc, ground, ground, &segs, fixed, 0.2).expect("room walls");
+        let run = [[10.0, 0.0], [14.0, 0.0], [16.0, 3.4641016151377544]];
+        let segs = walls::wall_segments(&run, false, 0.2, true).expect("run");
+        ops::commit_walls(&mut doc, ground, ground, &segs, fixed, 0.2).expect("run walls");
+        let ws = walls_of(&doc);
+        assert_eq!(ws.len(), 6);
+        let refs: Vec<&WallModel> = ws.iter().collect();
+        for w in &ws[..4] {
+            let c = chain_of(&refs, w.element).expect("room chain");
+            assert!(c.closed && !c.flip, "{c:?}");
+            assert_eq!(c.elements.len(), 4);
+            let mut pts = c.points.clone();
+            pts.sort_by(|a, b| a[0].total_cmp(&b[0]).then(a[1].total_cmp(&b[1])));
+            let near = |a: [f64; 2], b: [f64; 2]| (a[0] - b[0]).abs() < 1e-9 && (a[1] - b[1]).abs() < 1e-9;
+            assert!(pts.iter().zip([[0.0, 0.0], [0.0, 3.0], [4.0, 0.0], [4.0, 3.0]]).all(|(a, b)| near(*a, b)), "{pts:?}");
+            assert!(signed_area(&c.points) > 0.0, "counter-clockwise");
+        }
+        // An open run may come back in either direction: drawn flipped,
+        // or reversed and unflipped — the same walls.
+        let open = chain_of(&refs, ws[5].element).expect("open chain");
+        assert!(!open.closed);
+        let (mut order, mut expect) = (vec![ws[4].element, ws[5].element], run.to_vec());
+        if !open.flip {
+            order.reverse();
+            expect.reverse();
+        }
+        assert_eq!(open.elements, order);
+        for (a, b) in open.points.iter().zip(expect.iter()) {
+            assert!((a[0] - b[0]).abs() < 1e-9 && (a[1] - b[1]).abs() < 1e-9, "{:?}", open.points);
+        }
+
+        // Rewrite the room with a corner moved and a point inserted: the
+        // four walls are reused (in order), a fifth is created.
+        let room_chain = chain_of(&refs, ws[0].element).expect("room");
+        let existing: Vec<WallModel> =
+            room_chain.elements.iter().filter_map(|e| ws.iter().find(|w| w.element == *e).cloned()).collect();
+        let mut pts = room_chain.points.clone();
+        pts.insert(1, [(pts[0][0] + pts[1][0]) / 2.0, (pts[0][1] + pts[1][1]) / 2.0 - 1.0]);
+        let spec = ops::RunSpec { base: ground, level: ground, points: pts, closed: true, flip: false, thickness: 0.2, height: fixed };
+        let out = ops::rewrite_run(&mut doc, &existing, &spec).expect("rewrite");
+        assert_eq!(out.len(), 5);
+        assert_eq!(&out[..4], &room_chain.elements[..]);
+        let after = walls_of(&doc);
+        assert_eq!(after.len(), 7);
+        let refs: Vec<&WallModel> = after.iter().collect();
+        let c = chain_of(&refs, out[0]).expect("rewritten chain");
+        assert_eq!((c.elements.len(), c.closed), (5, true));
+        // Fewer points: the extra walls are deleted.
+        let spec = ops::RunSpec { points: room_chain.points[..3].to_vec(), ..spec };
+        let out = ops::rewrite_run(&mut doc, &after.iter().filter(|w| c.elements.contains(&w.element)).cloned().collect::<Vec<_>>(), &spec)
+            .expect("shrink");
+        assert_eq!(out.len(), 3);
+        assert_eq!(walls_of(&doc).len(), 5);
+    }
 }
