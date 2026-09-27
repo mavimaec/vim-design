@@ -8,7 +8,9 @@
 //!   it is drawn on, with coordinates stored as the level-frame
 //!   (u, v, w) — so a level elevation edit moves the element and, with
 //!   translation factoring, is transform-only;
-//! - every element is ASSOCIATED with that level (mandatory slot).
+//! - every element is ASSOCIATED with that level (mandatory slot); an
+//!   element drawn on a workplane is associated with the workplane's
+//!   root story level.
 
 use vim_design_lib::entity::slot;
 use vim_design_lib::{Command, Document, EntityId, EntityKind, Params, VimStatus};
@@ -18,7 +20,7 @@ use vim_design_lib::sketch::{Sketch, SketchDirection};
 use super::edit::FaceKind;
 use super::edit::profile::sketch_from_faces;
 use super::geom::{P2, normalized_ccw};
-use super::model::PlateModel;
+use super::model::{LegacyWallModel, PlateModel};
 use super::walls::WallSeg;
 
 /// Site defaults: downtown Montreal. The default lives in the app, not
@@ -150,61 +152,242 @@ pub fn build_attached_loop(
     one(doc, Command::CreateWire { edges })
 }
 
-/// Commit a wall run: one element per segment, each a vertical profile
-/// rectangle (base line at `w = 0`, top at `w = height`) extruded along
-/// the segment normal by `thickness`. Every point is attached to the
-/// construction `plane`; every element is associated with `level` (the
-/// plane's root story level). Returns the element ids in run order.
+/// How tall new walls are: a fixed height, or up to a construction
+/// plane plus an offset (the wall height then follows that plane).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WallHeight {
+    /// The wall's `height_m` (its height when `top` is `None`).
+    pub height_m: f64,
+    pub top: Option<EntityId>,
+    pub top_offset_m: f64,
+}
+
+/// The reference line of a segment for the library's `Wall`, whose
+/// material grows to the LEFT of start -> end: a segment whose thickness
+/// is on its right (flip side) is stored reversed.
+pub fn wall_line(seg: &WallSeg) -> (P2, P2) {
+    let d = [seg.end[0] - seg.start[0], seg.end[1] - seg.start[1]];
+    let left = seg.normal[0] * -d[1] + seg.normal[1] * d[0] >= 0.0;
+    if left { (seg.start, seg.end) } else { (seg.end, seg.start) }
+}
+
+/// Commit a wall run: one `Wall` per segment, on the construction
+/// `plane`, with the default profile (a rectangle of the wall's height
+/// with both top corners anchored to the top), each owned by one
+/// element associated with `level` (the plane's root story level).
+/// Returns the element ids in run order.
 pub fn commit_walls(
     doc: &mut Document,
     plane: EntityId,
     level: EntityId,
     segments: &[WallSeg],
-    height: f64,
+    height: WallHeight,
     thickness: f64,
 ) -> Result<Vec<EntityId>, String> {
     let mut elements = Vec::with_capacity(segments.len());
     for seg in segments {
-        let [sx, sy] = seg.start;
-        let [ex, ey] = seg.end;
-        // Wire order A -> B -> C -> D: the first edge runs along the base
-        // in the drawn direction (the model reads the wall axis from it).
-        let profile = [[sx, sy, 0.0], [ex, ey, 0.0], [ex, ey, height], [sx, sy, height]];
-        let wire = build_attached_loop(doc, plane, &profile)?;
-        let face = one(doc, Command::CreateFace { outer: wire, holes: vec![], plane: None })?;
-        let start_cp = one(doc, Command::CreateControlPoint { position: [sx, sy, 0.0] })?;
-        let end_cp = one(
+        let (start, end) = wall_line(seg);
+        let (profile, top_points) = vim_design_lib::wall::default_profile(seg.length(), thickness);
+        let wall = one(
             doc,
-            Command::CreateControlPoint {
-                position: [sx + seg.normal[0] * thickness, sy + seg.normal[1] * thickness, 0.0],
+            Command::CreateWall {
+                base: plane,
+                top: height.top,
+                start,
+                end,
+                height_m: height.height_m,
+                top_offset_m: height.top_offset_m,
+                profile,
+                top_points,
             },
         )?;
-        let path = one(doc, Command::CreateLine { start: start_cp, end: end_cp })?;
-        let extrusion = one(doc, Command::CreateExtrusion { profile: face, path })?;
-        attach_all(doc, plane, &[start_cp, end_cp])?;
         let name = next_element_name(doc, "Wall");
-        let element = one(
-            doc,
-            Command::CreateElement { name, members: vec![extrusion], level },
-        )?;
-        one(
-            doc,
-            Command::CreateInstance {
-                element,
-                transform: [
-                    1.0, 0.0, 0.0, 0.0, //
-                    0.0, 1.0, 0.0, 0.0, //
-                    0.0, 0.0, 1.0, 0.0,
-                ],
-            },
-        )?;
-        elements.push(element);
+        elements.push(one(doc, Command::CreateElement { name, members: vec![wall], level })?);
     }
     Ok(elements)
 }
 
+/// Convert a legacy (extrusion) wall into a library `Wall` in place: the
+/// same element, name, and level; the reference line from its base line
+/// (reversed when its thickness is on the right), its level as the base,
+/// a fixed height, the profile outline as a solid face of its thickness
+/// with the top corners anchored to the top, and every window a through
+/// void. The old construction chain is deleted. Returns the wall id.
+pub fn convert_legacy_wall(doc: &mut Document, wall: &LegacyWallModel) -> Result<EntityId, String> {
+    if wall.base_w.abs() > 1e-9 || wall.height <= 0.0 {
+        return Err("this wall is not a plain wall".to_owned());
+    }
+    let length = wall.length();
+    let d = wall.dir();
+    // Material on the left: keep the line; on the right: reverse it and
+    // mirror the profile along the wall.
+    let left = wall.normal[0] * -d[1] + wall.normal[1] * d[0] >= 0.0;
+    let (start, end) = if left { (wall.start, wall.end) } else { (wall.end, wall.start) };
+    let map = |p: &P2| -> P2 { if left { *p } else { [length - p[0], p[1]] } };
+    let mut faces = vec![(
+        wall.profile.iter().map(map).collect::<Vec<_>>(),
+        FaceKind::Solid { thickness: wall.thickness },
+    )];
+    faces.extend(
+        wall.windows
+            .iter()
+            .filter(|h| h.outline.len() >= 3)
+            .map(|h| (h.outline.iter().map(map).collect(), FaceKind::Void { depth: None })),
+    );
+    let effective = sketch_from_faces(&faces).map_err(|e| e.message().to_owned())?;
+    let top_points: Vec<u32> = effective
+        .points
+        .iter()
+        .filter(|p| (p.uv[1] - wall.height).abs() < 1e-6)
+        .map(|p| p.id)
+        .collect();
+    let profile = vim_design_lib::wall::stored_profile(&effective, &top_points, wall.height);
+    let id = one(
+        doc,
+        Command::CreateWall {
+            base: wall.plane_level,
+            top: None,
+            start,
+            end,
+            height_m: wall.height,
+            top_offset_m: 0.0,
+            profile,
+            top_points,
+        },
+    )?;
+    // The legacy instance (identity) is not needed by a wall element.
+    for dep in doc.dependents(wall.element).map_err(|st| format!("{st:?}"))? {
+        if doc.entity(dep).map(|e| e.kind()) == Some(EntityKind::Instance) {
+            ok(doc, Command::DeleteInstance { id: dep })?;
+        }
+    }
+    ok(
+        doc,
+        Command::UpdateElement { id: wall.element, name: None, members: Some(vec![id]), coalesce: false },
+    )?;
+    delete_construction_closure(doc, wall.extrusion)?;
+    Ok(id)
+}
+
+/// Height a wall keeps when its top plane is deleted while its top
+/// reference is at or below its base (meters).
+const MIN_UNWIRED_WALL_HEIGHT_M: f64 = 0.1;
+
+/// One workplane's params and parent, read back for the tree and the
+/// level manager.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkplaneInfo {
+    pub id: EntityId,
+    pub parent: EntityId,
+    pub name: String,
+    pub offset_m: f64,
+    pub color: [f32; 4],
+    pub extent_m: f64,
+}
+
+/// Every workplane, by offset then id (siblings in height order).
+pub fn workplanes(doc: &Document) -> Vec<WorkplaneInfo> {
+    let mut out: Vec<WorkplaneInfo> = doc
+        .entities()
+        .filter_map(|(id, record)| match &record.params {
+            Params::Workplane { name, offset_m, color, extent_m } => Some(WorkplaneInfo {
+                id: *id,
+                parent: record.inputs.get(slot::WORKPLANE_PARENT)?.referenced().next()?,
+                name: name.clone(),
+                offset_m: *offset_m,
+                color: *color,
+                extent_m: *extent_m,
+            }),
+            _ => None,
+        })
+        .collect();
+    out.sort_by(|a, b| a.offset_m.total_cmp(&b.offset_m).then(a.id.cmp(&b.id)));
+    out
+}
+
+/// What deleting a workplane takes with it: nested workplanes, floor
+/// plates and walls standing on them, and walls that only reach up to
+/// one of them (those keep their current height instead).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct WorkplaneContents {
+    pub workplanes: Vec<EntityId>,
+    /// Elements drawn on the planes (deleted).
+    pub elements: Vec<EntityId>,
+    /// Walls whose top is one of the planes (their top is unwired).
+    pub topped_walls: Vec<EntityId>,
+}
+
+fn element_of(doc: &Document, member: EntityId) -> Option<EntityId> {
+    doc.dependents(member)
+        .ok()?
+        .into_iter()
+        .find(|d| doc.entity(*d).map(|e| e.kind()) == Some(EntityKind::Element))
+}
+
+/// The contents of a workplane (itself included in `workplanes`, nested
+/// planes after their parents).
+pub fn workplane_contents(doc: &Document, id: EntityId) -> WorkplaneContents {
+    let mut out = WorkplaneContents::default();
+    let mut stack = vec![id];
+    while let Some(plane) = stack.pop() {
+        out.workplanes.push(plane);
+        for dep in doc.dependents(plane).unwrap_or_default() {
+            let Some(record) = doc.entity(dep) else { continue };
+            let on_base = || record.inputs.get(slot::WALL_BASE).and_then(|s| s.referenced().next()) == Some(plane);
+            match record.kind() {
+                EntityKind::Workplane => stack.push(dep),
+                EntityKind::Wall if !on_base() => out.topped_walls.push(dep),
+                EntityKind::Sketch | EntityKind::Wall | EntityKind::ControlPoint => {
+                    let owner = if record.kind() == EntityKind::ControlPoint { None } else { element_of(doc, dep) };
+                    if let Some(e) = owner.filter(|e| !out.elements.contains(e)) {
+                        out.elements.push(e);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    // A wall both on and up to the deleted planes is simply deleted.
+    out.topped_walls.retain(|w| element_of(doc, *w).is_none_or(|e| !out.elements.contains(&e)));
+    out
+}
+
+/// Delete a workplane with its contents (see [`WorkplaneContents`]).
+/// The caller wraps this in one gesture.
+pub fn delete_workplane_cascade(doc: &mut Document, id: EntityId) -> Result<(), String> {
+    let contents = workplane_contents(doc, id);
+    for wall in &contents.topped_walls {
+        let h = vim_design_lib::wall::wall_top_height(doc, *wall).ok_or("a wall has no height")?;
+        ok(
+            doc,
+            Command::UpdateWall {
+                id: *wall,
+                base: None,
+                top: Some(None),
+                start: None,
+                end: None,
+                // A wall whose top was at or below its base keeps a
+                // valid (tiny) height the user can fix.
+                height_m: Some(h.max(MIN_UNWIRED_WALL_HEIGHT_M)),
+                top_offset_m: Some(0.0),
+                profile: None,
+                top_points: None,
+                coalesce: false,
+            },
+        )?;
+    }
+    for element in &contents.elements {
+        delete_element(doc, *element)?;
+    }
+    for plane in contents.workplanes.iter().rev() {
+        ok(doc, Command::DeleteWorkplane { id: *plane })?;
+    }
+    Ok(())
+}
+
 /// Append a window (hole wire from level-frame (u, v, w) points) to a
-/// wall's profile face. Returns the new wire id.
+/// legacy wall's profile face (test fixtures only). Returns the wire id.
+#[cfg(test)]
 pub fn commit_window(
     doc: &mut Document,
     level: EntityId,
@@ -219,6 +402,47 @@ pub fn commit_window(
         Command::UpdateFace { id: face, outer: None, holes: Some(holes), plane: None, coalesce: false },
     )?;
     Ok(wire)
+}
+
+/// Build legacy (extrusion) walls as the first wall tool did (test
+/// fixtures only: documents from before the `Wall` entity).
+#[cfg(test)]
+pub fn commit_legacy_walls(
+    doc: &mut Document,
+    level: EntityId,
+    segments: &[WallSeg],
+    height: f64,
+    thickness: f64,
+) -> Result<Vec<EntityId>, String> {
+    let mut elements = Vec::with_capacity(segments.len());
+    for seg in segments {
+        let [sx, sy] = seg.start;
+        let [ex, ey] = seg.end;
+        let profile = [[sx, sy, 0.0], [ex, ey, 0.0], [ex, ey, height], [sx, sy, height]];
+        let wire = build_attached_loop(doc, level, &profile)?;
+        let face = one(doc, Command::CreateFace { outer: wire, holes: vec![], plane: None })?;
+        let start_cp = one(doc, Command::CreateControlPoint { position: [sx, sy, 0.0] })?;
+        let end_cp = one(
+            doc,
+            Command::CreateControlPoint {
+                position: [sx + seg.normal[0] * thickness, sy + seg.normal[1] * thickness, 0.0],
+            },
+        )?;
+        let path = one(doc, Command::CreateLine { start: start_cp, end: end_cp })?;
+        let extrusion = one(doc, Command::CreateExtrusion { profile: face, path })?;
+        attach_all(doc, level, &[start_cp, end_cp])?;
+        let name = next_element_name(doc, "Wall");
+        let element = one(doc, Command::CreateElement { name, members: vec![extrusion], level })?;
+        one(
+            doc,
+            Command::CreateInstance {
+                element,
+                transform: [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+            },
+        )?;
+        elements.push(element);
+    }
+    Ok(elements)
 }
 
 /// Ids of a committed floor plate.
@@ -446,6 +670,7 @@ fn delete_command(kind: EntityKind, id: EntityId) -> Option<Command> {
         EntityKind::Revolve => Command::DeleteRevolve { id },
         EntityKind::Chamfer => Command::DeleteChamfer { id },
         EntityKind::Sketch => Command::DeleteSketch { id },
+        EntityKind::Wall => Command::DeleteWall { id },
         _ => return None, // levels, materials, elements, ...: never swept
     })
 }

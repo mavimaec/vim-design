@@ -184,7 +184,7 @@
       <svg class="ico" viewBox="0 0 24 24"><path d="M3 20V9l5-3v11z"/><path d="M8 17l13-4V4L8 6"/><path d="M3 20l5-3"/></svg>
       <span>Wall</span>
     </button>
-    <button class="tool" type="button" data-tool="window" title="Windows in a wall (N)">
+    <button class="tool" type="button" data-tool="window" data-tools="window door" title="Windows and doors: tap a wall (N)">
       <svg class="ico" viewBox="0 0 24 24"><rect x="4" y="3.5" width="16" height="17" rx="1"/><path d="M12 3.5v17M4 12h16"/></svg>
       <span>Window</span>
     </button>
@@ -202,7 +202,17 @@
   <div id="hint" class="hint" hidden></div>
 
   <section id="drawbar" hidden aria-label="Drawing">
-    <div class="drawbar-row">
+    <div class="drawbar-row" id="opening-row" hidden>
+      <div class="seg small" id="opening-toggle" role="tablist" aria-label="Opening">
+        <button type="button" data-opening="window" title="Tap a wall to place a window">
+          <svg class="ico sm" viewBox="0 0 24 24"><rect x="4" y="3.5" width="16" height="17" rx="1"/><path d="M12 3.5v17M4 12h16"/></svg>Window
+        </button>
+        <button type="button" data-opening="door" title="Tap a wall to place a door">
+          <svg class="ico sm" viewBox="0 0 24 24"><path d="M6 21V4h12v17"/><path d="M4 21h16"/><circle cx="15" cy="13" r="0.8"/></svg>Door
+        </button>
+      </div>
+    </div>
+    <div class="drawbar-row" id="shape-row">
       <div class="seg small" id="shape-toggle" role="tablist" aria-label="Shape">
         <button type="button" data-shape="polygon" title="Polygon">
           <svg class="ico sm" viewBox="0 0 24 24"><path d="M5 18l-1-9 8-5 8 5-2 9z"/></svg>Polygon
@@ -214,10 +224,6 @@
       <button id="flip-toggle" class="chip-toggle" type="button" aria-pressed="false" title="Grow the wall thickness on the other side of the drawn line">
         <svg class="ico sm" viewBox="0 0 24 24"><path d="M7 4v16M17 4v16"/><path d="M10 9l-3-3-3 3M14 15l3 3 3-3"/></svg>
         <span>Flip side</span>
-      </button>
-      <button id="window-done" class="chip-toggle primary" type="button" title="Done with this wall (Esc)">
-        <svg class="ico sm" viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>
-        <span>Done</span>
       </button>
       <label class="stepper" id="thickness-stepper" title="Thickness of new floor plates">
         <span class="stepper-label">Thick</span>
@@ -257,7 +263,7 @@
         <button type="button" data-wall="thickness" data-step="1" aria-label="Thicker">+</button>
       </label>
     </div>
-    <div class="drawbar-row actions">
+    <div class="drawbar-row actions" id="draw-actions">
       <button id="undo-point" class="act" type="button" title="Undo last point (Backspace)">
         <svg class="ico sm" viewBox="0 0 24 24"><path d="M10 7L5 12l5 5"/><path d="M5 12h14"/></svg>
         <span>Undo point</span>

@@ -1,20 +1,25 @@
-//! Wall and window operations of the authoring app: wall settings and
-//! edits, picking a wall (with a generous screen tolerance — walls are
-//! thin in plan), and the window flow: tap a wall -> orthographic
-//! elevation view facing it -> draw windows -> Done returns to the
-//! previous view.
+//! Wall operations of the authoring app: settings for new walls (their
+//! height mode: a fixed height, or up to a construction plane plus an
+//! offset), wall property edits, and picking a wall (with a generous
+//! screen tolerance — walls are thin in plan).
+//!
+//! Walls are the library's `Wall` entity: a reference line on a plane
+//! and an elevation profile (openings are void faces, edited in the
+//! wall's Edit Mode). Legacy extrusion walls from before it still show,
+//! select, and delete; their height and thickness stay editable, and the
+//! pencil converts one in place.
 
 use glam::Vec3;
+use vim_design_lib::sketch::SketchFaceKind;
 use vim_design_lib::{Command, EntityId};
 use wasm_bindgen::prelude::*;
 
 use super::camera::ViewMode;
 use super::{
-    AuthorApp, MAX_WALL_HEIGHT_M, MAX_WALL_THICKNESS_M, MIN_WALL_HEIGHT_M,
-    MIN_WALL_THICKNESS_M, Tool, eid,
+    AuthorApp, MAX_WALL_HEIGHT_M, MAX_WALL_THICKNESS_M, MIN_WALL_HEIGHT_M, MIN_WALL_THICKNESS_M, eid,
 };
-use crate::authoring::model::{ElementModel, WallModel};
-use crate::authoring::sketch::{Sketch, SketchTool};
+use crate::authoring::model::{LegacyWallModel, WallModel};
+use crate::authoring::ops::{self, WallHeight};
 use crate::authoring::walls::WINDOW_MARGIN_M;
 
 /// Screen distance from a point to a segment (pixels).
@@ -27,6 +32,22 @@ fn seg_dist(p: (f32, f32), a: (f32, f32), b: (f32, f32)) -> f32 {
         (((p.0 - a.0) * abx + (p.1 - a.1) * aby) / len2).clamp(0.0, 1.0)
     };
     (p.0 - a.0 - abx * t).hypot(p.1 - a.1 - aby * t)
+}
+
+/// An `UpdateWall` that changes only the given fields.
+pub(super) fn update_wall(id: EntityId, coalesce: bool) -> Command {
+    Command::UpdateWall {
+        id,
+        base: None,
+        top: None,
+        start: None,
+        end: None,
+        height_m: None,
+        top_offset_m: None,
+        profile: None,
+        top_points: None,
+        coalesce,
+    }
 }
 
 #[wasm_bindgen]
@@ -52,7 +73,7 @@ impl AuthorApp {
             "mode": if self.wall_top.is_some() { "upto" } else { "fixed" },
             "topPlane": self.wall_top.map(|p| p.0 as f64),
             "topOffset": self.wall_top_offset,
-            "effectiveHeight": base.and_then(|b| self.new_wall_height(b).ok()),
+            "effectiveHeight": base.and_then(|b| self.new_wall_height_mode(b).ok().map(|m| self.height_of(b, &m))),
             "planes": self.top_plane_candidates(),
         })
         .to_string()
@@ -67,42 +88,56 @@ impl AuthorApp {
         }
     }
 
-    /// Up-to height for an existing wall: its height becomes the distance
-    /// from its base to `plane` plus `offset`. Returns the new height, or
-    /// -1 when the plane is not above the base.
-    pub fn set_wall_height_up_to(&mut self, id: f64, plane: f64, offset: f64) -> f64 {
+    /// A wall's height mode: up to `plane` plus `offset` (the height then
+    /// follows the plane), or fixed at its current height when `plane` is
+    /// negative. One undo step; offset drags coalesce until
+    /// [`AuthorApp::end_gesture`]. Returns the new height, or -1 when
+    /// refused (the top would not clear the openings or the base).
+    pub fn set_wall_top(&mut self, id: f64, plane: f64, offset: f64) -> f64 {
         let Some(wall) = self.wall(eid(id)).cloned() else { return -1.0 };
-        match self.height_up_to(wall.plane_level, eid(plane), offset) {
-            Ok(h) => {
-                self.set_wall_height(id, h);
-                self.gestures.end();
-                h
-            }
-            Err(_) => -1.0,
+        let top = (plane >= 0.0).then(|| eid(plane));
+        let offset = if offset.is_finite() { offset.clamp(-MAX_WALL_HEIGHT_M, MAX_WALL_HEIGHT_M) } else { 0.0 };
+        let height = match top {
+            Some(t) if self.root_level(t).is_none() => return -1.0,
+            Some(t) => self.plane_elevation(t) + offset - self.plane_elevation(wall.base),
+            None => wall.top_height,
+        };
+        if height < self.lib_wall_min_height(&wall) - 1e-9 {
+            return -1.0;
         }
+        let coalesce = self.gestures.begin_continuing(&self.doc, &format!("wall_top_{}", wall.wall.0));
+        let mut cmd = update_wall(wall.wall, coalesce);
+        if let Command::UpdateWall { top: t, top_offset_m, height_m, .. } = &mut cmd {
+            *t = Some(top);
+            match top {
+                Some(_) => *top_offset_m = Some(offset),
+                // Fixed: keep the height the wall has now.
+                None => *height_m = Some(height.clamp(MIN_WALL_HEIGHT_M, MAX_WALL_HEIGHT_M)),
+            }
+        }
+        self.submit(cmd);
+        self.sync("wall top");
+        height
     }
-}
 
-#[wasm_bindgen]
-impl AuthorApp {
     /// The wall under (or near) a canvas point: a ray hit on a wall, or
     /// else the wall whose base or top line passes within `tol_px`
     /// device pixels. In plan, only walls on the active level count.
     /// Returns the element id or -1.
     pub fn pick_wall(&self, px: f32, py: f32, tol_px: f32) -> f64 {
         let hit = self.pick(px, py);
-        if hit >= 0.0 && self.wall(eid(hit)).is_some() {
+        if hit >= 0.0 && self.wall_line(eid(hit)).is_some() {
             return hit;
         }
         let (w, h) = self.size_f();
         let plan = self.camera.mode == ViewMode::Plan;
         let mut best: Option<(f32, EntityId)> = None;
         for e in &self.model {
-            let ElementModel::Wall(wall) = e else { continue };
-            if plan && Some(wall.plane_level) != self.active_level {
+            let Some(wall) = e.wall_line() else { continue };
+            if plan && e.level() != self.active_level {
                 continue;
             }
-            let z = self.level_elevation(wall.plane_level) + wall.base_w;
+            let z = self.plane_elevation(wall.plane) + wall.base_w;
             let world = |p: [f64; 2], dz: f64| Vec3::new(p[0] as f32, p[1] as f32, (z + dz) as f32);
             for dz in [0.0, wall.height * 0.5, wall.height] {
                 let (Some(a), Some(b)) = (
@@ -120,60 +155,29 @@ impl AuthorApp {
         best.map_or(-1.0, |(_, id)| id.0 as f64)
     }
 
-    /// Start drawing windows on a wall: switch to the window tool and an
-    /// orthographic elevation view facing the wall's profile face (the
-    /// current view is restored by [`AuthorApp::end_window`]).
-    pub fn begin_window(&mut self, wall: f64) -> bool {
-        let id = eid(wall);
-        let Some(model) = self.wall(id).cloned() else {
-            return false;
-        };
-        if self.prev_camera.is_none() {
-            self.prev_camera = Some(self.camera.clone());
-        }
-        let (frame, length, height) = self.elevation_frame(&model);
-        let (w, h) = self.size_f();
-        self.camera.enter_elevation(frame, length, height, w / h);
-        self.tool = Tool::Window;
-        self.window_host = Some(id);
-        self.selection = None;
-        self.sketch = Some(Sketch::new(SketchTool::Window, self.window_shape, model.plane_level));
-        self.grid_key = None;
-        self.refresh_styles();
-        true
-    }
-
-    /// Done with the wall: back to the view and camera from before the
-    /// elevation (the window tool stays active to pick another wall).
-    pub fn end_window(&mut self) {
-        self.window_host = None;
-        if self.tool == Tool::Window {
-            self.sketch = None;
-        }
-        if let Some(c) = self.prev_camera.take() {
-            self.camera = c;
-        } else if self.camera.mode == ViewMode::Elevation {
-            self.camera.mode = ViewMode::Plan;
-        }
-        self.camera.elevation = None;
-        self.camera.plane_z = self.active_elevation as f32;
-        self.grid_key = None;
-        self.refresh_styles();
-    }
-
-    /// The wall being drawn on (-1 when none).
-    pub fn window_host(&self) -> f64 {
-        self.window_host.map_or(-1.0, |id| id.0 as f64)
-    }
-
-    /// Edit a wall's height (coalesced within one gesture). Clamped so the
-    /// wall stays above its highest window plus the window margin.
+    /// Edit a wall's fixed height (coalesced within one gesture); a wall
+    /// that was up to a plane becomes fixed. Clamped so the wall stays
+    /// above its openings.
     pub fn set_wall_height(&mut self, id: f64, height: f64) {
         let id = eid(id);
-        let Some(wall) = self.wall(id).cloned() else { return };
         if !height.is_finite() {
             return;
         }
+        if let Some(wall) = self.wall(id).cloned() {
+            let h = height.clamp(self.lib_wall_min_height(&wall), MAX_WALL_HEIGHT_M);
+            let coalesce = self.gestures.begin_continuing(&self.doc, &format!("wall_height_{}", id.0));
+            let mut cmd = update_wall(wall.wall, coalesce);
+            if let Command::UpdateWall { top, height_m, .. } = &mut cmd {
+                *height_m = Some(h);
+                if wall.top.is_some() {
+                    *top = Some(None);
+                }
+            }
+            self.submit(cmd);
+            self.sync("wall height");
+            return;
+        }
+        let Some(wall) = self.legacy_wall(id).cloned() else { return };
         let h = height.clamp(self.min_wall_height(&wall), MAX_WALL_HEIGHT_M);
         let coalesce = self.gestures.begin_continuing(&self.doc, &format!("wall_height_{}", id.0));
         for cp in &wall.top_cps {
@@ -189,59 +193,126 @@ impl AuthorApp {
         self.sync("wall height");
     }
 
-    /// Edit a wall's thickness: moves only the extrusion path's end point
-    /// (the profile face and its windows stay put).
+    /// Edit a wall's thickness: every solid face of its profile (a legacy
+    /// wall: its extrusion path's end point, so the profile face and its
+    /// windows stay put).
     pub fn set_wall_thickness(&mut self, id: f64, thickness: f64) {
         let id = eid(id);
-        let Some(wall) = self.wall(id).cloned() else { return };
         if !thickness.is_finite() {
             return;
         }
         let t = thickness.clamp(MIN_WALL_THICKNESS_M, MAX_WALL_THICKNESS_M);
+        let coalesce = self.gestures.begin_continuing(&self.doc, &format!("wall_thickness_{}", id.0));
+        if let Some(wall) = self.wall(id).cloned() {
+            let mut profile = wall.profile.clone();
+            for f in &mut profile.faces {
+                if let SketchFaceKind::Solid { thickness } = &mut f.kind {
+                    *thickness = t;
+                }
+            }
+            let mut cmd = update_wall(wall.wall, coalesce);
+            if let Command::UpdateWall { profile: p, .. } = &mut cmd {
+                *p = Some(profile);
+            }
+            self.submit(cmd);
+            self.sync("wall thickness");
+            return;
+        }
+        let Some(wall) = self.legacy_wall(id).cloned() else { return };
         let Some((_, s)) = crate::authoring::model::control_point(&self.doc, wall.path_start) else {
             return;
         };
         let end = [s[0] + wall.normal[0] * t, s[1] + wall.normal[1] * t, s[2]];
-        let coalesce = self.gestures.begin_continuing(&self.doc, &format!("wall_thickness_{}", id.0));
         self.submit(Command::UpdateControlPoint { id: wall.path_end, position: end, coalesce });
         self.sync("wall thickness");
     }
 
-    /// Remove a window from a wall and sweep its construction geometry.
+    /// Remove a window from a legacy wall and sweep its construction
+    /// geometry.
     pub fn delete_window(&mut self, wall: f64, wire: f64) -> bool {
         self.delete_hole(wall, wire)
+    }
+
+    /// Remove an opening (a void face) from a wall's profile — one undo
+    /// step.
+    pub fn delete_opening(&mut self, wall: f64, face: f64) -> bool {
+        let Some(w) = self.wall(eid(wall)).cloned() else { return false };
+        let face = face as u32;
+        if !w.profile.faces.iter().any(|f| f.id == face && matches!(f.kind, SketchFaceKind::Void { .. })) {
+            return false;
+        }
+        match vim_design_lib::wall::ops::delete_faces(&w.profile, &w.top_points, w.top_height, &[face]) {
+            Ok((profile, top_points)) => {
+                let depth = self.doc.undo_depth();
+                let mut cmd = update_wall(w.wall, false);
+                if let Command::UpdateWall { profile: p, top_points: tp, .. } = &mut cmd {
+                    *p = Some(profile);
+                    *tp = Some(top_points);
+                }
+                self.submit(cmd);
+                self.gestures.one_shot(depth);
+                self.sync("delete opening");
+                true
+            }
+            Err(_) => false,
+        }
     }
 }
 
 impl AuthorApp {
-    /// Planes a wall top can reach: every construction plane, grouped by
-    /// story level (top first), with its path and elevation.
+    /// Planes a wall top can reach: every construction plane (levels and
+    /// workplanes), highest first, with its path and elevation.
     fn top_plane_candidates(&self) -> Vec<serde_json::Value> {
-        let mut levels = crate::authoring::ops::levels_sorted(&self.doc);
-        levels.reverse();
-        levels.iter().map(|l| self.plane_json(l.id)).collect()
+        let mut planes: Vec<EntityId> = ops::levels_sorted(&self.doc).iter().map(|l| l.id).collect();
+        planes.extend(ops::workplanes(&self.doc).iter().map(|w| w.id));
+        let mut rows: Vec<(f64, serde_json::Value)> =
+            planes.into_iter().map(|p| (self.plane_elevation(p), self.plane_json(p))).collect();
+        rows.sort_by(|a, b| b.0.total_cmp(&a.0));
+        rows.into_iter().map(|(_, v)| v).collect()
     }
 
-    /// Height from a wall's base plane up to `top` plus `offset`.
-    fn height_up_to(&self, base: EntityId, top: EntityId, offset: f64) -> Result<f64, String> {
-        let h = self.plane_elevation(top) + offset - self.plane_elevation(base);
+    /// The height a wall of `mode` gets on `base`.
+    fn height_of(&self, base: EntityId, mode: &WallHeight) -> f64 {
+        match mode.top {
+            Some(top) => self.plane_elevation(top) + mode.top_offset_m - self.plane_elevation(base),
+            None => mode.height_m,
+        }
+    }
+
+    /// The height mode of a new wall on `base` from the tool bar: fixed,
+    /// or up to the chosen plane (refused when that is not above the
+    /// base).
+    pub(super) fn new_wall_height_mode(&self, base: EntityId) -> Result<WallHeight, String> {
+        let Some(top) = self.wall_top else {
+            return Ok(WallHeight { height_m: self.wall_height, top: None, top_offset_m: 0.0 });
+        };
+        let mode = WallHeight { height_m: self.wall_height, top: Some(top), top_offset_m: self.wall_top_offset };
+        let h = self.height_of(base, &mode);
         if h < MIN_WALL_HEIGHT_M {
             return Err("The wall top must be above its base: pick a higher plane".to_owned());
         }
-        Ok(h.min(MAX_WALL_HEIGHT_M))
+        // The stored height is the fallback if the top is later unwired.
+        Ok(WallHeight { height_m: h.min(MAX_WALL_HEIGHT_M), ..mode })
     }
 
-    /// The height a new wall on `base` gets from the height mode.
-    pub(super) fn new_wall_height(&self, base: EntityId) -> Result<f64, String> {
-        match self.wall_top {
-            Some(top) => self.height_up_to(base, top, self.wall_top_offset),
-            None => Ok(self.wall_height),
-        }
-    }
-
-    /// Lowest height a wall may take: above its highest window by the
-    /// window margin.
-    pub(super) fn min_wall_height(&self, wall: &WallModel) -> f64 {
+    /// Lowest height a legacy wall may take: above its highest window by
+    /// the window margin.
+    pub(super) fn min_wall_height(&self, wall: &LegacyWallModel) -> f64 {
         (wall.highest_window_top() + WINDOW_MARGIN_M).max(MIN_WALL_HEIGHT_M)
+    }
+
+    /// Lowest top reference a wall may take: its base-anchored points
+    /// (window heads, a door top) stay below the top, and its
+    /// top-anchored points stay above the base, by the window margin.
+    pub(super) fn lib_wall_min_height(&self, wall: &WallModel) -> f64 {
+        wall.profile
+            .points
+            .iter()
+            .map(|p| {
+                if wall.top_points.contains(&p.id) { -p.uv[1] } else { p.uv[1] }
+            })
+            .fold(0.0, f64::max)
+            .max(MIN_WALL_HEIGHT_M - WINDOW_MARGIN_M)
+            + WINDOW_MARGIN_M
     }
 }

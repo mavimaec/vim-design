@@ -1,4 +1,4 @@
-//! Wall construction from drawn reference lines, and window validation.
+//! Wall construction from drawn reference lines.
 //!
 //! A wall run is a polyline of reference points on a level. The drawn
 //! line is one FACE of the wall; the thickness grows to the LEFT of the
@@ -6,10 +6,9 @@
 //! normalized counter-clockwise, so an unflipped loop grows inward —
 //! tracing a floor plate's edge puts the walls on the plate.
 //!
-//! Each segment becomes one wall: a vertical rectangle (length × height)
-//! in the plane of the reference line — the PROFILE — extruded along the
-//! wall normal by the thickness. Windows are then hole wires in that
-//! profile face: no booleans.
+//! Each segment becomes one library `Wall` (see `ops::commit_walls`):
+//! its reference line and an elevation profile, where windows and doors
+//! are void faces.
 //!
 //! Butt joins at corners, decided per corner by the turn direction
 //! relative to the thickness side:
@@ -23,13 +22,13 @@
 //! (a mitred join needs non-rectangular profiles).
 
 use super::geom::{
-    self, EPS, Invalid, P2, dist, normalized_ccw, point_segment_distance, self_intersects,
-    strictly_inside, validate_outline,
+    self, EPS, Invalid, P2, dist, normalized_ccw, self_intersects, validate_outline,
 };
 
 /// Shortest wall segment accepted after joins are applied (meters).
 pub const MIN_WALL_LENGTH_M: f64 = 0.05;
-/// Clearance between a window and the edge of its wall face (meters).
+/// Clearance a wall keeps above its highest opening when its height is
+/// lowered (meters).
 pub const WINDOW_MARGIN_M: f64 = 0.05;
 
 /// One wall: its reference line (after joins) and thickness direction.
@@ -129,25 +128,6 @@ pub fn wall_segments(
         .collect()
 }
 
-/// Validate a window outline in wall-local (u along the wall, v up)
-/// coordinates against the wall profile and the existing windows.
-/// The profile must be convex (walls are rectangles), which makes the
-/// vertex-distance test sufficient for the margin.
-pub fn validate_window(outline: &[P2], profile: &[P2], windows: &[&[P2]]) -> Result<(), Invalid> {
-    validate_outline(outline)?;
-    let n = profile.len();
-    let clear = outline.iter().all(|p| {
-        (0..n).all(|i| point_segment_distance(*p, profile[i], profile[(i + 1) % n]) >= WINDOW_MARGIN_M - 1e-9)
-    });
-    if !strictly_inside(outline, profile) || !clear {
-        return Err(Invalid::WindowOutsideWall);
-    }
-    if windows.iter().filter(|w| w.len() >= 3).any(|w| !geom::disjoint(outline, w)) {
-        return Err(Invalid::WindowOverlapsWindow);
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,20 +186,5 @@ mod tests {
         assert_eq!(wall_segments(&short, false, 0.2, false), Err(Invalid::WallTooShort));
         let crossing = [[0.0, 0.0], [4.0, 0.0], [2.0, 2.0], [2.0, -2.0]];
         assert_eq!(wall_segments(&crossing, false, 0.2, false), Err(Invalid::SelfIntersecting));
-    }
-
-    #[test]
-    fn window_rules() {
-        let profile = [[0.0, 0.0], [4.0, 0.0], [4.0, 2.7], [0.0, 2.7]];
-        let w1 = [[1.0, 0.9], [2.0, 0.9], [2.0, 2.1], [1.0, 2.1]];
-        assert_eq!(validate_window(&w1, &profile, &[]), Ok(()));
-        let near_edge = [[1.0, 0.02], [2.0, 0.02], [2.0, 1.0], [1.0, 1.0]];
-        assert_eq!(validate_window(&near_edge, &profile, &[]), Err(Invalid::WindowOutsideWall));
-        let outside = [[3.5, 1.0], [4.5, 1.0], [4.5, 2.0], [3.5, 2.0]];
-        assert_eq!(validate_window(&outside, &profile, &[]), Err(Invalid::WindowOutsideWall));
-        let overlap = [[1.5, 1.0], [2.5, 1.0], [2.5, 2.0], [1.5, 2.0]];
-        assert_eq!(validate_window(&overlap, &profile, &[&w1]), Err(Invalid::WindowOverlapsWindow));
-        let beside = [[2.5, 1.0], [3.5, 1.0], [3.5, 2.0], [2.5, 2.0]];
-        assert_eq!(validate_window(&beside, &profile, &[&w1]), Ok(()));
     }
 }

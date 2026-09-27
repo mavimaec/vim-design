@@ -17,8 +17,6 @@ pub enum SketchTool {
     Hole,
     /// A run of wall reference lines on the level plane.
     Wall,
-    /// A window outline on a wall face (wall-local u/v coordinates).
-    Window,
     /// Edit Mode: a new solid or void face of the edited profile.
     Profile,
     /// Edit Mode: a two-point line that splits the faces it crosses.
@@ -31,7 +29,6 @@ impl SketchTool {
             SketchTool::Plate => "plate",
             SketchTool::Hole => "hole",
             SketchTool::Wall => "wall",
-            SketchTool::Window => "window",
             SketchTool::Profile => "profile",
             SketchTool::Split => "split",
         }
@@ -216,8 +213,6 @@ pub enum SketchContext<'a> {
     /// Plates on the sketch plane (the hole picks its container).
     Hole(&'a [PlateOutline<'a>]),
     Wall { thickness: f64, flip: bool },
-    /// The host wall's profile and existing windows (wall-local).
-    Window { profile: &'a [P2], windows: Vec<&'a [P2]> },
 }
 
 /// The committed shape of a finished wall sketch: the reference points
@@ -236,9 +231,6 @@ pub fn status(sketch: &Sketch, ctx: &SketchContext) -> SketchStatus {
         (SketchTool::Wall, SketchContext::Wall { thickness, flip }) => {
             let (run, closed) = wall_run(sketch, false);
             walls::wall_segments(&run, closed, *thickness, *flip).map(|_| ())
-        }
-        (SketchTool::Window, SketchContext::Window { profile, windows }) => {
-            walls::validate_window(&outline, profile, windows)
         }
         (SketchTool::Split, _) => {
             if outline.len() >= 2 { Ok(()) } else { Err(Invalid::TooFewWallPoints) }
@@ -265,11 +257,6 @@ pub fn status(sketch: &Sketch, ctx: &SketchContext) -> SketchStatus {
                 if !inside_one {
                     preview_err = Some(Invalid::HoleOutsidePlate);
                 }
-            }
-            SketchContext::Window { profile, .. }
-                if !preview.iter().all(|q| geom::point_in_polygon(*q, profile)) =>
-            {
-                preview_err = Some(Invalid::WindowOutsideWall);
             }
             _ => {}
         }

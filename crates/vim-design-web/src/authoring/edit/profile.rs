@@ -1,7 +1,8 @@
 //! The profile adapter over the library's `Sketch`: every edit is one
 //! of the library's pure topology operations, followed by the live
 //! geometric validation (a self-crossing or zero-area face is refused
-//! before it reaches the document).
+//! before it reaches the document). [`apply_wall`] maps the same edits
+//! onto `wall::ops` for a wall's anchored profile.
 
 use vim_design_lib::sketch::{self, Sketch, SketchError, SketchFaceKind, ops};
 
@@ -64,6 +65,61 @@ fn pairs(edges: &[EdgeKey]) -> Vec<(u32, u32)> {
     edges.iter().map(|e| (e.0, e.1)).collect()
 }
 
+/// Where `uv` projects on the edge a-b, as a parameter from `a`.
+fn edge_param(a: P2, b: P2, uv: P2) -> f64 {
+    let ab = [b[0] - a[0], b[1] - a[1]];
+    let len2 = ab[0] * ab[0] + ab[1] * ab[1];
+    if len2 <= f64::EPSILON {
+        0.5
+    } else {
+        ((uv[0] - a[0]) * ab[0] + (uv[1] - a[1]) * ab[1]) / len2
+    }
+}
+
+/// A wall profile edit: `edit` (in EFFECTIVE coordinates, as the user
+/// sees the wall at top reference `height`) applied through `wall::ops`
+/// to the STORED profile and its top anchors. Returns the stored profile
+/// and anchors for one `UpdateWall`.
+pub fn apply_wall(
+    profile: &Sketch,
+    top_points: &[u32],
+    height: f64,
+    edit: &Edit,
+) -> Result<(Sketch, Vec<u32>), EditError> {
+    use vim_design_lib::wall::ops as w;
+    let (p, t, h) = (profile, top_points, height);
+    match edit {
+        Edit::MovePoints { ids, delta } => w::move_points(p, t, h, ids, *delta),
+        Edit::MoveEdges { edges, delta } => w::move_edges(p, t, h, &pairs(edges), *delta),
+        Edit::MoveFaces { faces, delta } => w::move_faces(p, t, h, faces, *delta),
+        Edit::InsertPoint { edge, uv } => {
+            let eff = vim_design_lib::wall::effective_profile(p, t, h);
+            let (a, b) = (eff.uv(edge.0).map_err(edit_error)?, eff.uv(edge.1).map_err(edit_error)?);
+            w::insert_point_on_edge(p, t, h, edge.0, edge.1, edge_param(a, b, *uv))
+        }
+        Edit::AddFace { outline, kind } => w::add_face(p, t, h, outline, (*kind).into()),
+        Edit::SplitFaces { a, b } => w::split_faces(p, t, h, *a, *b),
+        Edit::DeletePoints(ids) => w::delete_points(p, t, h, ids),
+        Edit::DeleteEdges(edges) => w::delete_edges(p, t, h, &pairs(edges)),
+        Edit::DeleteFaces(ids) => w::delete_faces(p, t, h, ids),
+        // Face kinds do not depend on the anchors (the stored profile is
+        // checked for structure only: its geometry is the effective one's).
+        Edit::SetKind { faces, kind } => {
+            let mut next = p.clone();
+            let mut any = false;
+            for f in next.faces.iter_mut().filter(|f| faces.contains(&f.id)) {
+                f.kind = (*kind).into();
+                any = true;
+            }
+            if !any {
+                return Err(EditError::Unknown);
+            }
+            sketch::validate_structure(&next).map(|_| (next, t.to_vec()))
+        }
+    }
+    .map_err(edit_error)
+}
+
 impl ProfileModel for Sketch {
     fn view(&self) -> ProfileView {
         ProfileView {
@@ -83,14 +139,7 @@ impl ProfileModel for Sketch {
             Edit::MoveFaces { faces, delta } => ops::move_faces(self, faces, *delta),
             Edit::InsertPoint { edge, uv } => {
                 let (a, b) = (self.uv(edge.0).map_err(edit_error)?, self.uv(edge.1).map_err(edit_error)?);
-                let ab = [b[0] - a[0], b[1] - a[1]];
-                let len2 = ab[0] * ab[0] + ab[1] * ab[1];
-                let t = if len2 <= f64::EPSILON {
-                    0.5
-                } else {
-                    ((uv[0] - a[0]) * ab[0] + (uv[1] - a[1]) * ab[1]) / len2
-                };
-                ops::insert_point_on_edge(self, edge.0, edge.1, t)
+                ops::insert_point_on_edge(self, edge.0, edge.1, edge_param(a, b, *uv))
             }
             Edit::AddFace { outline, kind } => ops::add_face(self, outline, (*kind).into()),
             Edit::SplitFaces { a, b } => ops::split_faces(self, *a, *b),
@@ -189,5 +238,30 @@ mod tests {
         assert_eq!(s.view().faces[1].kind, FaceKind::Void { depth: Some(0.1) });
         let bad = s.apply(&Edit::SetKind { faces: vec![void], kind: FaceKind::Void { depth: Some(0.0) } });
         assert!(matches!(bad, Err(EditError::NoEffect(_))));
+    }
+
+    #[test]
+    fn wall_edits_keep_the_top_anchors() {
+        let (profile, top) = vim_design_lib::wall::default_profile(4.0, 0.2);
+        let h = 2.7;
+        // A gable: a point inserted on the top edge follows the top ...
+        let edge = EdgeKey::new(2, 3);
+        let (p1, t1) = apply_wall(&profile, &top, h, &Edit::InsertPoint { edge, uv: [2.0, 2.7] }).expect("insert");
+        let apex = p1.points.iter().map(|p| p.id).find(|id| !profile.points.iter().any(|q| q.id == *id)).expect("new point");
+        assert!(t1.contains(&apex), "on an edge between two anchored points");
+        // ... and raising it stores its v from the top reference.
+        let (p2, t2) = apply_wall(&p1, &t1, h, &Edit::MovePoints { ids: vec![apex], delta: [0.0, 1.0] }).expect("raise");
+        assert_eq!(p2.point(apex).map(|p| p.uv), Some([2.0, 1.0]));
+        let eff = vim_design_lib::wall::effective_profile(&p2, &t2, h);
+        assert_eq!(eff.point(apex).map(|p| p.uv), Some([2.0, 3.7]));
+        // A window void keeps its sill when the height changes.
+        let window = vec![[1.0, 0.9], [2.0, 0.9], [2.0, 2.1], [1.0, 2.1]];
+        let (p3, t3) = apply_wall(&p2, &t2, h, &Edit::AddFace { outline: window, kind: FaceKind::Void { depth: None } }).expect("window");
+        assert_eq!(t3, t2, "a window's points are not anchored");
+        let taller = vim_design_lib::wall::effective_profile(&p3, &t3, 3.5);
+        assert!(taller.points.iter().any(|p| p.uv == [1.0, 0.9]));
+        // Kinds change without touching the anchors.
+        let (p4, t4) = apply_wall(&p3, &t3, h, &Edit::SetKind { faces: vec![0], kind: FaceKind::Solid { thickness: 0.3 } }).expect("thicker");
+        assert_eq!((p4.faces[0].kind, t4), (SketchFaceKind::Solid { thickness: 0.3 }, t3));
     }
 }

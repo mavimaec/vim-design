@@ -51,8 +51,9 @@ pub struct EditSession<P: ProfileModel> {
     pub new_thickness: f64,
     pub new_void_depth: f64,
     pub new_void_through: bool,
-    /// Wall profiles: points measured from the wall's TOP reference (they
-    /// follow the wall height). Unused for floor plates.
+    /// Wall profiles: points anchored to the wall's TOP reference (they
+    /// follow the wall height) — a mirror of the wall's `top_points`,
+    /// reloaded with the profile. Unused for floor plates.
     pub top_points: BTreeSet<PointId>,
 }
 
@@ -174,20 +175,6 @@ impl<P: ProfileModel> EditSession<P> {
         super::interact::moving_points(&self.model.view(), &self.selection)
     }
 
-    /// Anchor the selected points to the top (`true`) or bottom reference.
-    /// Returns how many points changed.
-    pub fn set_anchor(&mut self, top: bool) -> usize {
-        let ids = self.selected_points();
-        let before = self.top_points.len();
-        if top {
-            self.top_points.extend(ids);
-            self.top_points.len() - before
-        } else {
-            self.top_points.retain(|id| !ids.contains(id));
-            before - self.top_points.len()
-        }
-    }
-
     /// The edit deleting the current selection.
     pub fn delete_edit(&self) -> Option<Edit> {
         if self.selection.is_empty() {
@@ -282,10 +269,9 @@ mod tests {
         s.set_mode(SelectMode::Edges);
         let top_left = corner(&s, [0.0, 4.0]);
         s.tap(Some(Hit::Edge { edge: crate::authoring::edit::EdgeKey::new(top_left, top_right), uv: [2.0, 4.0] }), false);
-        assert_eq!(s.set_anchor(true), 2, "an edge anchors both its points");
-        assert!(s.top_points.contains(&top_left) && s.top_points.contains(&top_right));
-        assert_eq!(s.set_anchor(false), 2);
-        s.set_anchor(true);
+        let ids = s.selected_points();
+        assert_eq!(ids.len(), 2, "an edge anchors both its points");
+        s.top_points = ids;
         // Deleting a point drops it from the anchors.
         s.set_mode(SelectMode::Points);
         s.tap(Some(Hit::Point(top_left)), false);

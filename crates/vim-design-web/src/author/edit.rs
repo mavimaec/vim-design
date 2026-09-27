@@ -1,18 +1,24 @@
 //! Edit Mode of the authoring app: a modal session editing one
 //! element's 2D profile — the library's `Sketch` (faces of shared
-//! points, solid with their own thickness or void).
+//! points, solid with their own thickness or void): a floor plate's
+//! plan profile, or a wall's elevation profile (u along the wall, v up;
+//! openings are voids, a door crosses the bottom edge; points anchored
+//! to the top follow the wall height).
 //!
 //! Lifecycle (the session is session state; the profile lives in the
 //! document):
 //! - enter: [`AuthorApp::edit_begin`] (pencil or Hole tool on a floor
-//!   plate) or [`AuthorApp::edit_begin_new`] (the Floor tool); a gestures
-//!   transaction opens at the document's undo depth. A legacy extrusion
-//!   plate is first converted to a sketch plate INSIDE the transaction,
-//!   below its undo floor (✗ reverts it; step-by-step undo does not);
-//! - edit: each accepted edit is one `UpdateSketch` (slider and typing
-//!   gestures coalesce); the first face of a new plate creates the
-//!   sketch and its element. Undo/redo inside the session are the
-//!   document's, bounded by the transaction;
+//!   plate), [`AuthorApp::edit_begin_new`] (the Floor tool), or
+//!   [`AuthorApp::edit_begin_wall`] (a wall's pencil, the Window and Door
+//!   tools); a gestures transaction opens at the document's undo depth. A
+//!   legacy extrusion plate or wall is first converted INSIDE the
+//!   transaction, below its undo floor (✗ reverts it; step-by-step undo
+//!   does not);
+//! - edit: each accepted edit is one `UpdateSketch` (a wall: one
+//!   `wall::ops` call and one `UpdateWall` with the stored profile and its
+//!   anchors); slider and typing gestures coalesce; the first face of a
+//!   new plate creates the sketch and its element. Undo/redo inside the
+//!   session are the document's, bounded by the transaction;
 //! - leave: [`AuthorApp::edit_confirm`] collapses the session into ONE
 //!   undo step of the main history (a plate left without faces is
 //!   deleted; a new one leaves no trace); [`AuthorApp::edit_cancel`]
@@ -22,12 +28,14 @@
 use glam::Vec3;
 use wasm_bindgen::prelude::*;
 
+use super::walls::update_wall;
 use super::{AuthorApp, SketchFrame, Tool, eid};
 use vim_design_lib::Command;
 use vim_design_lib::sketch::Sketch as Profile;
 
 use crate::authoring::edit::interact::{self, Hit, SelectMode};
-use crate::authoring::edit::presets::{Opening, preset_outline};
+use crate::authoring::edit::presets::{self, Opening, preset_outline};
+use crate::authoring::edit::profile::{apply_wall, edit_error};
 use crate::authoring::edit::session::{EditSession, Marquee};
 use crate::authoring::edit::{Edit, EditError, FaceKind, ProfileModel, ProfileView};
 use crate::authoring::geom::P2;
@@ -81,18 +89,10 @@ pub enum EditTarget {
     /// A floor plate: the profile lies on its construction plane.
     #[default]
     Plane,
-    /// A wall: the profile is the wall's elevation (u along the wall from
-    /// its start, v up from its base), seen in an elevation view.
+    /// A wall (by element): the profile is the wall's effective
+    /// elevation profile (u along the wall from its start, v up from its
+    /// base), seen in an elevation view.
     Wall(vim_design_lib::EntityId),
-}
-
-/// A session whose edits live only in memory (history kept here), until
-/// the profile can be stored in the document.
-#[derive(Debug, Clone, Default)]
-pub struct MemoryHistory {
-    undo: Vec<EditProfile>,
-    redo: Vec<EditProfile>,
-    last_key: Option<String>,
 }
 
 /// Pointer state of a move drag: where it was pressed on the plane, and
@@ -167,44 +167,47 @@ impl AuthorApp {
     }
 
     /// Enter Edit Mode on a wall: an orthographic elevation facing it and
-    /// its profile (u along the wall, v up) — the wall body a solid face,
-    /// its windows through voids, the top corners anchored to the top.
-    /// The session is kept in memory: the edits are not written to the
-    /// wall until walls are profile-based in the document.
+    /// its effective profile (anchored points at the top reference). A
+    /// legacy extrusion wall is converted to a `Wall` first, inside the
+    /// session's transaction (its windows become through voids).
     pub fn edit_begin_wall(&mut self, wall: f64) -> bool {
         let id = eid(wall);
         if self.edit.is_some() {
             return false;
         }
-        let Some(w) = self.wall(id).cloned() else { return false };
-        let mut faces = vec![(w.profile.clone(), FaceKind::Solid { thickness: w.thickness })];
-        faces.extend(
-            w.windows.iter().filter(|h| h.outline.len() >= 3).map(|h| (h.outline.clone(), FaceKind::Void { depth: None })),
-        );
-        let Ok(profile) = crate::authoring::edit::profile::sketch_from_faces(&faces) else {
+        let legacy = match self.model.iter().find(|e| e.element() == id) {
+            Some(ElementModel::LegacyWall(w)) => Some(w.clone()),
+            Some(ElementModel::Wall(_)) => None,
+            _ => return false,
+        };
+        self.gestures.begin_transaction(&self.doc);
+        if let Some(w) = legacy {
+            let depth = self.doc.undo_depth();
+            match ops::convert_legacy_wall(&mut self.doc, &w) {
+                Ok(_) => self.gestures.one_shot(depth),
+                Err(e) => {
+                    self.gestures.rollback_transaction(&mut self.doc);
+                    self.sync("convert failed");
+                    web_sys::console::error_1(&JsValue::from_str(&e));
+                    return false;
+                }
+            }
+            self.sync("convert wall");
+            self.gestures.set_transaction_floor(&self.doc);
+        }
+        let Some(w) = self.wall(id).cloned() else {
+            self.gestures.rollback_transaction(&mut self.doc);
+            self.sync("edit failed");
             return false;
         };
-        let top: std::collections::BTreeSet<u32> = profile
-            .points
-            .iter()
-            .filter(|p| (p.uv[1] - w.height).abs() < 1e-6)
-            .map(|p| p.id)
-            .collect();
         if self.prev_camera.is_none() {
             self.prev_camera = Some(self.camera.clone());
         }
-        let (frame, length, height) = self.elevation_frame(&w);
-        let (vw, vh) = self.size_f();
-        self.camera.enter_elevation(frame, length, height, vw / vh);
-        if vw > vh {
-            self.camera.elevation_half_h *= WALL_EDIT_LANDSCAPE_ZOOM_OUT;
-            self.camera.target += frame.u * (length * WALL_EDIT_LANDSCAPE_SHIFT);
-        }
         self.edit_target = EditTarget::Wall(id);
-        self.edit_memory = Some(MemoryHistory::default());
-        let mut session = EditSession::new(profile, w.plane_level, Some(id), w.name.clone());
-        session.top_points = top;
-        session.new_thickness = w.thickness;
+        self.face_edited_wall();
+        let mut session = EditSession::new(w.effective(), w.base, Some(id), w.name.clone());
+        session.top_points = w.top_points.iter().copied().collect();
+        session.new_thickness = w.thickness();
         self.edit_sketch = None;
         self.edit_entry_element = Some(id);
         self.start_edit(session);
@@ -226,12 +229,41 @@ impl AuthorApp {
     }
 
     /// Anchor the selected points to the wall's top (they follow its
-    /// height) or bottom. Returns how many points changed.
+    /// height) or to its base — one `UpdateWall`, the points do not move.
+    /// Returns how many points changed.
     pub fn edit_set_anchor(&mut self, top: bool) -> u32 {
-        if !matches!(self.edit_target, EditTarget::Wall(_)) {
+        let EditTarget::Wall(element) = self.edit_target else { return 0 };
+        let Some(ids) = self.edit.as_ref().map(|s| s.selected_points().into_iter().collect::<Vec<u32>>()) else {
+            return 0;
+        };
+        let Some(w) = self.wall(element).cloned() else { return 0 };
+        let changed = ids.iter().filter(|id| w.top_points.contains(id) != top).count();
+        if changed == 0 {
             return 0;
         }
-        self.edit.as_mut().map_or(0, |s| s.set_anchor(top) as u32)
+        let Ok((profile, top_points)) = vim_design_lib::wall::ops::set_anchor(&w.profile, &w.top_points, w.top_height, &ids, top) else {
+            return 0;
+        };
+        let depth = self.doc.undo_depth();
+        let mut cmd = update_wall(w.wall, false);
+        if let Command::UpdateWall { profile: p, top_points: tp, .. } = &mut cmd {
+            *p = Some(profile);
+            *tp = Some(top_points);
+        }
+        self.submit(cmd);
+        self.gestures.one_shot(depth);
+        self.sync("anchor");
+        self.reload_edit_model();
+        changed as u32
+    }
+
+    /// The opening presets (meters), for the page's hints.
+    pub fn presets_json(&self) -> String {
+        serde_json::json!({
+            "window": { "width": presets::WINDOW_WIDTH_M, "height": presets::WINDOW_HEIGHT_M, "sill": presets::WINDOW_SILL_M },
+            "door": { "width": presets::DOOR_WIDTH_M, "height": presets::DOOR_HEIGHT_M },
+        })
+        .to_string()
     }
 
     pub fn edit_active(&self) -> bool {
@@ -246,14 +278,6 @@ impl AuthorApp {
         let Some(session) = self.edit.take() else {
             return r#"{"result":"none"}"#.to_owned();
         };
-        if let Some(mem) = self.edit_memory.take() {
-            // In-memory session: nothing is written to the document.
-            self.leave_edit();
-            return serde_json::json!({
-                "result": "confirmed", "changed": !mem.undo.is_empty(), "name": session.name, "memory": true,
-            })
-            .to_string();
-        }
         let empty = session.model.faces.is_empty();
         let mut deleted = false;
         if empty && self.edit_entry_element.is_none() {
@@ -289,11 +313,6 @@ impl AuthorApp {
     /// Leave Edit Mode discarding the changes: the document returns to
     /// its state at entry.
     pub fn edit_cancel(&mut self) {
-        if self.edit.is_some() && self.edit_memory.take().is_some() {
-            self.edit = None;
-            self.leave_edit();
-            return;
-        }
         if self.edit.take().is_some() {
             self.gestures.rollback_transaction(&mut self.doc);
             self.leave_edit();
@@ -396,7 +415,7 @@ impl AuthorApp {
         let Some(uv) = self.edit_cursor_uv(px, py) else { return };
         let Some(press) = self.edit_pointer.press_uv else { return };
         let ppm = self.edit_px_per_m(uv);
-        let (enabled, step) = (self.snap_enabled, self.snap_step);
+        let (enabled, step) = (self.snap_enabled, self.edit_snap_step());
         let Some(s) = self.edit.as_mut() else { return };
         let Some(d) = &s.drag else { return };
         let raw = [d.anchor[0] + uv[0] - press[0], d.anchor[1] + uv[1] - press[1]];
@@ -502,13 +521,6 @@ impl AuthorApp {
     }
 
     pub fn edit_undo(&mut self) -> bool {
-        if let (Some(mem), Some(s)) = (self.edit_memory.as_mut(), self.edit.as_mut()) {
-            let Some(prev) = mem.undo.pop() else { return false };
-            mem.redo.push(std::mem::replace(&mut s.model, prev.clone()));
-            mem.last_key = None;
-            s.set_model(prev);
-            return true;
-        }
         if self.edit.is_none() || !self.gestures.undo(&mut self.doc) {
             return false;
         }
@@ -518,13 +530,6 @@ impl AuthorApp {
     }
 
     pub fn edit_redo(&mut self) -> bool {
-        if let (Some(mem), Some(s)) = (self.edit_memory.as_mut(), self.edit.as_mut()) {
-            let Some(next) = mem.redo.pop() else { return false };
-            mem.undo.push(std::mem::replace(&mut s.model, next.clone()));
-            mem.last_key = None;
-            s.set_model(next);
-            return true;
-        }
         if self.edit.is_none() || !self.gestures.redo(&mut self.doc) {
             return false;
         }
@@ -544,7 +549,9 @@ impl AuthorApp {
         let solids = selected_faces(s, false);
         if solids.is_empty() {
             s.new_thickness = t;
-            self.plate_thickness = t; // remembered for the next new plate
+            if self.edit_target == EditTarget::Plane {
+                self.plate_thickness = t; // remembered for the next new plate
+            }
             return r#"{"result":"default"}"#.to_owned();
         }
         self.edit_apply(&Edit::SetKind { faces: solids, kind: FaceKind::Solid { thickness: t } }, Some("thickness"), "changed")
@@ -650,7 +657,6 @@ impl AuthorApp {
             "canUndo": self.edit_can_undo(),
             "canRedo": self.edit_can_redo(),
             "target": if matches!(self.edit_target, EditTarget::Wall(_)) { "wall" } else { "floor" },
-            "memory": self.edit_memory.is_some(),
             "anchor": {
                 "selected": s.selected_points().len(),
                 "top": s.selected_points().iter().filter(|id| s.top_points.contains(id)).count(),
@@ -788,24 +794,28 @@ fn profile_json(view: &ProfileView) -> String {
 }
 
 impl AuthorApp {
-    pub(super) fn edit_can_undo(&self) -> bool {
-        match &self.edit_memory {
-            Some(m) => !m.undo.is_empty(),
-            None => self.gestures.can_undo(),
+    /// Face the wall being edited head-on, the whole profile in view (on
+    /// a landscape screen, clear of the edit panel at the top right).
+    pub(super) fn face_edited_wall(&mut self) {
+        let Some((frame, length, height)) = self.edit_wall_frame() else { return };
+        let (vw, vh) = self.size_f();
+        self.camera.enter_elevation(frame, length, height, vw / vh);
+        if vw > vh {
+            self.camera.elevation_half_h *= WALL_EDIT_LANDSCAPE_ZOOM_OUT;
+            self.camera.target += frame.u * (length * WALL_EDIT_LANDSCAPE_SHIFT);
         }
+        self.grid_key = None;
+    }
+
+    pub(super) fn edit_can_undo(&self) -> bool {
+        self.gestures.can_undo()
     }
 
     pub(super) fn edit_can_redo(&self) -> bool {
-        match &self.edit_memory {
-            Some(m) => !m.redo.is_empty(),
-            None => self.gestures.can_redo(),
-        }
+        self.gestures.can_redo()
     }
 
     fn start_edit(&mut self, session: EditSession<EditProfile>) {
-        if self.window_host.is_some() {
-            self.end_window();
-        }
         self.selection = None;
         self.tool = Tool::Select;
         self.sketch = None;
@@ -825,7 +835,6 @@ impl AuthorApp {
             self.grid_key = None;
         }
         self.edit_target = EditTarget::Plane;
-        self.edit_memory = None;
         self.sketch = None;
         self.edit_tool = EditTool::Select;
         self.edit_pointer = EditPointer::default();
@@ -838,6 +847,16 @@ impl AuthorApp {
     /// undo, or redo). A sketch undone away leaves an empty profile; redo
     /// brings the same entity back.
     fn reload_edit_model(&mut self) {
+        if let EditTarget::Wall(element) = self.edit_target {
+            let wall = self.wall(element).map(|w| (w.effective(), w.top_points.clone()));
+            if let Some(s) = self.edit.as_mut() {
+                let (profile, top) = wall.unwrap_or_default();
+                s.top_points = top.into_iter().collect();
+                s.set_model(profile);
+            }
+            self.refresh_styles();
+            return;
+        }
         let stored = self.edit_sketch.and_then(|id| model::sketch_params(&self.doc, id));
         let element = self.edit_sketch.and_then(|sk| {
             self.model.iter().find_map(|e| match e {
@@ -868,7 +887,7 @@ impl AuthorApp {
     /// The elevation frame of the wall being edited (wall sessions only).
     pub(super) fn edit_wall_frame(&self) -> Option<(super::ElevationFrame, f32, f32)> {
         let EditTarget::Wall(id) = self.edit_target else { return None };
-        self.wall(id).map(|w| self.elevation_frame(w))
+        self.wall_line(id).map(|w| self.elevation_frame(&w))
     }
 
     fn edit_cursor_uv(&self, px: f32, py: f32) -> Option<P2> {
@@ -901,17 +920,8 @@ impl AuthorApp {
             Ok(next) => next,
             Err(e) => return json_err(&e),
         };
-        if let Some(mem) = self.edit_memory.as_mut() {
-            let continuing = key.is_some() && key == mem.last_key.as_deref();
-            if !continuing {
-                mem.undo.push(s.model.clone());
-            }
-            mem.redo.clear();
-            mem.last_key = key.map(str::to_owned);
-            if let Some(s) = self.edit.as_mut() {
-                s.set_model(next);
-            }
-            return serde_json::json!({ "result": ok }).to_string();
+        if let EditTarget::Wall(element) = self.edit_target {
+            return self.edit_apply_wall(element, edit, key, ok);
         }
         let (plane, name) = (s.level, s.name.clone());
         let level = self.root_level(plane).unwrap_or(plane);
@@ -955,6 +965,47 @@ impl AuthorApp {
                 ops::rollback_to(&mut self.doc, depth);
                 self.sync("edit failed");
                 serde_json::json!({ "result": "rejected", "reason": e }).to_string()
+            }
+        }
+    }
+
+    /// A wall edit: the same operation through `wall::ops` on the stored
+    /// profile (anchors kept consistent), stored with one `UpdateWall`.
+    fn edit_apply_wall(&mut self, element: vim_design_lib::EntityId, edit: &Edit, key: Option<&str>, ok: &str) -> String {
+        let Some(w) = self.wall(element).cloned() else {
+            return serde_json::json!({ "result": "rejected", "reason": "The wall no longer exists" }).to_string();
+        };
+        let (profile, top_points) = match apply_wall(&w.profile, &w.top_points, w.top_height, edit) {
+            Ok(p) => p,
+            Err(e) => return json_err(&e),
+        };
+        let effective = vim_design_lib::wall::effective_profile(&profile, &top_points, w.top_height);
+        if let Err(e) = vim_design_lib::sketch::validate(&effective) {
+            return json_err(&edit_error(e));
+        }
+        let depth = self.doc.undo_depth();
+        let coalesce = match key {
+            Some(k) => self.gestures.begin_continuing(&self.doc, &format!("edit_{k}")),
+            None => false,
+        };
+        let mut cmd = update_wall(w.wall, coalesce);
+        if let Command::UpdateWall { profile: p, top_points: tp, .. } = &mut cmd {
+            *p = Some(profile);
+            *tp = Some(top_points);
+        }
+        match self.doc.submit(cmd) {
+            Ok(_) => {
+                if key.is_none() {
+                    self.gestures.one_shot(depth);
+                }
+                self.sync("edit wall");
+                self.reload_edit_model();
+                serde_json::json!({ "result": ok }).to_string()
+            }
+            Err(st) => {
+                ops::rollback_to(&mut self.doc, depth);
+                self.sync("edit failed");
+                serde_json::json!({ "result": "rejected", "reason": format!("the wall was refused ({st:?})") }).to_string()
             }
         }
     }

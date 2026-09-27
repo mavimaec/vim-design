@@ -35,11 +35,6 @@ pub enum Invalid {
     TooFewWallPoints,
     /// Wall tool: a segment is shorter than its corner joins need.
     WallTooShort,
-    /// Window tool: the outline leaves the wall face (or comes closer to
-    /// its edge than the window margin).
-    WindowOutsideWall,
-    /// Window tool: the outline touches or overlaps another window.
-    WindowOverlapsWindow,
 }
 
 impl Invalid {
@@ -53,8 +48,6 @@ impl Invalid {
             Invalid::HoleOverlapsHole => "Holes must not touch or overlap",
             Invalid::TooFewWallPoints => "Place at least 2 points",
             Invalid::WallTooShort => "A wall segment is too short for the wall thickness",
-            Invalid::WindowOutsideWall => "A window must stay 5 cm inside the wall",
-            Invalid::WindowOverlapsWindow => "Windows must not touch or overlap",
         }
     }
 
@@ -68,8 +61,6 @@ impl Invalid {
             Invalid::HoleOverlapsHole => "hole_overlaps_hole",
             Invalid::TooFewWallPoints => "too_few_wall_points",
             Invalid::WallTooShort => "wall_too_short",
-            Invalid::WindowOutsideWall => "window_outside_wall",
-            Invalid::WindowOverlapsWindow => "window_overlaps_window",
         }
     }
 }

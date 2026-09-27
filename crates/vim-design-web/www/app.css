@@ -581,7 +581,7 @@ body.drawing #edit-panel { display: none; }
 
 /* Drawing inside Edit Mode: only the shape toggle and the actions. */
 body.editing #thickness-stepper, body.editing #flip-toggle,
-body.editing #wall-settings, body.editing #window-done { display: none !important; }
+body.editing #wall-settings, body.editing #wall-height-mode, body.editing #opening-row { display: none !important; }
 
 @media (max-width: 520px) {
   #edit-bar { gap: 4px; }
@@ -673,3 +673,38 @@ body.edit-wall .wall-only { display: flex !important; }
   #wall-height-mode .stepper-label { display: none; }
   .plane-picker { max-width: 150px; }
 }
+
+/* ---- Workplanes ---------------------------------------------------------------------------- */
+.tree-row { cursor: pointer; }
+.tree-row.plane { min-height: 38px; font-size: 14px; }
+.tree-row.plane.active { background: var(--accent-soft); }
+.tree-row .plane-swatch { width: 10px; height: 10px; border-radius: 50%; }
+/* Row actions stay quiet until the row is hovered (always shown on touch). */
+.tree-row.level .tree-edit, .tree-row.plane .tree-edit { width: 30px; height: 30px; margin-right: -2px; }
+@media (hover: hover) {
+  .tree-row.level .tree-edit, .tree-row.plane .tree-edit { opacity: 0; transition: opacity 0.12s; }
+  .tree-row.level:hover .tree-edit, .tree-row.plane:hover .tree-edit, .tree-row .tree-edit:focus-visible { opacity: 1; }
+}
+.lvl-planes { display: grid; gap: 2px; }
+.lvl-planes:empty { display: none; }
+.wp-row {
+  display: flex; align-items: center; gap: 8px; width: 100%; min-height: 38px;
+  padding: 4px 8px 4px calc(30px + var(--depth, 0) * 16px);
+  border: 0; border-radius: 9px; background: transparent; text-align: left; color: var(--text); font-size: 14.5px;
+}
+.wp-row:hover { background: var(--surface-2); }
+.wp-row.active { font-weight: 650; }
+.wp-row .swatch { width: 10px; height: 10px; border-radius: 50%; flex: none; }
+.wp-row .wp-name { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.wp-row .wp-offset { color: var(--muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+.lvl-add-plane {
+  justify-self: start; display: inline-flex; align-items: center; gap: 4px;
+  border: 0; background: transparent; color: var(--accent); font: inherit; font-size: 13.5px; font-weight: 600;
+  padding: 2px 4px 2px 26px; border-radius: 8px;
+}
+.lvl-add-plane .ico { width: 16px; height: 16px; }
+.popover .pop-item.pop-plane { padding-left: calc(10px + var(--depth, 1) * 16px); font-size: 14px; }
+.popover .pop-item.pop-plane .swatch { border-radius: 50%; width: 10px; height: 10px; }
+#opening-row { justify-content: center; }
+#opening-toggle button { min-width: 112px; }
+.tree-row.plane .tree-meta, .tree-row.level .tree-meta { flex: none; }

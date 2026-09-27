@@ -49,14 +49,18 @@ const EDIT_PICK_PX = { mouse: 10, pen: 14, touch: 22 };
 // Edit Mode stepper increments (meters).
 const FACE_THICKNESS_STEP_M = 0.05;
 const VOID_DEPTH_STEP_M = 0.05;
-// Wall height modes and wall Edit Mode ship behind this page flag until
-// walls are profile-based in the document (?m4preview).
-const M4_PREVIEW = new URLSearchParams(location.search).has("m4preview");
 /** Edit HUD: a top-anchored point is a square this much wider than a
  *  round handle, with an up tick of this length (CSS px). */
 const TOP_ANCHOR_HANDLE_SCALE = 1.05;
 const TOP_ANCHOR_TICK_PX = 7;
 const WALL_TOP_OFFSET_STEP_M = 0.05;
+/** Workplane offset stepper step and slider range (meters). */
+const WORKPLANE_OFFSET_STEP_M = 0.05;
+const WORKPLANE_OFFSET_RANGE_M = 6.0;
+/** Range of the wall top offset slider (meters, either way). */
+const WALL_TOP_OFFSET_RANGE_M = 3.0;
+/** A wall opening whose bottom is below this (m above the base) is a door. */
+const OPENING_BOTTOM_EPS_M = 0.001;
 // Desktop: the Model tree panel opens by default at this width and up.
 const TREE_DEFAULT_OPEN_MIN_PX = 760;
 const COARSE = matchMedia("(pointer: coarse)").matches;
@@ -195,6 +199,10 @@ function confirmDialog({ title, message, ok = "OK", danger = false }) {
 
 // ---- formatting ------------------------------------------------------------------
 const fmtM = (v) => `${(Math.abs(v) < 0.005 ? 0 : v).toFixed(2).replace("-", "−")} m`;
+/** A preset dimension without trailing zeros ("1.2", "0.9", "2.1"). */
+const fmtDim = (v) => String(Math.round(v * 100) / 100);
+/** A workplane offset from its parent: "+2.40 m" / "−0.30 m". */
+const fmtOffset = (v) => `${v >= 0 ? "+" : "−"}${Math.abs(v).toFixed(2)} m`;
 const fmtArea = (v) => `${Math.max(0, v).toFixed(2)} m²`;
 const floatToHex = (c) =>
   "#" + [c[0], c[1], c[2]]
@@ -309,14 +317,14 @@ async function main() {
     }
   }
   if (typeof session.activeLevel === "number") app.set_active_level(session.activeLevel);
-  if (M4_PREVIEW && session.wall?.mode === "upto" && typeof session.wall.topPlane === "number") {
+  if (session.wall?.mode === "upto" && typeof session.wall.topPlane === "number") {
     app.set_wall_height_mode("upto", session.wall.topPlane, Number(session.wall.topOffset) || 0);
   }
   if (restored && session.camera) {
     app.set_camera_json(session.camera);
   } else {
     app.set_view_mode(session.view === "3d" ? "3d" : "plan");
-    app.zoom_fit();
+    fitView();
   }
 
   // -- persistence --------------------------------------------------------------
@@ -398,6 +406,8 @@ async function main() {
 
   // -- refresh: stats + dirty pump -> panels --------------------------------------
   let stats = JSON.parse(app.stats_json());
+  // Opening presets (window / door sizes) — the source is Rust (presets.rs).
+  const PRESETS = JSON.parse(app.presets_json());
   const refresh = () => {
     stats = JSON.parse(app.stats_json());
     renderChrome();
@@ -420,13 +430,14 @@ async function main() {
   };
   const tolPx = (type) => (SNAP_CAPTURE_PX[type] ?? SNAP_CAPTURE_PX.touch) * dpr;
   const wallPickPx = (type) => (WALL_PICK_PX[type] ?? WALL_PICK_PX.touch) * dpr;
-  const inElevation = () => stats.windowHost != null;
   const editPickPx = (type) => (EDIT_PICK_PX[type] ?? EDIT_PICK_PX.touch) * dpr;
   let editState = { active: false };
   const editing = () => editState.active === true;
   const isDrawing = () =>
-    stats.tool === "wall" || inElevation() ||
+    (stats.tool === "wall" && !editing()) ||
     (editing() && ["solid", "void", "split"].includes(editState.tool));
+  /** The Window / Door tools: a tap on a wall opens its Edit Mode. */
+  const isOpeningTool = () => !editing() && (stats.tool === "window" || stats.tool === "door");
 
   const pointers = new Map(); // id -> {x, y, type} (client px)
   let mode = "none"; // none | press | nav | pan | place | pinch | pinch-rest
@@ -650,11 +661,16 @@ async function main() {
 
   function handleTap(p) {
     const now = performance.now();
-    if (stats.tool === "window") {
-      // Window tool, no wall yet: the tap picks the wall to draw on.
+    if (isOpeningTool()) {
+      // Window / Door tool: the tap picks the wall; its Edit Mode opens
+      // with the preset armed.
+      const kind = stats.tool;
       const wall = app.pick_wall(p.dev[0], p.dev[1], wallPickPx(p.type));
-      if (wall >= 0) beginWindow(wall);
-      else toast("Tap a wall to add windows to it", { ms: 1800 });
+      if (wall >= 0) {
+        resumeTool = kind;
+        beginWallEdit(wall, kind);
+      }
+      else toast(`Tap a wall to add a ${kind} to it`, { ms: 1800 });
       return;
     }
     if (stats.tool === "hole") {
@@ -670,7 +686,7 @@ async function main() {
     const isDouble = lastTap && now - lastTap.t < DOUBLE_TAP_MS &&
       Math.hypot(p.x - lastTap.x, p.y - lastTap.y) < DOUBLE_TAP_PX;
     if (id < 0 && isDouble && lastTap.empty) {
-      app.zoom_fit();
+      fitView();
       lastTap = null;
       sessionSave();
       requestRender();
@@ -1066,8 +1082,13 @@ async function main() {
     const chip = $("level-chip");
     // The active construction plane: "Level 2 › Ceiling" for a workplane.
     const plane = levelsState.activePlane;
-    chip.querySelector(".chip-name").textContent = plane ? plane.path : lvl ? lvl.name : "No level";
-    chip.querySelector(".chip-elev").textContent = plane ? fmtM(plane.elevation) : lvl ? fmtM(lvl.elevation) : "add one in Levels";
+    // Phones: the plane's own name (the full path is the chip's title).
+    const narrow = innerWidth < TREE_DEFAULT_OPEN_MIN_PX;
+    chip.querySelector(".chip-name").textContent = plane ? (narrow ? plane.name : plane.path) : lvl ? lvl.name : "No level";
+    chip.title = plane ? `Drawing on ${plane.path}` : "";
+    chip.querySelector(".chip-elev").textContent = plane && !plane.isLevel
+      ? fmtOffset(plane.offset ?? 0)
+      : plane ? fmtM(plane.elevation) : lvl ? fmtM(lvl.elevation) : "add one in Levels";
     chip.querySelector(".swatch").style.background = lvl ? cssColor(lvl.color) : "#98a2b3";
   }
 
@@ -1094,16 +1115,19 @@ async function main() {
       return `${tap} ${noun} to select · drag to move · drag empty space to box-select${hold}`;
     }
     if (editing() && editState.tool === "window") {
-      return `${tap} the wall to place a window (1.2 × 1.2 m, sill 0.9 m)`;
+      const w = PRESETS.window;
+      return `${tap} the wall to place a window (${fmtDim(w.width)} × ${fmtDim(w.height)} m, sill ${fmtDim(w.sill)} m)`;
     }
     if (editing() && editState.tool === "door") {
-      return `${tap} the wall to place a door (0.9 × 2.1 m)`;
+      const d = PRESETS.door;
+      return `${tap} the wall to place a door (${fmtDim(d.width)} × ${fmtDim(d.height)} m)`;
     }
     if (editing() && editState.tool === "split") {
       return `${tap} two points: a line across the faces to split`;
     }
-    if (stats.tool === "window" && !inElevation()) {
-      return stats.walls === 0 ? "Draw some walls first — windows go into walls" : `${tap} a wall to add windows to it`;
+    if (isOpeningTool()) {
+      const what = stats.tool === "door" ? "doors" : "windows";
+      return stats.walls === 0 ? `Draw some walls first — ${what} go into walls` : `${tap} a wall to add ${what} to it`;
     }
     if (stats.tool === "hole") {
       return stats.platesOnLevel === 0
@@ -1115,7 +1139,6 @@ async function main() {
     const n = h.count ?? 0;
     if (stats.tool === "wall") {
       const base = wallHint(tap, n);
-      if (!M4_PREVIEW) return base;
       // Up to: say how high the new walls come out.
       const ws = JSON.parse(app.wall_settings_json());
       if (ws.mode !== "upto") return base;
@@ -1140,7 +1163,8 @@ async function main() {
       b.setAttribute("aria-selected", String(b.dataset.view === stats.view));
     }
     for (const b of document.querySelectorAll(".tool[data-tool]")) {
-      b.classList.toggle("on", b.dataset.tool === stats.tool);
+      const tools = (b.dataset.tools ?? b.dataset.tool).split(" ");
+      b.classList.toggle("on", tools.includes(stats.tool));
       b.disabled = b.dataset.tool !== "select" && !stats.canAuthor;
     }
     const snapBtn = $("snap-toggle");
@@ -1149,7 +1173,15 @@ async function main() {
     const drawing = isDrawing();
     document.body.classList.toggle("drawing", drawing);
     canvas.classList.toggle("drawing", drawing);
-    $("drawbar").hidden = !drawing;
+    const opening = isOpeningTool();
+    $("drawbar").hidden = !drawing && !opening;
+    // Window / Door: only the opening choice (there is nothing to draw).
+    $("opening-row").hidden = !opening;
+    for (const id of ["shape-row", "wall-settings", "draw-actions", "draw-reason"]) $(id).hidden = opening;
+    for (const b of document.querySelectorAll("#opening-toggle button")) {
+      b.classList.toggle("on", b.dataset.opening === stats.tool);
+    }
+    if (opening) $("wall-height-mode").hidden = true;
     if (drawing) {
       const h = JSON.parse(app.hud_json());
       lastHud = h;
@@ -1167,7 +1199,6 @@ async function main() {
       $("flip-toggle").hidden = !wall;
       $("flip-toggle").classList.toggle("on", stats.wall.flip);
       $("flip-toggle").setAttribute("aria-pressed", String(stats.wall.flip));
-      $("window-done").hidden = !inElevation();
       $("wall-settings").hidden = !wall;
       renderWallHeightMode(wall);
       for (const [id, v] of [["wall-height-input", stats.wall.height], ["wall-thickness-input", stats.wall.thickness]]) {
@@ -1208,10 +1239,12 @@ async function main() {
   function closePopover() { popover.hidden = true; }
   function openPopover() {
     levelsState = JSON.parse(app.levels_json());
+    const workplanes = JSON.parse(app.workplanes_json());
     popover.replaceChildren();
     const desc = [...levelsState.levels].reverse();
     for (const l of desc) {
-      const on = l.id === levelsState.activeId;
+      // A level is "on" when it is the active plane itself.
+      const on = l.id === levelsState.activeId && levelsState.activePlane?.isLevel !== false;
       const item = el("button", { class: `pop-item${on ? " on" : ""}`, type: "button", role: "option", "data-level": String(l.id) },
         el("span", { class: "swatch" }),
         el("span", { class: "pop-name", text: l.name }),
@@ -1224,6 +1257,25 @@ async function main() {
         closePopover();
       });
       popover.append(item);
+      // The level's workplanes, nested (highest first).
+      const addPlanes = (parent, depth) => {
+        for (const w of workplanes.filter((x) => x.parent === parent).reverse()) {
+          const p = el("button", {
+            class: `pop-item pop-plane${w.active ? " on" : ""}`, type: "button", role: "option",
+            "data-plane": String(w.id), style: `--depth:${depth}`,
+          },
+            el("span", { class: "swatch" }),
+            el("span", { class: "pop-name", text: w.name }),
+            el("span", { class: "pop-elev", text: fmtOffset(w.offset) }),
+            el("span", { class: "pop-check", html: w.active ? icon("check") : "" }),
+          );
+          p.querySelector(".swatch").style.background = cssColor(w.color);
+          p.addEventListener("click", () => { activatePlane(w.id); closePopover(); });
+          popover.append(p);
+          addPlanes(w.id, depth + 1);
+        }
+      };
+      addPlanes(l.id, 1);
     }
     if (desc.length) popover.append(el("div", { class: "pop-sep" }));
     popover.append(el("button", {
@@ -1269,15 +1321,20 @@ async function main() {
     if (tool === "hole" && stats.platesOnLevel === 0) {
       toast("Draw a floor plate on this level first — holes are cut into plates", { ms: 3200 });
     }
-    if (tool === "window" && stats.walls === 0) {
-      toast("Draw some walls first — windows are cut into walls", { ms: 3200 });
+    if ((tool === "window" || tool === "door") && stats.walls === 0) {
+      toast(`Draw some walls first — ${tool}s are cut into walls`, { ms: 3200 });
     }
     renderChrome();
     requestRender();
     return true;
   }
+  // The Window tool button keeps the last opening kind (window / door).
+  let openingTool = "window";
   for (const b of document.querySelectorAll(".tool[data-tool]")) {
-    b.addEventListener("click", () => setTool(b.dataset.tool));
+    b.addEventListener("click", () => setTool(b.dataset.tool === "window" ? openingTool : b.dataset.tool));
+  }
+  for (const b of document.querySelectorAll("#opening-toggle button")) {
+    b.addEventListener("click", () => { openingTool = b.dataset.opening; setTool(openingTool); });
   }
   $("snap-toggle").addEventListener("click", () => {
     snapEnabled = !snapEnabled;
@@ -1288,7 +1345,7 @@ async function main() {
     sessionSave();
   });
   $("fit-btn").addEventListener("click", () => {
-    app.zoom_fit();
+    fitView();
     requestRender();
     sessionSave();
   });
@@ -1317,8 +1374,7 @@ async function main() {
       refreshEdit();
       return;
     }
-    if (discarded === 0 && inElevation()) endWindow();
-    else if (discarded === 0) setTool("select");
+    if (discarded === 0) setTool("select");
     renderChrome();
     requestRender();
   }
@@ -1369,7 +1425,7 @@ async function main() {
   // stepper; Up to uses a plane picker and an offset from that plane.
   function renderWallHeightMode(wall) {
     const row = $("wall-height-mode");
-    row.hidden = !(M4_PREVIEW && wall);
+    row.hidden = !wall;
     if (row.hidden) { $("wall-height-stepper").hidden = false; return; }
     const ws = JSON.parse(app.wall_settings_json());
     const upto = ws.mode === "upto";
@@ -1421,23 +1477,6 @@ async function main() {
     if (Number.isFinite(v)) setWallHeightMode({ offset: v });
   });
 
-  // Window flow: tap a wall -> elevation view -> Done.
-  function beginWindow(wall) {
-    if (!app.begin_window(wall)) return;
-    if (sheetPage === "properties") closeSheet(false);
-    stats = JSON.parse(app.stats_json());
-    renderChrome();
-    renderTreePanel();
-    requestRender();
-  }
-  function endWindow() {
-    app.end_window();
-    stats = JSON.parse(app.stats_json());
-    renderChrome();
-    renderTreePanel();
-    requestRender();
-  }
-  $("window-done").addEventListener("click", () => endWindow());
 
   // Edit Mode ---------------------------------------------------------------------------
   // Autosave is suspended while editing: the document is saved as the
@@ -1448,14 +1487,22 @@ async function main() {
     renderChrome();
     requestRender();
   }
-  /** Enter Edit Mode on a wall: its elevation profile, openings, anchors. */
-  function beginWallEdit(id) {
+  /** Enter Edit Mode on a wall: its elevation profile, openings, anchors
+   *  (a legacy wall is converted); `preset` arms the Window or Door tool. */
+  function beginWallEdit(id, preset = null) {
     if (!app.edit_begin_wall(id)) {
       toast("This wall cannot be edited as a shape", { kind: "error" });
       return;
     }
     enterEditChrome();
+    if (preset) {
+      app.edit_set_tool(preset);
+      refreshEdit();
+    }
   }
+  // The Window / Door tool that opened a wall's Edit Mode comes back after
+  // it, ready for the next wall.
+  let resumeTool = null;
   /** Enter Edit Mode on a floor plate (a legacy plate is converted). */
   function beginEdit(id, tool = null) {
     if (!app.edit_begin(id)) {
@@ -1472,6 +1519,11 @@ async function main() {
     refreshEdit();
   }
   function exitEditChrome() {
+    if (resumeTool) {
+      const t = resumeTool;
+      resumeTool = null;
+      app.set_tool(t);
+    }
     refreshEdit();
     renderTreePanel();
     refresh();
@@ -1546,9 +1598,6 @@ async function main() {
     exitEditChrome();
     if (res.deleted) {
       toast(`${res.name} deleted — it had no faces left`, { action: { label: "Undo", fn: () => { if (app.undo()) refresh(); } } });
-    } else if (res.memory) {
-      // Preview: wall shapes are not in the document yet.
-      toast("Preview: wall edits are not saved yet", { ms: 2400 });
     } else if (res.changed) {
       toast(`${res.name} saved`, { kind: "ok", ms: 1600 });
     }
@@ -1693,7 +1742,7 @@ async function main() {
     else if (k === "f") setTool("plate");
     else if (k === "h") setTool("hole");
     else if (k === "w") setTool("wall");
-    else if (k === "n") setTool("window");
+    else if (k === "n") setTool(openingTool);
     else if (k === "r" && isDrawing()) { app.set_shape(stats.shape === "rect" ? "polygon" : "rect"); stats = JSON.parse(app.stats_json()); renderChrome(); requestRender(); }
     else if (k === "p") { app.set_view_mode("plan"); stats = JSON.parse(app.stats_json()); renderChrome(); requestRender(); }
     else if (k === "3") { app.set_view_mode("3d"); stats = JSON.parse(app.stats_json()); renderChrome(); requestRender(); }
@@ -1764,7 +1813,7 @@ async function main() {
   let sheetStack = [];
   const PAGE_TITLES = {
     menu: "Menu", levels: "Levels", project: "Project location", about: "About",
-    properties: "Properties", model: "Model",
+    properties: "Properties", model: "Model", workplane: "Workplane",
   };
   function openSheet(page, { root = false } = {}) {
     if (root) sheetStack = [];
@@ -1816,6 +1865,7 @@ async function main() {
     const pages = {
       menu: pageMenu, levels: pageLevels, project: pageProject, about: pageAbout, properties: pageProperties,
       model: () => renderTree(sheetBody),
+      workplane: pageWorkplane,
     };
     (pages[sheetPage] ?? (() => {}))();
   }
@@ -1830,6 +1880,7 @@ async function main() {
       if (app.selection() < 0) closeSheet(false); else updateProperties();
     } else if (sheetPage === "levels") updateLevels();
     else if (sheetPage === "project") updateProject();
+    else if (sheetPage === "workplane") updateWorkplane();
     else if (sheetPage === "menu") pageMenu();
   }
 
@@ -1862,7 +1913,11 @@ async function main() {
     pencil: '<path d="M4 20h4L19 9l-4-4L4 16z"/><path d="M13.5 6.5l4 4"/>',
     twist: '<path d="M7 10l5 5 5-5"/>',
     plane: '<path d="M3 15l9-5 9 5-9 5z"/>',
+    add: '<path d="M12 5v14M5 12h14"/>',
   };
+  /** A small action button inside a tree row. */
+  const treeAction = (attr, title, paths) =>
+    `<button type="button" class="tree-edit" ${attr} title="${title}" aria-label="${title}">${svg(paths)}</button>`;
   const svg = (paths, cls = "ico sm") => `<svg class="${cls}" viewBox="0 0 24 24">${paths}</svg>`;
   function toggleCollapsed(key) {
     if (treeCollapsed.has(key)) treeCollapsed.delete(key); else treeCollapsed.add(key);
@@ -1877,13 +1932,14 @@ async function main() {
       const key = `level:${lvl.id}`;
       const collapsed = treeCollapsed.has(key);
       const count = lvl.groups.reduce((n, g) => n + g.items.length, 0);
-      const head = el("button", {
-        type: "button", class: `tree-row level${lvl.active ? " active" : ""}`, "data-tree-level": String(lvl.id),
+      const head = el("div", {
+        role: "button", tabindex: "0", class: `tree-row level${lvl.active ? " active" : ""}`, "data-tree-level": String(lvl.id),
         title: "Make this the active level",
         html: `<span class="twist${collapsed ? " collapsed" : ""}" data-twist>${svg(TREE_ICON.twist, "ico sm")}</span>` +
           `<i class="swatch"></i><span class="tree-name"></span>` +
           (lvl.active ? `<span class="tree-tag">Active</span>` : "") +
-          `<span class="tree-meta">${fmtM(lvl.elevation)}</span>`,
+          `<span class="tree-meta">${fmtM(lvl.elevation)}</span>` +
+          treeAction("data-tree-add", "Add a workplane in this level", TREE_ICON.add),
       });
       head.querySelector(".swatch").style.background = cssColor(lvl.color);
       head.querySelector(".tree-name").textContent = lvl.name;
@@ -1893,20 +1949,28 @@ async function main() {
           renderTree(container);
           return;
         }
+        if (e.target.closest("[data-tree-add]")) { addWorkplane(lvl.id); return; }
         activatePlane(lvl.id);
       });
       const block = el("div", { class: "tree-level" }, head);
       if (!collapsed) {
         const addPlanes = (planes, depth) => {
           for (const pl of planes) {
-            const r = el("button", {
-              type: "button", class: `tree-row plane${pl.active ? " active" : ""}`, "data-tree-plane": String(pl.id),
-              style: `--depth:${depth}`,
-              html: `${svg(TREE_ICON.plane)}<span class="tree-name"></span><span class="tree-meta"></span>`,
+            const r = el("div", {
+              role: "button", tabindex: "0", class: `tree-row plane${pl.active ? " active" : ""}`, "data-tree-plane": String(pl.id),
+              style: `--depth:${depth}`, title: "Draw on this workplane",
+              html: `<i class="swatch plane-swatch"></i><span class="tree-name"></span>` +
+                (pl.active ? `<span class="tree-tag">Active</span>` : "") +
+                `<span class="tree-meta"></span>` +
+                treeAction("data-tree-plane-edit", "Workplane settings", TREE_ICON.pencil),
             });
+            r.querySelector(".swatch").style.background = cssColor(pl.color);
             r.querySelector(".tree-name").textContent = pl.name;
-            r.querySelector(".tree-meta").textContent = `${pl.offset >= 0 ? "+" : "−"}${Math.abs(pl.offset).toFixed(2)} m`;
-            r.addEventListener("click", () => activatePlane(pl.id));
+            r.querySelector(".tree-meta").textContent = fmtOffset(pl.offset);
+            r.addEventListener("click", (e) => {
+              if (e.target.closest("[data-tree-plane-edit]")) { openWorkplane(pl.id); return; }
+              activatePlane(pl.id);
+            });
             block.append(r);
             addPlanes(pl.planes ?? [], depth + 1);
           }
@@ -1926,7 +1990,7 @@ async function main() {
           block.append(gh);
           if (gcollapsed) continue;
           for (const it of g.items) {
-            const canEdit = it.editable && (it.kind !== "wall" || M4_PREVIEW);
+            const canEdit = it.editable;
             const r = el("div", {
               class: `tree-row item${it.selected ? " selected" : ""}`, role: "button", tabindex: "0",
               "data-tree-item": String(it.id),
@@ -1957,16 +2021,35 @@ async function main() {
   function renderTreePanel() {
     const panel = $("tree-panel");
     // Hidden in the focused flows (Edit Mode, a wall's elevation for windows).
-    const show = treeOpen && innerWidth >= TREE_DEFAULT_OPEN_MIN_PX && !editing() && !inElevation();
+    const show = treeOpen && innerWidth >= TREE_DEFAULT_OPEN_MIN_PX && !editing();
     panel.hidden = !show;
     $("tree-btn").classList.toggle("on", show || sheetPage === "model");
     $("tree-btn").setAttribute("aria-pressed", String(show || sheetPage === "model"));
     if (show) renderTree($("tree-body"));
   }
+  /** Keep a fitted view clear of the open Model panel (desktop): shift
+   *  it right by half the covered width and zoom out to match. */
+  function clearOfTreePanel() {
+    const panel = $("tree-panel");
+    if (panel.hidden || app.view_mode() === "elevation") return;
+    const r = canvas.getBoundingClientRect();
+    const covered = Math.max(0, panel.getBoundingClientRect().right - r.left);
+    if (covered <= 0 || covered >= r.width) return;
+    const k = canvas.width / r.width;
+    const cx = canvas.width / 2, cy = canvas.height / 2;
+    app.pan(cx, cy, cx + (covered * k) / 2, cy);
+    app.zoom_at(r.width / (r.width - covered), cx + (covered * k) / 2, cy);
+  }
+  /** Fit the view to the model (clear of the Model panel). */
+  function fitView() {
+    app.zoom_fit();
+    clearOfTreePanel();
+  }
+
   /** Select an element from the tree: select, frame, show properties. */
   function pickFromTree(id) {
     if (sheetPage === "model") closeSheet(false);
-    app.frame_element(id);
+    if (app.frame_element(id)) clearOfTreePanel();
     selectElement(id);
     renderLevelChip();
     renderTreePanel();
@@ -2059,7 +2142,7 @@ async function main() {
     });
     if (!ok) return;
     app.new_project();
-    app.zoom_fit();
+    fitView();
     closeSheet(false);
     refresh();
     saveNow();
@@ -2109,7 +2192,7 @@ async function main() {
       toast(`Import failed: ${err}`, { kind: "error" });
       return;
     }
-    app.zoom_fit();
+    fitView();
     closeSheet(false);
     refresh();
     saveNow();
@@ -2196,11 +2279,15 @@ async function main() {
         el("div", { class: "group" }, el("div", { class: "group-title", text: "Holes" }), el("div", { class: "card", id: "prop-holes" })),
       );
     } else if (e.kind === "wall") {
-      if (M4_PREVIEW) {
-        children.push(
-          editButton("Edit the wall's shape: openings, doors, top anchors", () => beginWallEdit(e.id)),
-          wallHeightModeGroup(e),
-        );
+      const legacy = e.legacy === true;
+      children.push(editButton(
+        legacy ? "Edit the wall's shape (converts this wall from an earlier version)" : "Edit the wall's shape: openings, doors, top anchors",
+        () => beginWallEdit(e.id),
+      ));
+      if (legacy) {
+        children.push(el("div", { class: "empty-note", id: "prop-legacy-note", text: "Drawn with an earlier version. Edit shape converts it (windows become openings)." }));
+      } else {
+        children.push(...wallHeightModeGroup(e));
       }
       const heightGroup = measureGroup({
         title: "Height", label: "Above level", id: "prop-height", value: e.height,
@@ -2208,7 +2295,9 @@ async function main() {
         apply: (v) => app.set_wall_height(e.id, v), current: () => selectedValue("height", 2.7),
       });
       // Up to: the plane sets the height, so the fixed stepper hides.
-      heightGroup.hidden = M4_PREVIEW && wallModes.get(e.id)?.mode === "upto";
+      heightGroup.hidden = e.mode === "upto";
+      heightGroup.id = "prop-height-group";
+      const openings = legacy ? e.windows.length : e.openings;
       children.push(
         heightGroup,
         measureGroup({
@@ -2216,12 +2305,17 @@ async function main() {
           min: 0.05, max: 0.6, step: WALL_THICKNESS_STEP_M,
           apply: (v) => app.set_wall_thickness(e.id, v), current: () => selectedValue("thickness", 0.2),
         }),
-        el("div", { class: "stat-grid" }, stat("Length", "prop-length", fmtM(e.length)), stat("Windows", "prop-window-count", String(e.windows.length))),
-        el("div", { class: "group" }, el("div", { class: "group-title", text: "Windows" }), el("div", { class: "card", id: "prop-windows" })),
-        el("button", {
-          type: "button", class: "btn block", id: "prop-add-window", style: "margin-bottom:10px",
-          html: `${icon("plus")} Add windows`, onclick: () => beginWindow(e.id),
-        }),
+        el("div", { class: "stat-grid" }, stat("Length", "prop-length", fmtM(e.length)), stat(legacy ? "Windows" : "Openings", "prop-window-count", String(openings))),
+        el("div", { class: "group" }, el("div", { class: "group-title", text: legacy ? "Windows" : "Openings" }), el("div", { class: "card", id: "prop-windows" })),
+        el("div", { class: "btn-row", style: "margin-bottom:10px" },
+          el("button", {
+            type: "button", class: "btn", id: "prop-add-window",
+            html: `${icon("plus")} Window`, onclick: () => beginWallEdit(e.id, "window"),
+          }),
+          el("button", {
+            type: "button", class: "btn", id: "prop-add-door",
+            html: `${icon("plus")} Door`, onclick: () => beginWallEdit(e.id, "door"),
+          })),
       );
     }
     children.push(el("button", {
@@ -2233,10 +2327,10 @@ async function main() {
     updateProperties();
   }
 
-  // -- Wall height mode (preview) --------------------------------------------------------
-  // Fixed: the height stepper. Up to: a plane picker (levels, and their
-  // workplanes) plus an offset from that plane.
-  const wallModes = new Map(); // wall id -> {mode, plane, offset} (session)
+  // -- Wall height mode --------------------------------------------------------------------
+  // Fixed: the height stepper. Up to: a plane picker (levels and their
+  // workplanes) plus an offset from that plane; the height follows it.
+  // Read from the document (the wall's top slot and top offset).
   function planeOptions(select, planes, selected) {
     select.replaceChildren();
     for (const p of planes) {
@@ -2252,55 +2346,92 @@ async function main() {
     const above = planes.filter((p) => p.elevation > elevation + 1e-6);
     return (above.length ? above[above.length - 1] : planes[0])?.id ?? null;
   }
+  const WALL_TOP_REFUSED = "The wall top must be above its base and its openings: pick a higher plane";
   function wallHeightModeGroup(e) {
     const planes = JSON.parse(app.wall_settings_json()).planes;
-    const base = JSON.parse(app.levels_json()).levels.find((l) => l.id === e.levelId)?.elevation ?? 0;
-    const st = wallModes.get(e.id) ?? { mode: "fixed", plane: planeAbove(planes, base), offset: 0 };
+    const upto = e.mode === "upto";
+    const setTop = (plane, offset) => {
+      if (app.set_wall_top(e.id, plane, offset) < 0) toast(WALL_TOP_REFUSED, { kind: "error" });
+      refresh();
+    };
     const seg = el("div", { class: "seg small", id: "prop-wall-mode" });
     for (const [m, label] of [["fixed", "Fixed"], ["upto", "Up to"]]) {
       seg.append(el("button", {
-        type: "button", text: label, "data-wall-mode": m, class: st.mode === m ? "on" : "",
-        onclick: () => { st.mode = m; wallModes.set(e.id, st); applyUpTo(); pageProperties(); },
+        type: "button", text: label, "data-wall-mode": m, class: e.mode === m ? "on" : "",
+        onclick: () => {
+          if (m === e.mode) return;
+          if (m === "fixed") setTop(-1, 0);
+          else setTop(planeAbove(planes, e.baseElevation) ?? -1, 0);
+          app.end_gesture();
+          pageProperties();
+        },
       }));
     }
-    const picker = el("select", { class: "plane-picker", id: "prop-wall-top", "aria-label": "Wall top plane" });
-    planeOptions(picker, planes, st.plane);
-    const offset = el("input", { type: "text", inputmode: "decimal", id: "prop-wall-offset", value: st.offset.toFixed(2) });
-    const applyUpTo = () => {
-      if (st.mode !== "upto" || st.plane == null) return;
-      const h = app.set_wall_height_up_to(e.id, st.plane, st.offset);
-      if (h < 0) toast("The wall top must be above its base: pick a higher plane", { kind: "error" });
-      refresh();
-    };
-    picker.addEventListener("change", () => { st.plane = Number(picker.value); wallModes.set(e.id, st); applyUpTo(); });
-    offset.addEventListener("change", () => {
-      const v = parseNum(offset.value);
-      if (Number.isFinite(v)) { st.offset = v; wallModes.set(e.id, st); applyUpTo(); }
-      offset.value = st.offset.toFixed(2);
-    });
-    const bump = (d) => {
-      st.offset = Math.round((st.offset + d * WALL_TOP_OFFSET_STEP_M) * 100) / 100;
-      offset.value = st.offset.toFixed(2);
-      wallModes.set(e.id, st);
-      applyUpTo();
-    };
     const rows = [el("div", { class: "field" }, el("span", { class: "field-label", text: "Height" }), seg)];
-    if (st.mode === "upto") {
+    const groups = [];
+    if (upto) {
+      const picker = el("select", { class: "plane-picker", id: "prop-wall-top", "aria-label": "Wall top plane" });
+      planeOptions(picker, planes, e.topPlane);
+      picker.addEventListener("change", () => { setTop(Number(picker.value), e.topOffset); app.end_gesture(); });
       rows.push(
         el("div", { class: "field" }, el("span", { class: "field-label", text: "Top at" }), picker),
         el("div", { class: "field" }, el("span", { class: "field-label", text: "Wall height" }),
           el("span", { class: "value", id: "prop-wall-effective", text: fmtM(e.height) })),
-        el("div", { class: "field" }, el("span", { class: "field-label", text: "Offset" }),
-          el("div", { class: "stepper" },
-            el("button", { type: "button", text: "−", "aria-label": "Lower the top", onclick: () => bump(-1) }),
-            offset, el("span", { class: "unit", text: "m" }),
-            el("button", { type: "button", text: "+", "aria-label": "Raise the top", onclick: () => bump(1) }))),
       );
+      // The offset: stepper presses are one step each, a slider drag or
+      // typing coalesces into one.
+      groups.push(measureGroup({
+        title: "Top offset", label: "From the top plane", id: "prop-wall-offset", value: e.topOffset,
+        min: -WALL_TOP_OFFSET_RANGE_M, max: WALL_TOP_OFFSET_RANGE_M, step: WALL_TOP_OFFSET_STEP_M,
+        apply: (v) => {
+          const plane = JSON.parse(app.selected_json())?.topPlane ?? e.topPlane;
+          if (app.set_wall_top(e.id, plane, v) < 0) toast(WALL_TOP_REFUSED, { kind: "error" });
+        },
+        current: () => selectedValue("topOffset", 0),
+      }));
     }
     const g = group("Height mode", ...rows);
     g.id = "prop-wall-height-mode";
-    g.classList.toggle("upto", st.mode === "upto");
-    return g;
+    g.classList.toggle("upto", upto);
+    return [g, ...groups];
+  }
+
+  /** Area of a (u, v) polygon. */
+  const polyArea = (pts) => Math.abs(pts.reduce((a, p, i) => {
+    const q = pts[(i + 1) % pts.length];
+    return a + p[0] * q[1] - q[0] * p[1];
+  }, 0)) / 2;
+  /** What a wall's void face is: a door crosses the bottom edge, a niche
+   *  has a depth, anything else is a window. */
+  const openingNoun = (f) => {
+    if (Math.min(...f.outline.map((p) => p[1])) < OPENING_BOTTOM_EPS_M) return "Door";
+    return f.depth == null ? "Window" : "Niche";
+  };
+  /** A wall's openings (its profile's void faces), each deletable. */
+  function renderWallOpenings(list, e) {
+    list.replaceChildren();
+    const voids = e.faces.filter((f) => f.kind === "void");
+    if (voids.length === 0) list.append(el("div", { class: "empty-note", text: "No openings yet — add a window or a door." }));
+    const counts = {};
+    for (const f of voids) {
+      const noun = openingNoun(f);
+      counts[noun] = (counts[noun] ?? 0) + 1;
+      const label = `${noun} ${counts[noun]}`;
+      list.append(el("div", { class: "hole-row" },
+        el("span", { class: "hole-name", text: label }),
+        el("span", { class: "hole-area", text: fmtArea(polyArea(f.outline)) }),
+        el("button", {
+          type: "button", class: "icon-btn ghost", "aria-label": `Delete ${label.toLowerCase()}`,
+          "data-testid": "delete-opening", html: icon("trash", "ico"), style: "color:var(--danger)",
+          onclick: () => {
+            if (app.delete_opening(e.id, f.id)) {
+              refresh();
+              toast(`${label} removed`, { action: { label: "Undo", fn: () => { if (app.undo()) refresh(); } } });
+            }
+          },
+        }),
+      ));
+    }
   }
 
   /** Rows of a plate's holes or a wall's windows, each deletable. */
@@ -2343,22 +2474,144 @@ async function main() {
       $("prop-hole-count").textContent = String(e.holes.length);
       renderOpenings($("prop-holes"), e, e.holes, "Hole", "delete-hole", "No holes yet — use the Hole tool to cut one.");
     } else if (e.kind === "wall") {
+      // A mode change (undo, another view) re-renders the group.
+      const modeGroup = $("prop-wall-height-mode");
+      if (modeGroup && modeGroup.classList.contains("upto") !== (e.mode === "upto")) { pageProperties(); return; }
       guardAssign($("prop-height"), e.height.toFixed(2));
       guardAssign($("prop-height-slider"), String(e.height));
+      $("prop-height-group").hidden = e.mode === "upto";
       if ($("prop-wall-effective")) $("prop-wall-effective").textContent = fmtM(e.height);
-      $("prop-height-label").textContent = e.windows.length ? `Above level (min ${fmtM(e.minHeight)})` : "Above level";
+      if ($("prop-wall-offset")) {
+        guardAssign($("prop-wall-offset"), e.topOffset.toFixed(2));
+        guardAssign($("prop-wall-offset-slider"), String(e.topOffset));
+      }
+      if ($("prop-wall-top")) guardAssign($("prop-wall-top"), String(e.topPlane));
+      const openings = e.legacy ? e.windows.length : e.openings;
+      $("prop-height-label").textContent = openings ? `Above level (min ${fmtM(e.minHeight)})` : "Above level";
       guardAssign($("prop-wall-thickness"), e.thickness.toFixed(2));
       guardAssign($("prop-wall-thickness-slider"), String(e.thickness));
       $("prop-length").textContent = fmtM(e.length);
-      $("prop-window-count").textContent = String(e.windows.length);
-      renderOpenings($("prop-windows"), e, e.windows, "Window", "delete-window", "No windows yet — tap Add windows.");
+      $("prop-window-count").textContent = String(openings);
+      if (e.legacy) renderOpenings($("prop-windows"), e, e.windows, "Window", "delete-window", "No windows.");
+      else renderWallOpenings($("prop-windows"), e);
     }
   }
 
+  // -- Workplanes ----------------------------------------------------------------------------
+  // Construction planes nested in a level (a ceiling, a sill plane). The
+  // tree and Menu → Levels add them; their sheet edits name, offset,
+  // color, and deletes (with the cascade prompt when they hold things).
+  let workplaneFor = null;
+  function addWorkplane(parent) {
+    const id = app.add_workplane(parent);
+    if (id < 0) { toast("Could not add a workplane here", { kind: "error" }); return; }
+    refresh();
+    activatePlane(id);
+    openWorkplane(id);
+  }
+  function openWorkplane(id) {
+    workplaneFor = id;
+    openSheet("workplane", { root: sheetPage !== "levels" });
+  }
+  const WORKPLANE_CASCADE_WORDING = (w) => {
+    const c = w.contents;
+    const parts = [];
+    if (c.elements) parts.push(`${c.elements} element${c.elements === 1 ? "" : "s"} drawn on it`);
+    if (c.workplanes) parts.push(`${c.workplanes} nested workplane${c.workplanes === 1 ? "" : "s"}`);
+    let text = `Workplane "${w.name}" has ${parts.join(" and ") || "dependents"}.\n\nDeleting it also deletes them, and all of their geometry.`;
+    if (c.toppedWalls) {
+      text += `\n\n${c.toppedWalls} wall${c.toppedWalls === 1 ? " reaches" : "s reach"} up to it: ${c.toppedWalls === 1 ? "it keeps its" : "they keep their"} current height.`;
+    }
+    return `${text}\n\nA single Undo restores everything.`;
+  };
+  async function deleteWorkplane(id) {
+    const w = JSON.parse(app.workplane_json(id));
+    if (!w) return;
+    const undo = { label: "Undo", fn: () => { if (app.undo()) refresh(); } };
+    const result = app.delete_workplane(id);
+    if (result === "deleted") {
+      if (sheetPage === "workplane") closeSheet(false);
+      refresh();
+      toast(`Workplane "${w.name}" deleted`, { action: undo });
+    } else if (result === "has_dependents") {
+      const ok = await confirmDialog({
+        title: `Delete workplane "${w.name}"?`,
+        message: WORKPLANE_CASCADE_WORDING(w),
+        ok: "Delete workplane and contents", danger: true,
+      });
+      if (ok && app.delete_workplane_cascade(id)) {
+        if (sheetPage === "workplane") closeSheet(false);
+        refresh();
+        toast(`Workplane "${w.name}" and its contents deleted`, { action: undo });
+      }
+    } else {
+      toast(`Could not delete the workplane (${result})`, { kind: "error" });
+    }
+  }
+  function pageWorkplane() {
+    const w = JSON.parse(app.workplane_json(workplaneFor ?? -1));
+    if (!w) { closeSheet(false); return; }
+    const id = w.id;
+    $("sheet-title").textContent = w.name;
+    const nameInput = el("input", { type: "text", class: "wide", id: "wp-name", value: w.name, autocomplete: "off" });
+    nameInput.addEventListener("input", () => { app.update_workplane_name(id, nameInput.value); refresh(); });
+    nameInput.addEventListener("change", () => app.end_gesture());
+    const color = el("input", { type: "color", id: "wp-color", "aria-label": "Workplane color", value: floatToHex(w.color) });
+    color.addEventListener("input", () => {
+      const [r, g, b] = hexToFloat(color.value);
+      app.update_workplane_color(id, r, g, b);
+      refresh();
+    });
+    color.addEventListener("change", () => app.end_gesture());
+    sheetBody.replaceChildren(
+      el("div", { class: "group kind-group" }, el("span", { class: "kind-badge", html: `${svg(TREE_ICON.plane)} Workplane` })),
+      group(null,
+        el("div", { class: "field" }, el("label", { for: "wp-name", text: "Name" }), nameInput),
+        el("div", { class: "field" }, el("span", { class: "field-label", text: "In" }), el("span", { class: "value", id: "wp-parent", text: w.path })),
+        el("div", { class: "field" }, el("span", { class: "field-label", text: "Elevation" }), el("span", { class: "value", id: "wp-elevation", text: fmtM(w.elevation) })),
+        el("div", { class: "field" }, el("label", { for: "wp-color", text: "Color" }), color),
+      ),
+      measureGroup({
+        title: "Offset", label: `Above ${w.parentName}`, id: "wp-offset", value: w.offset,
+        min: -WORKPLANE_OFFSET_RANGE_M, max: WORKPLANE_OFFSET_RANGE_M, step: WORKPLANE_OFFSET_STEP_M,
+        apply: (v) => app.update_workplane_offset(id, v),
+        current: () => JSON.parse(app.workplane_json(id))?.offset ?? 0,
+      }),
+      el("div", { class: "btn-row", style: "margin-bottom:10px" },
+        el("button", {
+          type: "button", class: "btn", id: "wp-activate", html: `${svg(TREE_ICON.plane)} Draw on it`,
+          onclick: () => { activatePlane(id); closeSheet(false); },
+        }),
+        el("button", {
+          type: "button", class: "btn", id: "wp-add-nested", html: `${icon("plus")} Workplane inside`,
+          onclick: () => addWorkplane(id),
+        })),
+      el("button", {
+        type: "button", class: "btn subtle-danger block", id: "wp-delete",
+        html: `${icon("trash")} Delete workplane`, onclick: () => deleteWorkplane(id),
+      }),
+    );
+    updateWorkplane();
+  }
+  function updateWorkplane() {
+    const w = JSON.parse(app.workplane_json(workplaneFor ?? -1));
+    if (!w) { closeSheet(false); return; }
+    if (!$("wp-name")) return;
+    $("sheet-title").textContent = w.name;
+    guardAssign($("wp-name"), w.name);
+    guardAssign($("wp-color"), floatToHex(w.color));
+    guardAssign($("wp-offset"), w.offset.toFixed(2));
+    guardAssign($("wp-offset-slider"), String(w.offset));
+    $("wp-parent").textContent = w.path;
+    $("wp-elevation").textContent = fmtM(w.elevation);
+    $("wp-activate").classList.toggle("on", w.active);
+  }
+
   // -- Levels --------------------------------------------------------------------------------
-  const CASCADE_WORDING = (name, count) =>
-    `Level "${name}" has ${count} element${count === 1 ? "" : "s"}.\n\n` +
-    "Deleting it also deletes every element associated with it, and all of their geometry.\n\n" +
+  const CASCADE_WORDING = (name, count, planes = 0) =>
+    `Level "${name}" has ${count} element${count === 1 ? "" : "s"}` +
+    (planes ? ` and ${planes} workplane${planes === 1 ? "" : "s"}` : "") + ".\n\n" +
+    `Deleting it also deletes every element associated with it${planes ? ", its workplanes," : ""} and all of their geometry.\n\n` +
     "A single Undo restores everything.";
   function buildLevelRow(lvl) {
     const r = el("div", { class: "level-row", "data-id": String(lvl.id) });
@@ -2372,7 +2625,8 @@ async function main() {
       `<span class="lvl-meta"></span>` +
       `<label class="story"><input type="checkbox" class="lvl-story" />Story</label>` +
       `<input type="text" inputmode="decimal" class="lvl-elev" aria-label="Elevation (m)" /><span class="lvl-unit">m</span>` +
-      `</div>`;
+      `</div><div class="lvl-planes"></div>` +
+      `<button type="button" class="lvl-add-plane link-btn">${icon("plus")} Workplane</button>`;
     const q = (s) => r.querySelector(s);
     q(".lvl-active").addEventListener("change", () => setActiveLevel(lvl.id));
     q(".lvl-color").addEventListener("input", (e) => {
@@ -2389,6 +2643,7 @@ async function main() {
     });
     // Re-sort on commit only, so the list never reorders mid-edit.
     q(".lvl-elev").addEventListener("change", () => { app.end_gesture(); updateLevels(true); });
+    q(".lvl-add-plane").addEventListener("click", () => addWorkplane(lvl.id));
     q(".lvl-story").addEventListener("change", (e) => { app.update_level_story(lvl.id, e.target.checked); app.end_gesture(); refresh(); });
     q(".lvl-delete").addEventListener("click", async () => {
       const name = q(".lvl-name").value;
@@ -2400,7 +2655,8 @@ async function main() {
         const info = JSON.parse(app.levels_json()).levels.find((l) => l.id === lvl.id);
         const ok = await confirmDialog({
           title: `Delete level "${name}"?`,
-          message: CASCADE_WORDING(name, info?.elements ?? 0),
+          message: CASCADE_WORDING(name, info?.elements ?? 0,
+            JSON.parse(app.workplanes_json()).filter((w) => w.root === lvl.id).length),
           ok: "Delete level and elements", danger: true,
         });
         if (ok && app.delete_level_cascade(lvl.id)) {
@@ -2429,6 +2685,7 @@ async function main() {
     const list = $("level-list");
     if (!list) return;
     levelsState = JSON.parse(app.levels_json());
+    const workplanes = JSON.parse(app.workplanes_json());
     $("no-levels-hint").hidden = levelsState.levels.length > 0;
     const desired = [...levelsState.levels].reverse();
     const focused = list.contains(document.activeElement) ? document.activeElement : null;
@@ -2452,6 +2709,23 @@ async function main() {
       guardAssign(r.querySelector(".lvl-story"), l.isStory, "checked");
       r.querySelector(".lvl-meta").textContent =
         `${l.elements} element${l.elements === 1 ? "" : "s"}${active ? " · active" : ""}`;
+      renderLevelPlanes(r.querySelector(".lvl-planes"), workplanes, l.id, 0);
+    }
+  }
+  /** A level's workplanes in Menu → Levels (nested, each opens its sheet). */
+  function renderLevelPlanes(box, all, parent, depth) {
+    if (depth === 0) box.replaceChildren();
+    for (const w of all.filter((x) => x.parent === parent)) {
+      const b = el("button", {
+        type: "button", class: `wp-row${w.active ? " active" : ""}`, "data-workplane": String(w.id),
+        style: `--depth:${depth}`,
+        html: `<i class="swatch"></i><span class="wp-name"></span><span class="wp-offset">${fmtOffset(w.offset)}</span>${icon("chev", "ico sm")}`,
+      });
+      b.querySelector(".swatch").style.background = cssColor(w.color);
+      b.querySelector(".wp-name").textContent = w.name;
+      b.addEventListener("click", () => openWorkplane(w.id));
+      box.append(b);
+      renderLevelPlanes(box, all, w.id, depth + 1);
     }
   }
 
@@ -2578,10 +2852,13 @@ async function main() {
     wallToWorld: (wallId, u, v) => {
       const w = JSON.parse(app.elements_json()).find((e) => e.id === wallId && e.kind === "wall");
       if (!w) return null;
+      // The base plane (a level or a workplane) of a wall; legacy walls
+      // stand on their level.
       const lvl = JSON.parse(app.levels_json()).levels.find((l) => l.id === w.levelId);
+      const base = w.baseElevation ?? lvl?.elevation ?? 0;
       const len = Math.hypot(w.end[0] - w.start[0], w.end[1] - w.start[1]);
       const d = [(w.end[0] - w.start[0]) / len, (w.end[1] - w.start[1]) / len];
-      return [w.start[0] + d[0] * u, w.start[1] + d[1] * u, (lvl?.elevation ?? 0) + w.baseW + v];
+      return [w.start[0] + d[0] * u, w.start[1] + d[1] * u, base + w.baseW + v];
     },
     // World -> page CSS pixels (specs compute tap targets from world
     // coordinates instead of hardcoding pixels).

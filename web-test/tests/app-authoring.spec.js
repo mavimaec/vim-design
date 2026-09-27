@@ -758,7 +758,7 @@ test("wall properties: height and thickness edits with undo, flip side, delete",
   expect(errors).toEqual([]);
 });
 
-test("windows: elevation view, rectangle + polygon, validation, delete, reload, transform-only drag", async ({ page }) => {
+test("openings: the Window tool opens the wall's Edit Mode — window + door presets, a polygon void, ✓ one undo, reload, transform-only drag", async ({ page }) => {
   const errors = await openApp(page);
   await drawPlate(page, [-3, -2], [3, 2]);
   await tool(page, "wall");
@@ -769,99 +769,101 @@ test("windows: elevation view, rectangle + polygon, validation, delete, reload, 
   expect(ws).toHaveLength(4);
   const bottom = ws.find((w) => w.start[1] === -2 && w.end[1] === -2);
   expect(bottom.length).toBeCloseTo(5.8, 9);
+  const voidsOf = async () => (await walls(page)).find((w) => w.id === bottom.id).faces.filter((f) => f.kind === "void");
 
-  // Window tool: tap the wall -> orthographic elevation facing it.
+  // Window tool: tap the wall -> its Edit Mode, elevation, Window armed.
   await tool(page, "window");
   await tapWorld(page, 0, -1.9);
-  let s = await stats(page);
-  expect(s.view).toBe("elevation");
-  expect(s.windowHost).toBe(bottom.id);
-  expect(s.shape).toBe("rect"); // windows default to rectangles
+  let es = await editState(page);
+  expect(es).toMatchObject({ active: true, target: "wall", tool: "window", name: bottom.name });
+  expect((await stats(page)).view).toBe("elevation");
+  expect(es.canUndo, "nothing to undo yet inside the session").toBe(false);
 
-  // Rectangle window (0.1 m snap on the wall face).
-  await tapWall(page, bottom.id, 1.02, 0.93);
-  await tapWall(page, bottom.id, 1.98, 2.08);
-  let wall = (await walls(page)).find((w) => w.id === bottom.id);
-  expect(wall.windows).toHaveLength(1);
-  expect(sortedOutline(wall.windows[0].outline)).toEqual(sortedOutline([[1, 0.9], [2, 0.9], [2, 2.1], [1, 2.1]]));
-  expect((await stats(page)).windowHost, "stays on the wall for more windows").toBe(bottom.id);
+  // Window preset (1.2 x 1.2 m at a 0.9 m sill) centred on the tap.
+  await tapWall(page, bottom.id, 1.5, 1.5);
+  let voids = await voidsOf();
+  expect(voids).toHaveLength(1);
+  expect(sortedOutline(voids[0].outline)).toEqual(sortedOutline([[0.9, 0.9], [2.1, 0.9], [2.1, 2.1], [0.9, 2.1]]));
+  expect(voids[0].depth).toBe(null);
 
-  // Polygon window (a pointed head).
+  // A polygon void (a pointed head) with the Void tool.
+  await editTool(page, "void");
   await shape(page, "polygon");
-  for (const [u, v] of [[3.0, 0.9], [4.4, 0.9], [4.4, 2.1], [3.7, 2.6], [3.0, 2.1]]) {
+  // (Kept well below the top edge: a point snapped onto it would follow
+  // the top.)
+  for (const [u, v] of [[3.0, 0.9], [4.4, 0.9], [4.4, 1.7], [3.7, 2.2], [3.0, 1.7]]) {
     await tapWall(page, bottom.id, u, v);
   }
   await page.locator("#finish-draw").click();
-  wall = (await walls(page)).find((w) => w.id === bottom.id);
-  expect(wall.windows).toHaveLength(2);
-  expect(wall.windows[1].outline).toHaveLength(5);
-  expect(wall.windows[1].area).toBeCloseTo(1.4 * 1.2 + 0.5 * 1.4 * 0.5, 6);
+  voids = await voidsOf();
+  expect(voids).toHaveLength(2);
+  expect(voids[1].outline).toHaveLength(5);
   await shot(page, "window-elevation");
 
-  // Invalid windows are rejected and change nothing.
-  const gen = (await stats(page)).committed;
-  await shape(page, "rect");
-  await tapWall(page, bottom.id, 5.5, 1.0);
-  await tapWall(page, bottom.id, 6.5, 2.0);
-  const msgs = () => page.evaluate(() => window.__author.toasts.map((t) => t.msg));
-  expect(await msgs()).toContain("A window must stay 5 cm inside the wall");
-  await page.locator("#cancel-draw").click();
-  await tapWall(page, bottom.id, 1.5, 1.2);
-  await tapWall(page, bottom.id, 2.5, 1.8);
-  expect(await msgs()).toContain("Windows must not touch or overlap");
-  await page.locator("#cancel-draw").click();
-  expect((await stats(page)).committed).toBe(gen);
-  expect((await walls(page)).find((w) => w.id === bottom.id).windows).toHaveLength(2);
+  // ✓: the whole session is one undo step of the main history.
+  await page.locator("#edit-confirm").click();
+  expect((await editState(page)).active).toBe(false);
+  expect((await stats(page)).view).toBe("plan");
+  expect((await stats(page)).tool, "the Window tool is back for the next wall").toBe("window");
+  await page.locator("#undo").click();
+  expect(await voidsOf()).toHaveLength(0);
+  await page.locator("#redo").click();
+  expect(await voidsOf()).toHaveLength(2);
 
-  // Done: back to the plan view.
-  await page.locator("#window-done").click();
-  s = await stats(page);
-  expect(s.view).toBe("plan");
-  expect(s.windowHost).toBe(null);
+  // Door: the toggle next to Window, then a tap on the wall.
+  await page.locator('#opening-toggle button[data-opening="door"]').click();
+  expect((await stats(page)).tool).toBe("door");
+  await tapWorld(page, 0, -1.9);
+  es = await editState(page);
+  expect(es).toMatchObject({ active: true, tool: "door" });
+  await tapWall(page, bottom.id, 5.0, 1.0);
+  await page.locator("#edit-confirm").click();
+  voids = await voidsOf();
+  expect(voids).toHaveLength(3);
+  const door = voids[2].outline;
+  expect(Math.min(...door.map((p) => p[1])), "a door crosses the bottom edge").toBeLessThan(0);
 
-  // Height stays above the highest window (2.6 + 0.05 margin).
+  // Height stays above the highest opening (the pointed head at 2.2 m,
+  // on the 0.1 m wall grid, + the 0.05 m margin).
   await tool(page, "select");
   await tapWorld(page, 0, -1.9);
   expect((await stats(page)).selection).toBe(bottom.id);
+  await expect(page.locator("#prop-window-count")).toHaveText("3");
   await page.locator("#prop-height").fill("1.0");
   await page.locator("#prop-height").press("Enter");
-  expect((await walls(page)).find((w) => w.id === bottom.id).height).toBeCloseTo(2.65, 9);
+  const lowered = (await walls(page)).find((w) => w.id === bottom.id);
+  expect(lowered.minHeight).toBeCloseTo(2.25, 9);
+  expect(lowered.height).toBeCloseTo(2.25, 9);
   await page.locator("#undo").click();
 
-  // Delete a window (its geometry is swept); undo restores it.
-  const entities = async () => (await page.evaluate(() => window.__author.debugInfo())).document.entities;
-  const before = await entities();
-  await page.locator('[data-testid="delete-window"]').first().click();
-  expect((await walls(page)).find((w) => w.id === bottom.id).windows).toHaveLength(1);
-  expect(before - (await entities()), "wire + 4 edges + 4 lines + 4 points").toBe(13);
+  // Delete an opening from the properties; undo restores it.
+  await page.locator('[data-testid="delete-opening"]').first().click();
+  expect(await voidsOf()).toHaveLength(2);
   await page.locator("#undo").click();
-  expect((await walls(page)).find((w) => w.id === bottom.id).windows).toHaveLength(2);
+  expect(await voidsOf()).toHaveLength(3);
   await page.locator("#sheet-close").click();
 
-  // Walls and windows survive a reload.
+  // Walls and openings survive a reload.
   await page.waitForFunction((k) => !!localStorage.getItem(k), DOC_KEY, { timeout: 5000 });
   await page.evaluate(() => window.__author.saveNow());
   await page.reload();
   await page.waitForFunction(() => window.__author?.ready === true, null, { timeout: 90_000 });
   ws = await walls(page);
   expect(ws).toHaveLength(4);
-  expect(ws.find((w) => w.name === bottom.name).windows).toHaveLength(2);
+  expect(ws.find((w) => w.name === bottom.name).faces.filter((f) => f.kind === "void")).toHaveLength(3);
 
-  // Level elevation edit with walls + windows present: transform-only.
+  // Level elevation edit (walls without a top constraint): transform-only.
   await page.locator("#menu-btn").click();
   await page.locator('[data-testid="menu-levels"]').click();
   const levels = await page.evaluate(() => window.__author.levels());
   const ground = levels.levels.find((l) => l.name === "Ground");
   await page.locator(`.level-row[data-id="${ground.id}"] .lvl-elev`).fill("0.5");
-  s = await stats(page);
+  let s = await stats(page);
   expect(s.lastMeshUpserts, "no mesh re-upload").toBe(0);
   expect(s.lastBaseTransforms, "plate + 4 walls re-placed").toBe(5);
   await page.locator(`.level-row[data-id="${ground.id}"] .lvl-elev`).fill("0");
   await page.locator("#sheet-close").click();
-
-  await page.locator('#view-toggle button[data-view="3d"]').click();
-  await page.locator("#fit-btn").click();
-  await shot(page, "house-3d");
-  expect((await stats(page)).errors).toEqual([]);
+  s = await stats(page);
+  expect(s.errors).toEqual([]);
   expect(errors).toEqual([]);
 });

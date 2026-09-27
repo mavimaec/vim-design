@@ -159,14 +159,31 @@ front end over the same document. The element list it shows is derived from the
 document after every change; every action is one undo step; the document persists in
 the browser (`localStorage`, VIMD bytes as base64) and exports/imports as `.vimd`.
 
-**Tools.** Select (properties, delete), Floor plate, Hole, Wall, Window. Plan view
-(orthographic onto the active level, cut 1.2 m above it) and 3D view both accept
+**Tools.** Select (properties, delete), Floor plate, Hole, Wall, Window / Door. Plan view
+(orthographic onto the active plane, cut 1.2 m above it) and 3D view both accept
 drawing. Snapping, in priority order: the first vertex (closes the outline), existing
 corners, existing edges (plate outlines and wall base lines — tracing a plate edge is
 how walls go onto a plate), horizontal/vertical alignment with the previous and first
 vertex, the grid. Outlines the kernel would accept but that are wrong (a self-crossing
-or zero-area face; windows outside their wall or touching each other) are rejected
-live in the UI.
+or zero-area face) are rejected live in the UI.
+
+**Model tree.** A panel beside the tool dock (desktop) or a bottom sheet (phone, from the
+top bar) lists the model by story level, highest first. Under each level: its workplanes
+(nested, with their offset) and its elements grouped Floors / Walls / Other. Tapping an
+element selects it, frames it, and opens its properties; tapping a level or a workplane
+makes it the active plane (session state, no undo step). "+" on a level adds a
+workplane; a workplane's pencil opens its settings. Collapsed groups are remembered.
+
+**Workplanes** (§10) are construction planes nested in a level: a ceiling, a sill plane.
+A new one sits 2.40 m above its level (0.30 m above a parent workplane) in the parent's
+color. Its sheet edits the name, the offset (one undo step; a drag coalesces), and the
+color; "Workplane inside" nests another. Deleting one that holds anything shows what
+goes with it — nested workplanes and the elements drawn on them — and says which walls
+only reach up to it (they keep their current height); one Undo restores everything.
+Menu → Levels lists each level's workplanes too. The active plane is shown by the chip
+("Ground › Ceiling +2.40 m"); drawing happens on it, its grid is shown, other planes
+show faint outlines, and new elements are associated with its root level. A workplane
+moves with its level (transform-only for what is on it).
 
 **Floor plates are sketches, authored in Edit Mode.** A floor plate is an element whose
 member is a `Sketch` (§9) hanging below its level. The Floor tool opens a new plate in
@@ -195,36 +212,56 @@ Hole tool opens the tapped plate with the Void tool armed. Edit Mode is modal:
   solid face with its thickness, each hole → through void; the old construction chain
   is deleted) inside the Edit Mode session, so ✗ undoes the conversion too.
 
-**Walls.** The drawn line is one face of the wall; the thickness grows to the left of
-the drawing direction (to the right with "flip side"). A closed loop is normalized
-counter-clockwise first, so an unflipped loop grows inward. Each segment becomes one
-Wall element whose profile is the vertical rectangle (length × height) in the plane of
-the drawn line, extruded along the wall normal by the thickness. Height edits move the
-profile's top edge; thickness edits move only the extrusion path's end point, so the
-profile face and its windows stay put. Butt joins at corners: at a convex corner
-(turning toward the thickness side) the next segment's start is trimmed by the
-thickness; at a reflex corner the previous segment's end is extended by it.
+**Walls** are the library's `Wall` entity (§10). The drawn line is one face of the wall;
+the thickness grows to the left of the drawing direction (to the right with "flip
+side": the stored reference line is then reversed, since a `Wall` always has its
+material on the left). A closed loop is normalized counter-clockwise first, so an
+unflipped loop grows inward. Butt joins at corners: at a convex corner (turning toward
+the thickness side) the next segment's start is trimmed by the thickness; at a reflex
+corner the previous segment's end is extended by it. Each segment becomes one `Wall` on
+the active plane with the default profile (a rectangle whose top corners are anchored to
+the top), owned by one element.
 
-**Windows.** Tapping a wall with the Window tool opens an orthographic elevation view
-facing the wall's profile face, with a wall-local grid: `u` along the wall from its
-start (the drawn direction), `v` up from the level (world up) — a basis from stable
-inputs only, so it never flips. A window is a hole wire in the wall's profile face — the
-same face-with-holes construction as the legacy plate holes, no booleans. It must stay 5 cm inside
-the face and must not touch other windows.
+**Wall height.** The wall tool bar and the wall properties offer **Fixed** (a height) or
+**Up to** a plane (any level or workplane, plus an offset): the wall's top slot is wired
+to that plane, so the height follows it — drag the level above and the walls re-mesh to
+it, while their windows keep their sill height. A top that would not clear the base (or
+the wall's openings) is refused. Switching back to Fixed keeps the current height. Walls
+with a top plane are evaluated in world space; walls with only a base plane move by
+transform only when their level is dragged.
 
-**Attachment.** Sketches live on their level, and every point of walls and windows is
-attached to the level it was drawn on, so a level elevation edit moves everything on it
-as a transform only (no re-evaluation, no re-tessellation).
+**Wall Edit Mode.** The pencil on a wall opens its elevation (orthographic, facing the
+wall: `u` along it from its start, `v` up from its base) with the same Edit Mode as floor
+plates (§9 operations through `wall::ops`, one `UpdateWall` per edit, ✓ one undo step,
+✗ byte-identical), plus two quick tools: **Window** (1.2 × 1.2 m at a 0.9 m sill) and
+**Door** (0.9 × 2.1 m, reaching 5 cm below the base so it cuts the bottom edge) —
+preset voids placed where tapped, then edited like any face. A void with a depth under
+the thickness is a niche. **Anchor Bottom | Top** re-anchors the selected points: a
+top-anchored point (square handle) follows the wall height, a bottom-anchored one
+(round) keeps its height above the base. A point inserted on the top edge follows the
+top, so a gable is: hold on the top edge, drag the new point up. The Window tool in the
+main dock (with its Window | Door choice) opens the tapped wall's Edit Mode with the
+preset armed, and comes back after ✓ for the next wall. The properties list a wall's
+openings (window / door / niche) with delete.
+
+**Legacy walls** (extrusion + window hole wires, from before the `Wall` entity) still
+display, select, and delete; their height and thickness stay editable. The pencil — or
+the Window tool — converts one in place inside the Edit Mode session (same element,
+name, and level; its base line becomes the reference line, its level the base, a fixed
+height, the profile a solid face of its thickness with the top corners anchored, each
+window a through void; the old construction chain is deleted), so ✗ undoes the
+conversion too.
+
+**Attachment.** Sketches and walls live on their construction plane, in the space of its
+root level, so a level elevation edit moves everything on it (and on its workplanes) as
+a transform only — except walls whose top follows another plane, which re-mesh.
 
 **Known limitations.**
 - Butt joins are exact only at 90°; at other angles the corner blocks overlap or leave
   a sliver. Joins are computed when a run is drawn: separately drawn runs are not
   joined, and a later thickness edit does not re-trim neighbours.
-- Window points attach to the level, not to the wall face: a window does not follow its
-  wall if the wall is later moved. The planned `FaceFrame` construction plane (§3)
-  fixes this.
-- No doors yet. A door can be a notch in the wall's outer profile (the profile becomes
-  a U-shaped outline) — again no boolean needed.
+- Walls are not re-joined after edits: moving or re-heightening one does not re-trim its
+  neighbours, and a gable does not trim the walls it meets.
 
 ## 9. Edit Mode data model: the `Sketch` entity
 
