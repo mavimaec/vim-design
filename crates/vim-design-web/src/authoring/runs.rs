@@ -1,145 +1,148 @@
-//! Wall runs: a polyline of reference points on a construction plane
-//! (open or closed) with one thickness, the unit the wall's plan Edit
-//! Mode works on. The drawn line is one face of the walls; the
-//! thickness grows to its left (to the right with `flip`), as in the
-//! wall tool.
+//! Wall runs in the authoring app: the library's `WallRun` (a whole
+//! chain of wall segments as one thickened polyline, mitered joins at any
+//! angle; material on the LEFT of the direction of travel).
 //!
-//! [`RunModel`] is the Edit Mode adapter ([`ProfileModel`]): its points
-//! are the run's points and every segment is a two-point "face", so the
-//! shared hit-testing, marquee, and drag code select points and edges.
-//! [`RunModel::footprint`] is the thickened line with mitered joins at
-//! any angle (drawn live while editing), and [`chain_of`] recovers a run
-//! from the walls of the first wall tool (one `Wall` per segment, butt
-//! joined), until the library's `WallRun` holds runs directly.
+//! [`RunModel`] is the plan Edit Mode adapter ([`ProfileModel`]): its
+//! points are the run's points and every segment is a two-point "face",
+//! so the shared hit-testing, marquee, and drag code select points and
+//! edges; each edit is one `wall_run::ops` call on the run's data.
+//! [`footprint`] is the thickened line drawn live while editing — the
+//! same miter and bevel rule as the library (tested against its
+//! evaluated volume). [`chain_of`] recovers a chain from the walls of
+//! the earlier wall tools (one `Wall` per segment, butt joined) for
+//! their conversion.
 
 use vim_design_lib::EntityId;
+use vim_design_lib::wall_run::ops::{self as run_ops, RunEnd};
+use vim_design_lib::wall_run::{RunPoint, WallRunData, WallRunError};
 
 use super::edit::{Edit, EditError, FaceKind, ProfileFace, ProfileModel, ProfilePoint, ProfileView};
-use super::geom::{EPS, Invalid, P2, dist, self_intersects, signed_area};
+use super::geom::{EPS, Invalid, P2, dist, signed_area};
 use super::model::WallModel;
-use super::walls::{MIN_WALL_LENGTH_M, left};
+use super::walls::left;
 
-/// A mitered corner longer than this many thicknesses is beveled (a very
-/// sharp corner would otherwise spike far out).
-pub const MITER_LIMIT: f64 = 4.0;
-/// A point inserted on a segment stays this fraction of the segment away
-/// from its ends.
-const INSERT_END_FRACTION: f64 = 0.02;
-
-/// A run being edited: points (stable ids), open or closed, thickness,
-/// and the thickness side.
-#[derive(Debug, Clone, PartialEq)]
-pub struct RunModel {
-    pub points: Vec<(u32, P2)>,
-    pub closed: bool,
-    pub thickness: f64,
-    pub flip: bool,
-}
+/// A mitered corner longer than this many thicknesses is beveled (the
+/// library's `wall_run::MITER_LIMIT`).
+pub const MITER_LIMIT: f64 = vim_design_lib::wall_run::MITER_LIMIT;
 
 fn unit(a: P2, b: P2) -> P2 {
     let l = dist(a, b).max(1e-12);
     [(b[0] - a[0]) / l, (b[1] - a[1]) / l]
 }
 
+/// User-facing meaning of a wall-run error (the page's toast).
+pub fn run_error(e: WallRunError) -> EditError {
+    use WallRunError as E;
+    EditError::NoEffect(match e {
+        E::TooFewPoints => "A wall needs two points (a closed one three)",
+        E::ZeroLengthSegment(_) => "Two points of the wall coincide",
+        E::SelfIntersecting => return EditError::Invalid(Invalid::SelfIntersecting),
+        E::JoinTooAcute(_) => "The wall would fold back on itself",
+        E::SegmentTooShort(_) => "A wall segment is too short for its corner joins",
+        E::FootprintOverlaps => "The wall is too thick for that shape: it would overlap itself",
+        E::OpeningOutsideClearSpan(_) => "An opening must stay clear of the corner joins",
+        E::OpeningsOverlap(..) => "Openings must not overlap",
+        E::OpeningStraddlesSplit(_) => "A new point cannot split an opening",
+        E::OpeningDisplaced(_) => "An opening would no longer be on the wall",
+        E::InvalidOpening(_) => "An opening needs a positive size and a sill at or above the base",
+        E::ProfileNotBandAtJoin(_) => "Near a corner the wall's shape must be a plain band",
+        E::TopBelowBase => "The wall top must be above its base",
+        E::WrongRunKind => "Not possible for this wall: open it first",
+        E::InvalidThickness => "The thickness must be more than zero",
+        E::InvalidHeight => "The height must be more than zero",
+        E::InvalidParameter => "Press on a segment away from its ends",
+        E::UnknownPoint(_) | E::UnknownSegment(_) | E::UnknownOpening(_) => return EditError::Unknown,
+        E::DuplicatePointId(_)
+        | E::DuplicateOpeningId(_)
+        | E::DuplicateProfile(_)
+        | E::NonFinite
+        | E::Profile { .. }
+        | E::UnknownTopPoint { .. }
+        | E::Boolean => "That edit is not possible",
+    })
+}
+
+/// The segment start ids and end ids of a run, in order.
+pub fn segment_pairs(run: &WallRunData) -> Vec<(u32, u32)> {
+    let n = run.points.len();
+    let count = run.segment_count();
+    (0..count).map(|i| (run.points[i].id, run.points[(i + 1) % n].id)).collect()
+}
+
+/// The thickened line: for an open run one polygon (the line, then the
+/// offset line back); for a closed run the reference ring and the offset
+/// ring. The offset is to the left, corners mitered, beveled past
+/// [`MITER_LIMIT`] thicknesses.
+pub fn footprint(run: &WallRunData) -> Vec<Vec<P2>> {
+    let pts: Vec<P2> = run.points.iter().map(|p| p.uv).collect();
+    let offset = offset_line(&pts, run.closed, run.thickness_m, false);
+    if run.closed {
+        vec![pts, offset]
+    } else {
+        let mut poly = pts;
+        poly.extend(offset.into_iter().rev());
+        vec![poly]
+    }
+}
+
+/// Area of the footprint (m²): the plan area of the walls.
+pub fn footprint_area(run: &WallRunData) -> f64 {
+    let rings = footprint(run);
+    if run.closed {
+        (signed_area(&rings[0]).abs() - signed_area(&rings[1]).abs()).abs()
+    } else {
+        signed_area(&rings[0]).abs()
+    }
+}
+
+/// A run's points reversed (the material side flips to the other face of
+/// the line): each segment is renamed by its new start point, and its
+/// openings and profile are mirrored along it.
+pub fn reversed(run: &WallRunData) -> WallRunData {
+    let mut out = run.clone();
+    out.points.reverse();
+    let pairs = segment_pairs(run);
+    // Old segment (a -> b) becomes (b -> a), named b.
+    let renamed = |segment: u32| pairs.iter().find(|(a, _)| *a == segment).map_or(segment, |(_, b)| *b);
+    for o in &mut out.openings {
+        let length = run.segment_length(o.segment).unwrap_or(0.0);
+        o.offset_m = length - o.offset_m - o.width_m;
+        o.segment = renamed(o.segment);
+    }
+    for pr in &mut out.profiles {
+        let length = run.segment_length(pr.segment).unwrap_or(0.0);
+        for p in &mut pr.profile.points {
+            p.uv[0] = length - p.uv[0];
+        }
+        pr.segment = renamed(pr.segment);
+    }
+    if run.closed {
+        // Closed: the reversed loop keeps its first point first, so every
+        // segment keeps the "starts at" naming above.
+        out.points.rotate_right(1);
+    }
+    out
+}
+
+/// A run being edited in plan: the library's run data and its current
+/// top reference height (for splitting profiles).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunModel {
+    pub data: WallRunData,
+    pub height: f64,
+}
+
 impl RunModel {
-    pub fn new(points: &[P2], closed: bool, thickness: f64, flip: bool) -> Self {
-        let points = points.iter().enumerate().map(|(i, p)| (i as u32, *p)).collect();
-        Self { points, closed, thickness, flip }
+    fn with(&self, data: WallRunData) -> Self {
+        Self { data, height: self.height }
     }
 
-    pub fn uvs(&self) -> Vec<P2> {
-        self.points.iter().map(|(_, p)| *p).collect()
-    }
-
-    fn next_id(&self) -> u32 {
-        self.points.iter().map(|(id, _)| id + 1).max().unwrap_or(0)
-    }
-
-    fn index(&self, id: u32) -> Option<usize> {
-        self.points.iter().position(|(pid, _)| *pid == id)
-    }
-
-    /// Segments as point-id pairs, in run order (the closing one last).
-    pub fn segments(&self) -> Vec<(u32, u32)> {
-        let n = self.points.len();
-        let count = if self.closed { n } else { n.saturating_sub(1) };
-        (0..count).map(|i| (self.points[i].0, self.points[(i + 1) % n].0)).collect()
-    }
-
-    /// The points in the orientation the walls are built with: a closed
-    /// run counter-clockwise (so an unflipped loop grows inward).
-    pub fn oriented(&self) -> Vec<P2> {
-        let mut pts = self.uvs();
-        if self.closed && signed_area(&pts) < 0.0 {
-            pts.reverse();
-        }
-        pts
-    }
-
-    /// The thickened line: for an open run one polygon (the line, then
-    /// the offset line back); for a closed run the reference ring and
-    /// the offset ring. Corners are mitered (beveled past
-    /// [`MITER_LIMIT`]).
-    pub fn footprint(&self) -> Vec<Vec<P2>> {
-        let pts = self.oriented();
-        let offset = offset_line(&pts, self.closed, self.thickness, self.flip);
-        if self.closed {
-            vec![pts, offset]
-        } else {
-            let mut poly = pts;
-            poly.extend(offset.into_iter().rev());
-            vec![poly]
-        }
-    }
-
-    /// The live rules: enough points, segments long enough, and neither
-    /// the line nor its thickened outline crossing itself.
-    pub fn validate(&self) -> Result<(), EditError> {
-        let pts = self.oriented();
-        let min = if self.closed { 3 } else { 2 };
-        if pts.len() < min {
-            return Err(EditError::NoEffect("A wall needs at least two points (a closed one three)"));
-        }
-        let n = pts.len();
-        let count = if self.closed { n } else { n - 1 };
-        if (0..count).any(|i| dist(pts[i], pts[(i + 1) % n]) < MIN_WALL_LENGTH_M) {
-            return Err(EditError::Invalid(Invalid::WallTooShort));
-        }
-        if self_intersects(&pts, self.closed) {
-            return Err(EditError::Invalid(Invalid::SelfIntersecting));
-        }
-        let rings = self.footprint();
-        let crossing = if self.closed {
-            let inner = &rings[1];
-            // The offset ring must stay a simple ring on the same side.
-            self_intersects(inner, true) || signed_area(inner) * signed_area(&rings[0]) <= 0.0
-        } else {
-            self_intersects(&rings[0], true)
-        };
-        if crossing {
-            return Err(EditError::NoEffect("The wall is too thick for that shape: it would cross itself"));
-        }
-        Ok(())
-    }
-
-    fn validated(self) -> Result<Self, EditError> {
-        self.validate().map(|_| self)
-    }
-
-    fn move_ids(&self, ids: &[u32], delta: P2) -> Result<Self, EditError> {
-        let mut next = self.clone();
-        let mut any = false;
-        for (id, p) in &mut next.points {
-            if ids.contains(id) {
-                p[0] += delta[0];
-                p[1] += delta[1];
-                any = true;
-            }
-        }
-        if !any {
-            return Err(EditError::Unknown);
-        }
-        Ok(next)
+    /// The segment (by start id) an edge is.
+    fn segment_of(&self, edge: (u32, u32)) -> Option<u32> {
+        segment_pairs(&self.data)
+            .into_iter()
+            .find(|(a, b)| (*a, *b) == edge || (*b, *a) == edge)
+            .map(|(a, _)| a)
     }
 }
 
@@ -181,20 +184,13 @@ fn offset_line(pts: &[P2], closed: bool, thickness: f64, flip: bool) -> Vec<P2> 
     out
 }
 
-fn project_t(a: P2, b: P2, p: P2) -> f64 {
-    let ab = [b[0] - a[0], b[1] - a[1]];
-    let len2 = ab[0] * ab[0] + ab[1] * ab[1];
-    if len2 <= f64::EPSILON { 0.5 } else { ((p[0] - a[0]) * ab[0] + (p[1] - a[1]) * ab[1]) / len2 }
-}
-
 impl ProfileModel for RunModel {
     fn view(&self) -> ProfileView {
-        let kind = FaceKind::Solid { thickness: self.thickness };
+        let kind = FaceKind::Solid { thickness: self.data.thickness_m };
         ProfileView {
-            points: self.points.iter().map(|(id, uv)| ProfilePoint { id: *id, uv: *uv }).collect(),
+            points: self.data.points.iter().map(|p| ProfilePoint { id: p.id, uv: p.uv }).collect(),
             // Each segment is a two-point face: its one edge is the segment.
-            faces: self
-                .segments()
+            faces: segment_pairs(&self.data)
                 .iter()
                 .enumerate()
                 .map(|(i, (a, b))| ProfileFace { id: i as u32, points: vec![*a, *b], kind })
@@ -203,93 +199,94 @@ impl ProfileModel for RunModel {
     }
 
     fn apply(&self, edit: &Edit) -> Result<Self, EditError> {
-        match edit {
-            Edit::MovePoints { ids, delta } => self.move_ids(ids, *delta)?.validated(),
-            Edit::MoveEdges { edges, delta } => {
-                let ids: Vec<u32> = edges.iter().flat_map(|e| [e.0, e.1]).collect();
-                self.move_ids(&ids, *delta)?.validated()
-            }
+        let run = &self.data;
+        let segments_of_edges = |edges: &[crate::authoring::edit::EdgeKey]| -> Result<Vec<u32>, EditError> {
+            edges.iter().map(|e| self.segment_of((e.0, e.1)).ok_or(EditError::Unknown)).collect()
+        };
+        let next = match edit {
+            Edit::MovePoints { ids, delta } => run_ops::move_points(run, ids, *delta),
+            Edit::MoveEdges { edges, delta } => run_ops::move_edges(run, &segments_of_edges(edges)?, *delta),
             Edit::MoveFaces { faces, delta } => {
-                let segs = self.segments();
-                let ids: Vec<u32> = faces.iter().filter_map(|f| segs.get(*f as usize)).flat_map(|(a, b)| [*a, *b]).collect();
-                self.move_ids(&ids, *delta)?.validated()
+                let pairs = segment_pairs(run);
+                let segs: Vec<u32> = faces.iter().filter_map(|f| pairs.get(*f as usize)).map(|(a, _)| *a).collect();
+                run_ops::move_edges(run, &segs, *delta)
             }
             Edit::InsertPoint { edge, uv } => {
-                let (ia, ib) = (self.index(edge.0).ok_or(EditError::Unknown)?, self.index(edge.1).ok_or(EditError::Unknown)?);
-                let n = self.points.len();
-                // The segment's order in the run (a -> b), wrap included.
-                let (first, second) = if (ia + 1) % n == ib { (ia, ib) } else if (ib + 1) % n == ia { (ib, ia) } else {
-                    return Err(EditError::Unknown);
-                };
-                let (a, b) = (self.points[first].1, self.points[second].1);
-                let t = project_t(a, b, *uv).clamp(INSERT_END_FRACTION, 1.0 - INSERT_END_FRACTION);
-                let mut next = self.clone();
-                let p = [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
-                next.points.insert(first + 1, (self.next_id(), p));
-                next.validated()
+                let segment = self.segment_of((edge.0, edge.1)).ok_or(EditError::Unknown)?;
+                let index = run.segment_index(segment).ok_or(EditError::Unknown)?;
+                let (a, b) = run.segment_ends(index).ok_or(EditError::Unknown)?;
+                let d = unit(a, b);
+                let along = (uv[0] - a[0]) * d[0] + (uv[1] - a[1]) * d[1];
+                run_ops::insert_point(run, segment, along, self.height).map(|(r, _)| r)
             }
-            Edit::DeletePoints(ids) => {
-                // The neighbours of a removed point join: its two
-                // segments merge into one.
-                let mut next = self.clone();
-                next.points.retain(|(id, _)| !ids.contains(id));
-                if next.points.len() == self.points.len() {
-                    return Err(EditError::Unknown);
-                }
-                if next.closed && next.points.len() < 3 {
-                    next.closed = false;
-                }
-                next.validated()
-            }
-            Edit::DeleteEdges(edges) => {
-                // An edge's two points merge into its first point (in run
-                // order), which keeps its position.
-                let mut next = self.clone();
-                let n = self.points.len();
-                let mut drop = Vec::new();
-                for e in edges {
-                    let (Some(ia), Some(ib)) = (self.index(e.0), self.index(e.1)) else { continue };
-                    let second = if (ia + 1) % n == ib { ib } else { ia };
-                    drop.push(self.points[second].0);
-                }
-                if drop.is_empty() {
-                    return Err(EditError::Unknown);
-                }
-                next.points.retain(|(id, _)| !drop.contains(id));
-                if next.closed && next.points.len() < 3 {
-                    next.closed = false;
-                }
-                next.validated()
-            }
+            Edit::DeletePoints(ids) => run_ops::delete_points(run, ids),
+            Edit::DeleteEdges(edges) => run_ops::delete_edges(run, &segments_of_edges(edges)?),
             Edit::Extend { at_end, uv } => {
-                if self.closed {
-                    return Err(EditError::NoEffect("A closed wall has no end to extend: open it first"));
-                }
-                let mut next = self.clone();
-                let point = (self.next_id(), *uv);
-                if *at_end { next.points.push(point) } else { next.points.insert(0, point) }
-                next.validated()
+                run_ops::extend(run, if *at_end { RunEnd::End } else { RunEnd::Start }, *uv).map(|(r, _)| r)
             }
-            Edit::SetClosed(closed) => {
-                let mut next = self.clone();
-                next.closed = *closed;
-                next.validated()
-            }
+            Edit::SetClosed(closed) => run_ops::set_closed(run, *closed),
             Edit::AddFace { .. } | Edit::SplitFaces { .. } | Edit::DeleteFaces(_) | Edit::SetKind { .. } => {
-                Err(EditError::NoEffect("That edit does not apply to a wall's plan"))
+                return Err(EditError::NoEffect("That edit does not apply to a wall's plan"));
             }
-        }
+        };
+        next.map(|d| self.with(d)).map_err(run_error)
     }
 }
 
-/// A run recovered from walls: its elements in run order, points, and
-/// thickness side.
+/// A new run's data from drawn points: a closed loop is made
+/// counter-clockwise (material inward), `flip` puts the material on the
+/// other side (the points reversed).
+pub fn new_run(points: &[P2], closed: bool, flip: bool, thickness: f64, height_m: f64, top_offset_m: f64) -> WallRunData {
+    let mut pts = points.to_vec();
+    if closed && signed_area(&pts) < 0.0 {
+        pts.reverse();
+    }
+    if flip {
+        pts.reverse();
+    }
+    WallRunData {
+        points: pts.iter().enumerate().map(|(i, uv)| RunPoint { id: i as u32, uv: *uv }).collect(),
+        closed,
+        thickness_m: thickness,
+        height_m,
+        top_offset_m,
+        openings: Vec::new(),
+        profiles: Vec::new(),
+    }
+}
+
+/// A chain recovered from walls: its elements in walk order, the corner
+/// points (entry corner of each wall, plus the far end when open),
+/// whether each wall is walked along its stored direction, and whether
+/// the chain closes.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Chain {
     pub elements: Vec<EntityId>,
     pub points: Vec<P2>,
+    pub forward: Vec<bool>,
     pub closed: bool,
-    pub flip: bool,
+}
+
+impl Chain {
+    /// The walls in their stored direction (material on the left, as in
+    /// a wall run), each with its corner-to-corner line: the order a
+    /// wall run of the chain has.
+    pub fn stored(&self) -> Vec<(EntityId, P2, P2)> {
+        let n = self.points.len();
+        let mut out: Vec<(EntityId, P2, P2)> = self
+            .elements
+            .iter()
+            .enumerate()
+            .map(|(k, e)| {
+                let (entry, exit) = (self.points[k], self.points[(k + 1) % n]);
+                if self.forward[k] { (*e, entry, exit) } else { (*e, exit, entry) }
+            })
+            .collect();
+        if self.forward.first() == Some(&false) {
+            out.reverse();
+        }
+        out
+    }
 }
 
 /// Where the reference lines of two walls meet (their corner), if the
@@ -309,20 +306,14 @@ fn corner(w1: &WallModel, a: P2, w2: &WallModel, b: P2) -> Option<P2> {
     (reach(w1, a) && reach(w2, b)).then_some(p)
 }
 
-/// The run that `start` belongs to: the walls on the same base plane,
-/// with the same thickness and height settings, whose ends meet in butt
-/// joins, walked from one free end (or around a loop). A closed run is
-/// returned counter-clockwise.
+/// The chain that `start` belongs to: the walls on the same base plane
+/// with the same thickness whose ends meet (end to end, or in the butt
+/// joins of the first wall tool), walked from one free end (or around a
+/// loop).
 pub fn chain_of(walls: &[&WallModel], start: EntityId) -> Option<Chain> {
     let first = walls.iter().position(|w| w.element == start)?;
     let w0 = walls[first];
-    let same = |w: &WallModel| {
-        w.base == w0.base
-            && w.top == w0.top
-            && (w.thickness() - w0.thickness()).abs() < 1e-9
-            && (w.top_offset_m - w0.top_offset_m).abs() < 1e-9
-            && (w.top.is_some() || (w.height_m - w0.height_m).abs() < 1e-9)
-    };
+    let same = |w: &WallModel| w.base == w0.base && (w.thickness() - w0.thickness()).abs() < 1e-9;
     let cands: Vec<&WallModel> = walls.iter().copied().filter(|w| same(w)).collect();
     let me = cands.iter().position(|w| w.element == start)?;
     let end_pt = |i: usize, e: usize| if e == 0 { cands[i].start } else { cands[i].end };
@@ -385,72 +376,74 @@ pub fn chain_of(walls: &[&WallModel], start: EntityId) -> Option<Chain> {
             }
         }
     }
-    // Material on the left of the stored direction: walking a wall
-    // backwards puts it on the right of the walk.
-    let mut flip = !forward[0];
-    if closed && signed_area(&points) < 0.0 {
-        points.reverse();
-        // Reversed, the loop's first point stays first.
-        points.rotate_right(1);
-        elements.reverse();
-        flip = !flip;
-    }
-    Some(Chain { elements, points, closed, flip })
+    Some(Chain { elements, points, forward, closed })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::authoring::edit::EdgeKey;
+    use vim_design_lib::wall_run::{Opening, OpeningKind, validate};
 
-    fn square(flip: bool) -> RunModel {
-        RunModel::new(&[[0.0, 0.0], [4.0, 0.0], [4.0, 3.0], [0.0, 3.0]], true, 0.2, flip)
+    fn room() -> RunModel {
+        RunModel { data: new_run(&[[0.0, 0.0], [0.0, 3.0], [4.0, 3.0], [4.0, 0.0]], true, false, 0.2, 2.7, 0.0), height: 2.7 }
     }
 
     #[test]
-    fn footprint_miters_any_angle() {
-        // An open run with a 45° turn: the inner corner is one mitered point.
-        let r = RunModel::new(&[[0.0, 0.0], [4.0, 0.0], [6.0, 2.0]], false, 0.2, false);
-        let poly = &r.footprint()[0];
-        assert_eq!(poly.len(), 6, "3 line points + 3 offset points, no bevel");
-        // The mitered point lies on both offset lines (y = 0.2 and the
-        // 45° line shifted by 0.2 to its left).
-        let m = poly[4];
-        assert!((m[1] - 0.2).abs() < 1e-9, "{m:?}");
-        let d = (m[1] - m[0] + 4.0) / 2f64.sqrt(); // distance to y = x - 4, left side
-        assert!((d - 0.2).abs() < 1e-9, "{m:?}");
-        assert_eq!(r.validate(), Ok(()));
-        // A closed CW square is built CCW: the inner ring is inward.
-        let cw = RunModel::new(&[[0.0, 0.0], [0.0, 3.0], [4.0, 3.0], [4.0, 0.0]], true, 0.2, false);
-        let rings = cw.footprint();
-        assert!(signed_area(&rings[0]) > 0.0);
-        assert!((signed_area(&rings[1]) - 3.6 * 2.6).abs() < 1e-9);
+    fn new_runs_grow_inward_and_flip_reverses() {
+        let r = room().data;
+        assert!(signed_area(&r.points.iter().map(|p| p.uv).collect::<Vec<_>>()) > 0.0, "CCW");
+        assert_eq!(validate(&r), Ok(()));
+        assert!((footprint_area(&r) - (4.0 * 3.0 - 3.6 * 2.6)).abs() < 1e-9, "inward band");
+        let f = new_run(&[[0.0, 0.0], [0.0, 3.0], [4.0, 3.0], [4.0, 0.0]], true, true, 0.2, 2.7, 0.0);
+        assert!((footprint_area(&f) - (4.4 * 3.4 - 12.0)).abs() < 1e-9, "outward band");
+        // An open run at 60° then 135°: the footprint is mitered.
+        let open = new_run(&[[0.0, 0.0], [4.0, 0.0], [6.0, 3.464_101_615_137_754], [3.0, 5.0]], false, false, 0.2, 2.7, 0.0);
+        assert_eq!(validate(&open), Ok(()));
+        assert_eq!(footprint(&open)[0].len(), 8);
     }
 
     #[test]
-    fn edits_insert_merge_extend_and_validate() {
-        let r = square(false);
-        let ins = r.apply(&Edit::InsertPoint { edge: EdgeKey::new(0, 1), uv: [2.0, 0.3] }).expect("insert");
-        assert_eq!(ins.points.len(), 5);
-        assert_eq!(ins.points[1].1, [2.0, 0.0], "projected onto the segment");
-        // Deleting a point merges its two segments.
-        let merged = ins.apply(&Edit::DeletePoints(vec![ins.points[1].0])).expect("delete point");
-        assert_eq!(merged.uvs(), r.uvs());
-        // Deleting an edge keeps its first point.
-        let e = r.apply(&Edit::DeleteEdges(vec![EdgeKey::new(1, 2)])).expect("delete edge");
-        assert_eq!(e.uvs(), vec![[0.0, 0.0], [4.0, 0.0], [0.0, 3.0]]);
-        // Open, then extend from the end.
+    fn plan_edits_are_wall_run_ops() {
+        let r = room();
+        let (a, b) = (r.data.points[0].id, r.data.points[1].id);
+        let ins = r.apply(&Edit::InsertPoint { edge: EdgeKey::new(a, b), uv: [2.0, 0.3] }).expect("insert");
+        assert_eq!(ins.data.points.len(), 5);
+        let merged = ins.apply(&Edit::DeletePoints(vec![ins.data.points[1].id])).expect("delete point");
+        assert_eq!(merged.data.points.len(), 4);
+        let e = r.apply(&Edit::DeleteEdges(vec![EdgeKey::new(b, r.data.points[2].id)])).expect("delete edge");
+        assert_eq!(e.data.points.len(), 3);
         let open = r.apply(&Edit::SetClosed(false)).expect("open");
-        let ext = open.apply(&Edit::Extend { at_end: true, uv: [-2.0, 3.0] }).expect("extend");
-        assert_eq!(ext.points.last().map(|p| p.1), Some([-2.0, 3.0]));
+        let ext = open.apply(&Edit::Extend { at_end: true, uv: [-2.0, 0.0] }).expect("extend");
+        assert_eq!(ext.data.points.len(), 5);
         assert!(matches!(r.apply(&Edit::Extend { at_end: true, uv: [9.0, 9.0] }), Err(EditError::NoEffect(_))));
-        // A move that folds the run over itself is refused.
-        let bad = r.apply(&Edit::MovePoints { ids: vec![3], delta: [5.0, -1.5] });
-        assert_eq!(bad, Err(EditError::Invalid(Invalid::SelfIntersecting)));
-        // Too thick for a narrow room: the offset ring would invert.
-        let thick = RunModel { thickness: 2.0, ..square(false) };
-        assert!(matches!(thick.validate(), Err(EditError::NoEffect(_))));
-        // Flipped, the thickness goes outside: fine.
-        assert_eq!(RunModel { thickness: 2.0, ..square(true) }.validate(), Ok(()));
+        // (4, 0) moved to (-1, 2): its segments cross the others.
+        let bad = r.apply(&Edit::MovePoints { ids: vec![r.data.points[0].id], delta: [-5.0, 2.0] });
+        assert!(bad.is_err(), "a crossing run is refused");
+    }
+
+    #[test]
+    fn reversing_mirrors_openings_onto_the_renamed_segments() {
+        let mut r = room().data;
+        let seg = r.points[1].id; // the top segment, from (4,3)? (CCW order)
+        let length = r.segment_length(seg).expect("length");
+        r.openings.push(Opening { id: 0, segment: seg, offset_m: 1.0, sill_m: 0.9, width_m: 1.2, height_m: 1.2, kind: OpeningKind::Window, depth_m: None });
+        assert_eq!(validate(&r), Ok(()));
+        let rev = reversed(&r);
+        assert_eq!(validate(&rev), Ok(()));
+        let o = rev.openings[0];
+        assert!((o.offset_m - (length - 2.2)).abs() < 1e-9);
+        // The opening is on the same wall line: its end points coincide.
+        let at = |run: &WallRunData, o: &Opening, u: f64| {
+            let i = run.segment_index(o.segment).expect("segment");
+            let (a, b) = run.segment_ends(i).expect("ends");
+            let d = unit(a, b);
+            [a[0] + d[0] * u, a[1] + d[1] * u]
+        };
+        let (p0, q1) = (at(&r, &r.openings[0], 1.0), at(&rev, &o, o.offset_m + o.width_m));
+        assert!(dist(p0, q1) < 1e-9, "{p0:?} {q1:?}");
+        let back = reversed(&rev);
+        assert_eq!((back.points.clone(), back.openings[0].segment), (r.points.clone(), r.openings[0].segment), "reversing twice");
+        assert!((back.openings[0].offset_m - r.openings[0].offset_m).abs() < 1e-12);
     }
 }

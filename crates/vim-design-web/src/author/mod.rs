@@ -43,7 +43,6 @@ use crate::authoring::sketch::{
     self, PlaceOutcome, PlateOutline, Shape, Sketch, SketchContext, SketchTool,
 };
 use crate::authoring::snap::{self, SnapInput};
-use crate::authoring::walls as wall_geom;
 use crate::gestures::Gestures;
 use crate::render::{LineLayer, MeshStyle, Renderer, RendererOptions};
 
@@ -784,13 +783,17 @@ impl AuthorApp {
                 Shape::Polygon if closing => (sk.points.clone(), true),
                 Shape::Polygon => (preview_uv.clone(), false),
             };
-            wall_geom::wall_segments(&run, closed, self.wall_thickness, self.wall_flip)
-                .map(|segs| {
-                    segs.iter()
-                        .map(|s| s.footprint(self.wall_thickness).iter().filter_map(|p| proj(*p)).collect())
-                        .collect()
-                })
-                .unwrap_or_default()
+            // The run as the library will build it: mitered.
+            let pts = crate::authoring::geom::dedup_closed(&run);
+            if pts.len() >= 2 {
+                let data = crate::authoring::runs::new_run(&pts, closed, self.wall_flip, self.wall_thickness, 1.0, 0.0);
+                crate::authoring::runs::footprint(&data)
+                    .iter()
+                    .map(|ring| ring.iter().filter_map(|p| proj(*p)).collect())
+                    .collect()
+            } else {
+                Vec::new()
+            }
         } else {
             Vec::new()
         };
@@ -850,7 +853,7 @@ impl AuthorApp {
         };
         hits.iter()
             .take_while(|(_, d)| *d <= d0 + PICK_TIE_M)
-            .find(|(id, _)| self.wall_line(*id).is_some())
+            .find(|(id, _)| self.is_wall(*id))
             .map_or(nearest, |(id, _)| *id)
             .0 as f64
     }
@@ -876,6 +879,11 @@ impl AuthorApp {
                         (&mut floors, meta, true)
                     }
                     ElementModel::Plate(p) => (&mut floors, format!("{:.1} m² · {:.2} m", p.area, p.thickness), true),
+                    ElementModel::Run(r) => {
+                        let n = r.data.segment_count();
+                        let meta = format!("{} segment{} · h {:.2} m", n, if n == 1 { "" } else { "s" }, r.top_height);
+                        (&mut walls, meta, true)
+                    }
                     ElementModel::Wall(w) => {
                         let meta = format!("{:.2} m · h {:.2} m", w.length(), w.top_height);
                         (&mut walls, meta, true)
@@ -1298,8 +1306,8 @@ impl AuthorApp {
             "elements": self.model.len(),
             "plates": self.model.iter().filter(|e| matches!(e, ElementModel::Plate(_))).count(),
             "platesOnLevel": plates_on_level,
-            "walls": self.model.iter().filter(|e| e.wall_line().is_some()).count(),
-            "wallsOnLevel": self.model.iter().filter(|e| e.wall_line().is_some() && e.level() == self.active_level).count(),
+            "walls": self.model.iter().filter(|e| e.is_wall()).count(),
+            "wallsOnLevel": self.model.iter().filter(|e| e.is_wall() && e.level() == self.active_level).count(),
             "editing": self.edit.is_some(),
             "openings": self.openings.is_some(),
             "wall": {
@@ -1372,10 +1380,7 @@ impl AuthorApp {
     /// The elements in focus: a wall run being edited (all its walls),
     /// else the focus element.
     fn focus_ids(&self) -> Vec<EntityId> {
-        match &self.run_edit {
-            Some(r) => r.elements.clone(),
-            None => self.focus_element().into_iter().collect(),
-        }
+        self.focus_element().into_iter().collect()
     }
 
     /// The box Fit frames: the focus elements' bounds.
@@ -1535,9 +1540,8 @@ impl AuthorApp {
         })
     }
 
-    /// Either kind of wall's reference line, by element.
-    fn wall_line(&self, element: EntityId) -> Option<WallLine> {
-        self.model.iter().find(|e| e.element() == element).and_then(|e| e.wall_line())
+    fn is_wall(&self, element: EntityId) -> bool {
+        self.model.iter().any(|e| e.element() == element && e.is_wall())
     }
 
     /// The elevation frame facing a wall, with its length and height.
@@ -1681,8 +1685,8 @@ impl AuthorApp {
                         out.extend_from_slice(&h.outline);
                     }
                 }
-                ElementModel::Wall(_) | ElementModel::LegacyWall(_) => {
-                    if let Some(w) = e.wall_line().filter(|w| w.plane == level && w.base_w.abs() < 1e-9) {
+                ElementModel::Run(_) | ElementModel::Wall(_) | ElementModel::LegacyWall(_) => {
+                    for w in e.wall_lines().into_iter().filter(|w| w.plane == level && w.base_w.abs() < 1e-9) {
                         out.push(w.start);
                         out.push(w.end);
                     }
@@ -1700,7 +1704,7 @@ impl AuthorApp {
     /// the session, not as "other" geometry).
     fn is_edited(&self, element: EntityId) -> bool {
         self.edit.as_ref().and_then(|s| s.element) == Some(element)
-            || self.run_edit.as_ref().is_some_and(|r| r.elements.contains(&element))
+            || self.run_edit.is_some_and(|r| r.element == element)
     }
 
     fn is_plate(&self, element: EntityId) -> bool {
@@ -1719,8 +1723,8 @@ impl AuthorApp {
                     let n = p.outline.len();
                     out.extend((0..n).map(|i| (p.outline[i], p.outline[(i + 1) % n])));
                 }
-                ElementModel::Wall(_) | ElementModel::LegacyWall(_) => {
-                    if let Some(w) = e.wall_line().filter(|w| w.plane == level && w.base_w.abs() < 1e-9) {
+                ElementModel::Run(_) | ElementModel::Wall(_) | ElementModel::LegacyWall(_) => {
+                    for w in e.wall_lines().into_iter().filter(|w| w.plane == level && w.base_w.abs() < 1e-9) {
                         out.push((w.start, w.end));
                     }
                 }
@@ -1769,17 +1773,17 @@ impl AuthorApp {
             })
             .to_string()
         };
-        let segments = if sketch.tool == SketchTool::Wall {
+        let run = if sketch.tool == SketchTool::Wall {
             let (run, closed) = sketch::wall_run(&sketch, closing);
-            match wall_geom::wall_segments(&run, closed, self.wall_thickness, self.wall_flip) {
-                Ok(segs) => segs,
-                Err(e) => return rejected(e, sketch.points.len()),
+            if let Err(e) = sketch::validate_run(&run, closed, self.wall_thickness, self.wall_flip) {
+                return rejected(e, sketch.points.len());
             }
+            Some((crate::authoring::geom::dedup_closed(&run), closed))
         } else {
             if let Some(st) = self.sketch_status().filter(|s| !s.can_finish) {
                 return rejected(st.reason.unwrap_or(Invalid::TooFewPoints), sketch.points.len());
             }
-            Vec::new()
+            None
         };
         if matches!(sketch.tool, SketchTool::Profile | SketchTool::Split) {
             return self.finish_edit_sketch(sketch.tool, sketch.outline());
@@ -1808,25 +1812,25 @@ impl AuthorApp {
             }
             SketchTool::Wall => {
                 let level = self.root_level(sketch.level).unwrap_or(sketch.level);
+                let (points, closed) = run.clone().unwrap_or_default();
                 match self.new_wall_height_mode(sketch.level) {
-                    Ok(height) => ops::commit_walls(
+                    Ok(height) => ops::commit_run(
                         &mut self.doc,
                         sketch.level,
                         level,
-                        &segments,
-                        height,
+                        &points,
+                        closed,
+                        self.wall_flip,
                         self.wall_thickness,
+                        height,
                     ),
                     Err(e) => Err(e),
                 }
             }
-            .map(|ids| {
-                let msg = if ids.len() == 1 {
-                    "Wall created".to_owned()
-                } else {
-                    format!("{} walls created", ids.len())
-                };
-                (msg, ids.first().copied(), "draw walls")
+            .map(|element| {
+                let segs = run.as_ref().map_or(0, |(p, c)| if *c { p.len() } else { p.len().saturating_sub(1) });
+                let msg = if segs == 1 { "Wall created".to_owned() } else { format!("Wall created: {segs} segments") };
+                (msg, Some(element), "draw walls")
             }),
             SketchTool::Profile | SketchTool::Split => Err("not a document sketch".to_owned()),
         };
@@ -1920,6 +1924,51 @@ impl AuthorApp {
                     obj.insert("faces".into(), faces.into());
                     obj.insert("faceCount".into(), p.sketch.faces.len().into());
                     obj.insert("area".into(), stats.map_or(0.0, |s| s.top_area).into());
+                    obj.insert("volume".into(), stats.map_or(0.0, |s| s.volume).into());
+                    obj.insert("triangles".into(), stats.map_or(0, |s| s.triangles).into());
+                    obj.insert("bbox".into(), stats.map_or(serde_json::Value::Null, |s| serde_json::json!(s.bbox)));
+                }
+                v
+            }
+            ElementModel::Run(r) => {
+                let mut v = base;
+                let stats = self.pick.owner_stats(r.element);
+                let openings: Vec<serde_json::Value> = r
+                    .data
+                    .openings
+                    .iter()
+                    .map(|o| {
+                        serde_json::json!({
+                            "id": o.id, "segment": o.segment, "kind": match o.kind {
+                                vim_design_lib::wall_run::OpeningKind::Window => "window",
+                                vim_design_lib::wall_run::OpeningKind::Door => "door",
+                            },
+                            "offset": o.offset_m, "sill": o.sill_m, "width": o.width_m, "height": o.height_m, "depth": o.depth_m,
+                        })
+                    })
+                    .collect();
+                if let Some(obj) = v.as_object_mut() {
+                    obj.insert("run".into(), true.into());
+                    obj.insert("legacy".into(), false.into());
+                    obj.insert("points".into(), serde_json::json!(r.data.points.iter().map(|p| p.uv).collect::<Vec<_>>()));
+                    obj.insert("closed".into(), r.data.closed.into());
+                    obj.insert("segments".into(), r.data.segment_count().into());
+                    obj.insert("height".into(), r.top_height.into());
+                    obj.insert("heightM".into(), r.data.height_m.into());
+                    obj.insert("mode".into(), if r.top.is_some() { "upto" } else { "fixed" }.into());
+                    obj.insert("topPlane".into(), r.top.map(|t| t.0 as f64).into());
+                    obj.insert("topOffset".into(), r.data.top_offset_m.into());
+                    obj.insert("basePlane".into(), (r.base.0 as f64).into());
+                    obj.insert("basePlaneName".into(), self.plane_name(r.base).into());
+                    obj.insert("baseElevation".into(), self.plane_elevation(r.base).into());
+                    obj.insert("thickness".into(), r.data.thickness_m.into());
+                    obj.insert("length".into(), r.length().into());
+                    obj.insert("footprintArea".into(), crate::authoring::runs::footprint_area(&r.data).into());
+                    obj.insert("minHeight".into(), self.run_min_height(r).into());
+                    obj.insert("openings".into(), openings.len().into());
+                    obj.insert("openingList".into(), openings.into());
+                    obj.insert("faces".into(), serde_json::json!([]));
+                    obj.insert("windows".into(), serde_json::json!([]));
                     obj.insert("volume".into(), stats.map_or(0.0, |s| s.volume).into());
                     obj.insert("triangles".into(), stats.map_or(0, |s| s.triangles).into());
                     obj.insert("bbox".into(), stats.map_or(serde_json::Value::Null, |s| serde_json::json!(s.bbox)));
@@ -2117,7 +2166,7 @@ impl AuthorApp {
         for mu in &updates.meshes {
             let fallback = if self.is_plate(mu.id) {
                 rgb(CONCRETE)
-            } else if self.wall_line(mu.id).is_some() {
+            } else if self.is_wall(mu.id) {
                 rgb(WALL)
             } else {
                 rgb(OTHER_ELEMENT)
@@ -2259,7 +2308,7 @@ impl AuthorApp {
             let element = self.model.iter().find(|e| e.element() == id);
             let level = element.and_then(|e| e.level());
             let is_plate = matches!(element, Some(ElementModel::Plate(_) | ElementModel::SketchPlate(_)));
-            let is_wall = element.is_some_and(|e| e.wall_line().is_some());
+            let is_wall = element.is_some_and(|e| e.is_wall());
             let depth_bias = if ortho && is_plate { PLATE_DEPTH_BIAS } else { 0.0 };
             // The plan cut exposes the inside of a wall: fill it flat.
             let cut_wall = is_wall && self.camera.mode == ViewMode::Plan;

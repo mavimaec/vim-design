@@ -34,9 +34,9 @@ use crate::authoring::edit::presets;
 use crate::authoring::edit::session::{EditSession, Marquee};
 use crate::authoring::edit::{Edit, EditError, FaceKind, ProfileModel, ProfileView};
 use crate::authoring::geom::P2;
-use crate::authoring::model::{self, ElementModel, WallModel};
-use crate::authoring::ops::{self, RunSpec, WallHeight};
-use crate::authoring::runs::{RunModel, chain_of};
+use crate::authoring::model::{self, ElementModel, WallModel, WallRunModel};
+use crate::authoring::ops;
+use crate::authoring::runs::{RunModel, reversed, run_error};
 use crate::authoring::sketch::{Shape, Sketch, SketchTool};
 use crate::authoring::snap::SnapResult;
 
@@ -64,7 +64,7 @@ impl EditProfile {
     fn is_empty(&self) -> bool {
         match self {
             EditProfile::Sketch(s) => s.faces.is_empty(),
-            EditProfile::Run(r) => r.points.is_empty(),
+            EditProfile::Run(r) => r.data.points.is_empty(),
         }
     }
 }
@@ -85,24 +85,13 @@ impl ProfileModel for EditProfile {
     }
 }
 
-/// A wall run's Edit Mode: its walls (in run order), where they stand,
-/// how tall they are, and a snapshot of the run at every undo depth of
-/// the session (undo and redo restore the run from them).
-#[derive(Debug, Clone)]
+/// A wall run's Edit Mode: its element and `WallRun` entity (the run's
+/// data lives in the document; the session reloads it after every edit,
+/// undo, and redo).
+#[derive(Debug, Clone, Copy)]
 pub struct RunEdit {
-    pub elements: Vec<EntityId>,
-    pub base: EntityId,
-    pub level: EntityId,
-    pub height: WallHeight,
-    snapshots: Vec<RunSnapshot>,
-}
-
-#[derive(Debug, Clone)]
-struct RunSnapshot {
-    depth: usize,
-    run: RunModel,
-    elements: Vec<EntityId>,
-    height: WallHeight,
+    pub element: EntityId,
+    pub run: EntityId,
 }
 
 /// Limits for face thickness and void depth (meters).
@@ -215,64 +204,48 @@ impl AuthorApp {
         true
     }
 
-    /// Enter Edit Mode on a wall's run, in plan on its base plane: the
-    /// walls that join it end to end form one polyline (open or closed)
-    /// whose points and segments are edited; the footprint follows live.
-    /// Legacy extrusion walls on the wall's level are converted first,
-    /// inside the session.
+    /// Enter Edit Mode on a wall run, in plan on its base plane: its
+    /// points and segments. A wall of the earlier tools is converted
+    /// first, inside the session (legacy walls to `Wall`s, then their
+    /// whole chain to one run).
     pub fn edit_begin_wall(&mut self, wall: f64) -> bool {
         let id = eid(wall);
         if self.edit.is_some() || self.openings.is_some() {
             return false;
         }
-        let legacy_level = match self.model.iter().find(|e| e.element() == id) {
-            Some(ElementModel::LegacyWall(w)) => Some(w.plane_level),
-            Some(ElementModel::Wall(_)) => None,
-            _ => return false,
-        };
         self.gestures.begin_session(&self.doc);
-        if let Some(level) = legacy_level {
-            if let Err(e) = self.convert_legacy_walls(level) {
+        let was_run = self.is_run(id);
+        let element = match self.ensure_run(id) {
+            Ok(e) => e,
+            Err(e) => {
                 self.gestures.cancel_session(&mut self.doc);
                 self.sync("convert failed");
                 web_sys::console::error_1(&JsValue::from_str(&e));
                 return false;
             }
+        };
+        if !was_run {
+            // The conversion is part of the session, not an edit to undo.
             self.gestures.set_session_floor(&self.doc);
         }
-        let walls: Vec<&WallModel> = self
-            .model
-            .iter()
-            .filter_map(|e| if let ElementModel::Wall(w) = e { Some(w) } else { None })
-            .collect();
-        let (Some(chain), Some(first)) = (chain_of(&walls, id), walls.iter().find(|w| w.element == id).map(|w| (*w).clone()))
-        else {
+        let Some(r) = self.run_model(element).cloned() else {
             self.gestures.cancel_session(&mut self.doc);
             self.sync("edit failed");
             return false;
         };
-        let model = RunModel::new(&chain.points, chain.closed, first.thickness(), chain.flip);
-        let count = chain.elements.len();
-        let name = if count == 1 { first.name.clone() } else { format!("{} + {} walls", first.name, count - 1) };
-        let height = WallHeight { height_m: first.height_m, top: first.top, top_offset_m: first.top_offset_m };
-        self.run_edit = Some(RunEdit {
-            elements: chain.elements.clone(),
-            base: first.base,
-            level: first.level,
-            height,
-            snapshots: vec![RunSnapshot { depth: self.doc.undo_depth(), run: model.clone(), elements: chain.elements, height }],
-        });
+        self.run_edit = Some(RunEdit { element, run: r.run });
         // Plan, on the run's base plane.
         if self.prev_camera.is_none() {
             self.prev_camera = Some(self.camera.clone());
         }
-        self.set_active_plane(first.base.0 as f64);
+        self.set_active_plane(r.base.0 as f64);
         self.camera.set_mode(ViewMode::Plan);
         self.edit_target = EditTarget::Run;
-        let mut session = EditSession::new(EditProfile::Run(model), first.base, Some(id), name);
-        session.new_thickness = first.thickness();
+        let model = RunModel { data: r.data.clone(), height: r.top_height };
+        let mut session = EditSession::new(EditProfile::Run(model), r.base, Some(element), r.name.clone());
+        session.new_thickness = r.data.thickness_m;
         self.edit_sketch = None;
-        self.edit_entry_element = Some(id);
+        self.edit_entry_element = Some(element);
         self.start_edit(session);
         if let Some(s) = self.edit.as_mut() {
             s.set_mode(SelectMode::Points);
@@ -288,7 +261,7 @@ impl AuthorApp {
         let Some(run) = self.edit.as_ref().and_then(|s| s.model.run()) else { return none() };
         let step = self.snap_step;
         let uv = if self.snap_enabled { [(uv[0] / step).round() * step, (uv[1] / step).round() * step] } else { uv };
-        let pts = run.uvs();
+        let pts: Vec<P2> = run.data.points.iter().map(|p| p.uv).collect();
         let (Some(first), Some(last)) = (pts.first(), pts.last()) else { return none() };
         let at_end = crate::authoring::geom::dist(uv, *last) <= crate::authoring::geom::dist(uv, *first);
         self.edit_apply(&Edit::Extend { at_end, uv }, None, "extended")
@@ -311,58 +284,71 @@ impl AuthorApp {
         offset: f64,
         height: f64,
     ) -> String {
-        let (Some(run), Some(edit)) = (self.edit.as_ref().and_then(|s| s.model.run()).cloned(), self.run_edit.clone())
-        else {
+        let (Some(run), Some(edit)) = (self.edit.as_ref().and_then(|s| s.model.run()).cloned(), self.run_edit) else {
             return r#"{"result":"none"}"#.to_owned();
         };
-        let mut next = run;
+        let Some(current) = self.run_model(edit.element).cloned() else { return r#"{"result":"none"}"#.to_owned() };
+        let mut data = run.data.clone();
         if thickness.is_finite() {
-            next.thickness = thickness.clamp(super::MIN_WALL_THICKNESS_M, super::MAX_WALL_THICKNESS_M);
+            data.thickness_m = thickness.clamp(super::MIN_WALL_THICKNESS_M, super::MAX_WALL_THICKNESS_M);
         }
         if flip >= 0 {
-            next.flip = flip == 1;
+            // The material to the other side: the run reversed.
+            data = reversed(&data);
         }
-        if closed >= 0 {
-            next.closed = closed == 1;
+        if closed >= 0 && (closed == 1) != data.closed {
+            match vim_design_lib::wall_run::ops::set_closed(&data, closed == 1) {
+                Ok(d) => data = d,
+                Err(e) => return json_err(&run_error(e)),
+            }
         }
-        if let Err(e) = next.validate() {
-            return json_err(&e);
+        if let Err(e) = vim_design_lib::wall_run::validate(&data) {
+            return json_err(&run_error(e));
         }
-        let mut h = edit.height;
+        // Height mode: (top, top offset, fixed height).
+        let (mut top, mut top_offset, mut height_m) = (current.top, current.data.top_offset_m, current.data.height_m);
         match mode {
             "fixed" => {
-                if h.top.is_some() {
+                if top.is_some() {
                     // Keep the height the walls have now.
-                    h.height_m = self.run_top_height(&edit);
+                    height_m = current.top_height;
                 }
-                h.top = None;
+                top = None;
                 if height.is_finite() {
-                    h.height_m = height.clamp(super::MIN_WALL_HEIGHT_M, super::MAX_WALL_HEIGHT_M);
+                    height_m = height.clamp(super::MIN_WALL_HEIGHT_M, super::MAX_WALL_HEIGHT_M);
                 }
             }
             "upto" => {
                 if plane >= 0.0 && self.root_level(eid(plane)).is_some() {
-                    h.top = Some(eid(plane));
+                    top = Some(eid(plane));
                 }
                 if offset.is_finite() {
-                    h.top_offset_m = offset.clamp(-super::MAX_WALL_HEIGHT_M, super::MAX_WALL_HEIGHT_M);
+                    top_offset = offset.clamp(-super::MAX_WALL_HEIGHT_M, super::MAX_WALL_HEIGHT_M);
                 }
-                let Some(top) = h.top else {
+                let Some(t) = top else {
                     return serde_json::json!({ "result": "rejected", "reason": "Pick the plane the walls go up to" }).to_string();
                 };
-                let reach = self.plane_elevation(top) + h.top_offset_m - self.plane_elevation(edit.base);
+                let reach = self.plane_elevation(t) + top_offset - self.plane_elevation(current.base);
                 if reach < super::MIN_WALL_HEIGHT_M {
                     return serde_json::json!({
                         "result": "rejected", "reason": "The wall top must be above its base: pick a higher plane",
                     })
                     .to_string();
                 }
-                h.height_m = reach.min(super::MAX_WALL_HEIGHT_M);
+                // The fixed height is the fallback if the top is removed.
+                height_m = reach.min(super::MAX_WALL_HEIGHT_M);
             }
             _ => {}
         }
         let continuous = thickness.is_finite() || height.is_finite() || offset.is_finite();
-        self.edit_apply_run(next, h, continuous.then_some("run_settings"), "changed")
+        let key = continuous.then_some("run_settings");
+        let mut cmd = ops::update_run(edit.run, &data, false);
+        if let Command::UpdateWallRun { top: t, top_offset_m, height_m: h, .. } = &mut cmd {
+            *t = Some(top);
+            *top_offset_m = Some(top_offset);
+            *h = Some(height_m);
+        }
+        self.submit_run_edit(cmd, key, "changed")
     }
 
     /// The opening presets (meters), for the page's hints.
@@ -856,13 +842,13 @@ impl AuthorApp {
             _ => s.model.run(),
         };
         let footprint: Vec<Vec<[f32; 2]>> = run
-            .map(|r| r.footprint().iter().map(|ring| ring.iter().filter_map(|p| proj(*p)).collect()).collect())
+            .map(|r| crate::authoring::runs::footprint(&r.data).iter().map(|ring| ring.iter().filter_map(|p| proj(*p)).collect()).collect())
             .unwrap_or_default();
         serde_json::json!({
             "active": true,
             "mode": s.mode.name(),
             "footprint": footprint,
-            "closed": run.is_some_and(|r| r.closed),
+            "closed": run.is_some_and(|r| r.data.closed),
             "faces": if run.is_some() { Vec::new() } else { faces_json },
             "edges": edges_json,
             "points": points_json,
@@ -909,30 +895,73 @@ fn profile_json(view: &ProfileView) -> String {
 impl AuthorApp {
     /// The run session's state for the page (`null` outside one).
     fn run_state_json(&self) -> serde_json::Value {
-        let (Some(run), Some(edit)) = (self.edit.as_ref().and_then(|s| s.model.run()), self.run_edit.as_ref()) else {
+        let (Some(run), Some(r)) = (
+            self.edit.as_ref().and_then(|s| s.model.run()),
+            self.run_edit.and_then(|e| self.run_model(e.element)),
+        ) else {
             return serde_json::Value::Null;
         };
         serde_json::json!({
-            "points": run.points.len(),
-            "segments": run.segments().len(),
-            "closed": run.closed,
-            "flip": run.flip,
-            "thickness": run.thickness,
-            "walls": edit.elements.len(),
-            "mode": if edit.height.top.is_some() { "upto" } else { "fixed" },
-            "topPlane": edit.height.top.map(|t| t.0 as f64),
-            "topOffset": edit.height.top_offset_m,
-            "height": self.run_top_height(edit),
-            "elements": edit.elements.iter().map(|e| e.0 as f64).collect::<Vec<_>>(),
-            "base": edit.base.0 as f64,
+            "points": run.data.points.len(),
+            "segments": run.data.segment_count(),
+            "closed": run.data.closed,
+            "thickness": run.data.thickness_m,
+            "openings": run.data.openings.len(),
+            "mode": if r.top.is_some() { "upto" } else { "fixed" },
+            "topPlane": r.top.map(|t| t.0 as f64),
+            "topOffset": r.data.top_offset_m,
+            "height": r.top_height,
+            "element": r.element.0 as f64,
+            "base": r.base.0 as f64,
+            "footprintArea": crate::authoring::runs::footprint_area(&run.data),
         })
     }
 
-    /// The top reference height of a run's walls above their base.
-    pub(super) fn run_top_height(&self, edit: &RunEdit) -> f64 {
-        match edit.height.top {
-            Some(top) => self.plane_elevation(top) + edit.height.top_offset_m - self.plane_elevation(edit.base),
-            None => edit.height.height_m,
+    /// A wall run of the model, by element.
+    pub(super) fn run_model(&self, element: EntityId) -> Option<&WallRunModel> {
+        self.model.iter().find_map(|e| match e {
+            ElementModel::Run(r) if r.element == element => Some(r),
+            _ => None,
+        })
+    }
+
+    fn is_run(&self, element: EntityId) -> bool {
+        self.run_model(element).is_some()
+    }
+
+    /// The wall run `element` is (or becomes): walls of the earlier tools
+    /// are converted — legacy walls on its level to `Wall`s, then the
+    /// connected chain to one run element (each conversion one undo
+    /// step). Returns the run's element.
+    pub(super) fn ensure_run(&mut self, element: EntityId) -> Result<EntityId, String> {
+        if self.is_run(element) {
+            return Ok(element);
+        }
+        if let Some(ElementModel::LegacyWall(w)) = self.model.iter().find(|e| e.element() == element) {
+            let level = w.plane_level;
+            self.convert_legacy_walls(level)?;
+        }
+        if !matches!(self.model.iter().find(|e| e.element() == element), Some(ElementModel::Wall(_))) {
+            return Err("not a wall".to_owned());
+        }
+        let walls: Vec<WallModel> = self
+            .model
+            .iter()
+            .filter_map(|e| if let ElementModel::Wall(w) = e { Some(w.clone()) } else { None })
+            .collect();
+        let depth = self.doc.undo_depth();
+        match ops::convert_chain_to_run(&mut self.doc, &walls, element) {
+            Ok(run_element) => {
+                self.gestures.one_shot(depth);
+                self.sync("convert to wall run");
+                Ok(run_element)
+            }
+            Err(e) => {
+                ops::rollback_to(&mut self.doc, depth);
+                self.gestures.invalidate_redo();
+                self.sync("convert failed");
+                Err(e)
+            }
         }
     }
 
@@ -957,53 +986,33 @@ impl AuthorApp {
         Ok(())
     }
 
-    /// Store a run edit: the run's walls rewritten (reused in order,
-    /// created, deleted) — one undo step, or part of the open gesture
-    /// `key` — and a snapshot for undo/redo inside the session.
-    fn edit_apply_run(&mut self, next: RunModel, height: WallHeight, key: Option<&str>, ok: &str) -> String {
-        let Some(edit) = self.run_edit.clone() else { return r#"{"result":"none"}"#.to_owned() };
-        let existing: Vec<WallModel> = edit.elements.iter().filter_map(|e| self.wall(*e).cloned()).collect();
-        if existing.len() != edit.elements.len() {
-            return serde_json::json!({ "result": "rejected", "reason": "The walls changed outside this edit" }).to_string();
-        }
-        let spec = RunSpec {
-            base: edit.base,
-            level: edit.level,
-            points: next.oriented(),
-            closed: next.closed,
-            flip: next.flip,
-            thickness: next.thickness,
-            height,
-        };
+    /// Store a run edit: one `UpdateWallRun` — one undo step, or part of
+    /// the open gesture `key` (coalesced).
+    fn submit_run_edit(&mut self, cmd: Command, key: Option<&str>, ok: &str) -> String {
         let depth = self.doc.undo_depth();
-        if let Some(k) = key {
-            self.gestures.begin_continuing(&self.doc, &format!("edit_{k}"));
-        }
-        match ops::rewrite_run(&mut self.doc, &existing, &spec) {
-            Ok(elements) => {
+        let coalesce = match key {
+            Some(k) => self.gestures.begin_continuing(&self.doc, &format!("edit_{k}")),
+            None => false,
+        };
+        let cmd = match cmd {
+            Command::UpdateWallRun { id, base, top, points, closed, thickness_m, height_m, top_offset_m, openings, profiles, .. } => {
+                Command::UpdateWallRun { id, base, top, points, closed, thickness_m, height_m, top_offset_m, openings, profiles, coalesce }
+            }
+            other => other,
+        };
+        match self.doc.submit(cmd) {
+            Ok(_) => {
                 if key.is_none() {
                     self.gestures.one_shot(depth);
                 }
-                self.sync("edit walls");
-                let depth_after = self.doc.undo_depth();
-                if let Some(r) = self.run_edit.as_mut() {
-                    r.snapshots.retain(|snap| snap.depth <= depth);
-                    r.snapshots.push(RunSnapshot { depth: depth_after, run: next.clone(), elements: elements.clone(), height });
-                    r.elements = elements.clone();
-                    r.height = height;
-                }
-                if let Some(s) = self.edit.as_mut() {
-                    s.element = elements.first().copied();
-                    s.set_model(EditProfile::Run(next));
-                }
-                self.refresh_styles();
+                self.sync("edit wall run");
+                self.reload_edit_model();
                 serde_json::json!({ "result": ok }).to_string()
             }
-            Err(e) => {
+            Err(st) => {
                 ops::rollback_to(&mut self.doc, depth);
-                self.gestures.invalidate_redo();
-                self.sync("edit walls failed");
-                serde_json::json!({ "result": "rejected", "reason": e }).to_string()
+                self.sync("edit failed");
+                serde_json::json!({ "result": "rejected", "reason": format!("the wall was refused ({st:?})") }).to_string()
             }
         }
     }
@@ -1049,21 +1058,9 @@ impl AuthorApp {
     /// brings the same entity back.
     fn reload_edit_model(&mut self) {
         if self.edit_target == EditTarget::Run {
-            // The run at this undo depth (the latest snapshot at or below it).
-            let depth = self.doc.undo_depth();
-            let snap = self
-                .run_edit
-                .as_ref()
-                .and_then(|r| r.snapshots.iter().rev().find(|snap| snap.depth <= depth).cloned());
-            if let Some(snap) = snap {
-                if let Some(r) = self.run_edit.as_mut() {
-                    r.elements = snap.elements.clone();
-                    r.height = snap.height;
-                }
-                if let Some(s) = self.edit.as_mut() {
-                    s.element = snap.elements.first().copied();
-                    s.set_model(EditProfile::Run(snap.run));
-                }
+            let run = self.run_edit.and_then(|e| self.run_model(e.element)).map(|r| RunModel { data: r.data.clone(), height: r.top_height });
+            if let (Some(run), Some(s)) = (run, self.edit.as_mut()) {
+                s.set_model(EditProfile::Run(run));
             }
             self.refresh_styles();
             return;
@@ -1123,8 +1120,8 @@ impl AuthorApp {
             Err(e) => return json_err(&e),
         };
         if let EditProfile::Run(run) = next {
-            let Some(height) = self.run_edit.as_ref().map(|r| r.height) else { return r#"{"result":"none"}"#.to_owned() };
-            return self.edit_apply_run(run, height, key, ok);
+            let Some(edit) = self.run_edit else { return r#"{"result":"none"}"#.to_owned() };
+            return self.submit_run_edit(ops::update_run(edit.run, &run.data, false), key, ok);
         }
         let EditProfile::Sketch(next) = next else { return r#"{"result":"none"}"#.to_owned() };
         let (plane, name) = (s.level, s.name.clone());

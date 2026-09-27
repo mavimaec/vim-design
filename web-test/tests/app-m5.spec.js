@@ -210,8 +210,10 @@ test("touch: two fingers pan OR zoom (classified once, locked); a new pinch re-c
 test("Openings mode: place windows and doors on any wall, select, drag along it, size, delete; ✗ reverts, ✓ keeps (one step each)", async ({ page }) => {
   const errors = await openApp(page);
   await drawRoom(page, [-3, -2], [3, 2]);
-  const ws = await walls(page);
-  const bottom = ws.find((w) => Math.abs(w.start[1] + 2) < 1e-9 && Math.abs(w.end[1] + 2) < 1e-9);
+  const [room] = await walls(page);
+  // The bottom segment: from (-3, -2) to (3, -2) in the run's order.
+  const bottomSeg = room.points.findIndex(([x, y]) => x === -3 && y === -2);
+  expect(room.points[(bottomSeg + 1) % 4]).toEqual([3, -2]);
   const before = await savedBytes(page);
 
   // The Window tool opens the mode.
@@ -227,10 +229,8 @@ test("Openings mode: place windows and doors on any wall, select, drag along it,
   await tapWorld(page, 0.5, -1.9);
   let os = await openings(page);
   expect(os).toHaveLength(1);
-  expect(os[0]).toMatchObject({ wall: bottom.id, kind: "window", width: 1.2, height: 1.2, sill: 0.9 });
-  const u = 0.5 - Math.min(bottom.start[0], bottom.end[0]);
-  const along = bottom.start[0] < bottom.end[0] ? os[0].offset + 0.6 : bottom.length - os[0].offset - 0.6;
-  expect(Math.abs(along - u)).toBeLessThan(0.06);
+  expect(os[0]).toMatchObject({ wall: room.id, segment: bottomSeg, kind: "window", width: 1.2, height: 1.2, sill: 0.9 });
+  expect(Math.abs(os[0].offset + 0.6 - 3.5), "centred on the tap").toBeLessThan(0.06);
   st = await openingsState(page);
   expect(st.selected).toMatchObject({ kind: "window", width: 1.2 });
 
@@ -295,15 +295,17 @@ test("wall Edit Mode in plan: the run's points and segments — move, insert, de
   await page.locator("#prop-edit").click();
   let es = await editState(page);
   expect(es).toMatchObject({ active: true, target: "run", mode: "points" });
-  expect(es.run).toMatchObject({ walls: 4, points: 4, closed: true, thickness: 0.2 });
+  expect(es.run).toMatchObject({ segments: 4, points: 4, closed: true, thickness: 0.2 });
   expect((await stats(page)).view).toBe("plan");
   expect((await page.evaluate(() => window.__author.editHud())).footprint).toHaveLength(2);
 
-  // Drag a corner: the run follows (the walls are rewritten).
+  // Drag a corner: the run follows (one UpdateWallRun).
   await dragClient(page, await worldToClient(page, 3, 2), await worldToClient(page, 4, 3));
   let prof = await profile(page);
   expect(hasPoint(prof, [4, 3])).toBe(true);
-  expect((await walls(page)).length).toBe(4);
+  let [room] = await walls(page);
+  expect(room.points).toContainEqual([4, 3]);
+  expect(room.volume).toBeCloseTo(room.footprintArea * 2.7, 3);
 
   // Hold on the bottom segment: a new point; Delete merges it back.
   // (Fit first: the moved corner grew the run past the view.)
@@ -311,12 +313,11 @@ test("wall Edit Mode in plan: the run's points and segments — move, insert, de
   await shot(page, "wall-plan-edit");
   await longPressClient(page, await worldToClient(page, 0, -2));
   es = await editState(page);
-  expect(es.run.points).toBe(5);
-  expect((await walls(page)).length).toBe(5);
+  expect(es.run).toMatchObject({ points: 5, segments: 5 });
+  expect((await walls(page))[0].segments).toBe(5);
   await page.locator("#edit-delete").click();
   es = await editState(page);
-  expect(es.run.points).toBe(4);
-  expect((await walls(page)).length).toBe(4);
+  expect(es.run).toMatchObject({ points: 4, segments: 4 });
 
   // Edges: deleting one merges its two points.
   await page.locator('[data-edit-mode="edges"]').click();
@@ -328,14 +329,14 @@ test("wall Edit Mode in plan: the run's points and segments — move, insert, de
   // Open the loop, then extend it from its end.
   await page.locator("#run-closed").click();
   es = await editState(page);
-  expect(es.run).toMatchObject({ closed: false, walls: 2 });
+  expect(es.run).toMatchObject({ closed: false, segments: 2 });
   await page.locator('[data-edit-tool="extend"]').click();
   prof = await profile(page);
   const last = prof.points[prof.points.length - 1].uv;
   // (Inside the view: the left of the canvas is under the edit dock.)
   await tapWorld(page, last[0] + 1, last[1] - 2);
   es = await editState(page);
-  expect(es.run).toMatchObject({ points: 4, walls: 3 });
+  expect(es.run).toMatchObject({ points: 4, segments: 3 });
 
   // Thickness of the whole run.
   await page.locator("#run-thickness").fill("0.3");

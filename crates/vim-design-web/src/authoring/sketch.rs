@@ -9,7 +9,6 @@ use super::geom::{
     validate_outline,
 };
 use super::snap::{SnapKind, SnapResult};
-use super::walls;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SketchTool {
@@ -224,13 +223,32 @@ pub fn wall_run(sketch: &Sketch, closing: bool) -> (Vec<P2>, bool) {
     }
 }
 
+/// A drawn wall run as the library would build it (a closed loop made
+/// counter-clockwise, `flip` reversing it): refused when the library's
+/// `wall_run::validate` refuses it.
+pub fn validate_run(points: &[P2], closed: bool, thickness: f64, flip: bool) -> Result<(), Invalid> {
+    let pts = geom::dedup_closed(points);
+    if pts.len() < 2 || (closed && pts.len() < 3) {
+        return Err(Invalid::TooFewWallPoints);
+    }
+    let run = super::runs::new_run(&pts, closed, flip, thickness, 1.0, 0.0);
+    match vim_design_lib::wall_run::validate(&run) {
+        Ok(()) => Ok(()),
+        Err(vim_design_lib::wall_run::WallRunError::SelfIntersecting) => Err(Invalid::SelfIntersecting),
+        Err(vim_design_lib::wall_run::WallRunError::SegmentTooShort(_) | vim_design_lib::wall_run::WallRunError::ZeroLengthSegment(_)) => {
+            Err(Invalid::WallTooShort)
+        }
+        Err(_) => Err(Invalid::WallOverlaps),
+    }
+}
+
 pub fn status(sketch: &Sketch, ctx: &SketchContext) -> SketchStatus {
     let outline = sketch.outline();
     let finish = match (sketch.tool, ctx) {
         (SketchTool::Hole, SketchContext::Hole(plates)) => validate_hole(&outline, plates).map(|_| ()),
         (SketchTool::Wall, SketchContext::Wall { thickness, flip }) => {
             let (run, closed) = wall_run(sketch, false);
-            walls::wall_segments(&run, closed, *thickness, *flip).map(|_| ())
+            validate_run(&run, closed, *thickness, *flip)
         }
         (SketchTool::Split, _) => {
             if outline.len() >= 2 { Ok(()) } else { Err(Invalid::TooFewWallPoints) }

@@ -1710,11 +1710,10 @@ async function main() {
     const r = editState.run;
     if (!r) return;
     $("edit-panel").classList.remove("target-new");
-    $("edit-panel-title").textContent = `Wall run · ${r.walls} wall${r.walls === 1 ? "" : "s"}`;
+    $("edit-panel-title").textContent = `Wall run · ${r.segments} segment${r.segments === 1 ? "" : "s"}`;
     $("edit-panel-note").textContent = `${r.points} points · ${r.closed ? "closed" : "open"}`;
     guardValue($("run-thickness"), r.thickness.toFixed(2));
-    $("run-flip").classList.toggle("on", r.flip);
-    $("run-flip").setAttribute("aria-pressed", String(r.flip));
+
     $("run-closed").classList.toggle("on", r.closed);
     $("run-closed").setAttribute("aria-pressed", String(r.closed));
     $("run-closed").disabled = !r.closed && r.points < 3;
@@ -1830,7 +1829,8 @@ async function main() {
       app.edit_end_gesture();
     });
   }
-  $("run-flip").addEventListener("click", () => runSet({ flip: !editState.run?.flip }));
+  // Flip: the material to the other side of the line (the run reversed).
+  $("run-flip").addEventListener("click", () => runSet({ flip: true }));
   $("run-closed").addEventListener("click", () => runSet({ closed: !editState.run?.closed }));
   for (const b of document.querySelectorAll("#run-mode button")) {
     b.addEventListener("click", () => {
@@ -2682,16 +2682,22 @@ async function main() {
   /** A wall's openings (its profile's void faces), each deletable. */
   function renderWallOpenings(list, e) {
     list.replaceChildren();
-    const voids = e.faces.filter((f) => f.kind === "void");
+    // A wall run's structured openings, or a wall's void faces.
+    const voids = e.run
+      ? e.openingList.map((o) => ({
+        id: o.id, depth: o.depth, kind: o.kind,
+        outline: [[o.offset, o.kind === "door" ? 0 : o.sill], [o.offset + o.width, (o.kind === "door" ? 0 : o.sill) + o.height]],
+      }))
+      : e.faces.filter((f) => f.kind === "void");
     if (voids.length === 0) list.append(el("div", { class: "empty-note", text: "No openings yet — add a window or a door." }));
     const counts = {};
     for (const f of voids) {
-      const noun = openingNoun(f);
+      const noun = f.kind === "door" ? "Door" : f.kind === "window" ? (f.depth == null ? "Window" : "Niche") : openingNoun(f);
       counts[noun] = (counts[noun] ?? 0) + 1;
       const label = `${noun} ${counts[noun]}`;
       list.append(el("div", { class: "hole-row" },
         el("span", { class: "hole-name", text: label }),
-        el("span", { class: "hole-area", text: fmtArea(polyArea(f.outline)) }),
+        el("span", { class: "hole-area", text: fmtArea(e.run ? (f.outline[1][0] - f.outline[0][0]) * (f.outline[1][1] - f.outline[0][1]) : polyArea(f.outline)) }),
         el("button", {
           type: "button", class: "icon-btn ghost", "aria-label": `Delete ${label.toLowerCase()}`,
           "data-testid": "delete-opening", html: icon("trash", "ico"), style: "color:var(--danger)",
@@ -2792,7 +2798,7 @@ async function main() {
     if (c.workplanes) parts.push(`${c.workplanes} nested workplane${c.workplanes === 1 ? "" : "s"}`);
     let text = `Workplane "${w.name}" has ${parts.join(" and ") || "dependents"}.\n\nDeleting it also deletes them, and all of their geometry.`;
     if (c.toppedWalls) {
-      text += `\n\n${c.toppedWalls} wall${c.toppedWalls === 1 ? " reaches" : "s reach"} up to it: ${c.toppedWalls === 1 ? "it keeps its" : "they keep their"} current height.`;
+      text += `\n\nWalls that go up to it keep their current height (${c.toppedWalls} wall${c.toppedWalls === 1 ? "" : "s"}).`;
     }
     return `${text}\n\nA single Undo restores everything.`;
   };

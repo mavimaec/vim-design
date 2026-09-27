@@ -15,12 +15,13 @@
 use vim_design_lib::entity::slot;
 use vim_design_lib::{Command, Document, EntityId, EntityKind, Params, VimStatus};
 
-use vim_design_lib::sketch::{Sketch, SketchDirection, SketchFaceKind};
+use vim_design_lib::sketch::{Sketch, SketchDirection};
 
 use super::edit::FaceKind;
 use super::edit::profile::sketch_from_faces;
 use super::geom::{P2, dist, normalized_ccw};
 use super::model::{LegacyWallModel, PlateModel, WallModel};
+use vim_design_lib::wall_run::WallRunData;
 use super::walls::WallSeg;
 
 /// Site defaults: downtown Montreal. The default lives in the app, not
@@ -171,11 +172,13 @@ pub fn wall_line(seg: &WallSeg) -> (P2, P2) {
     if left { (seg.start, seg.end) } else { (seg.end, seg.start) }
 }
 
-/// Commit a wall run: one `Wall` per segment, on the construction
+/// Build walls of the M4 wall tool: one `Wall` per segment, on the construction
 /// `plane`, with the default profile (a rectangle of the wall's height
 /// with both top corners anchored to the top), each owned by one
 /// element associated with `level` (the plane's root story level).
-/// Returns the element ids in run order.
+/// Returns the element ids in run order (test fixtures: documents from
+/// before the `WallRun`).
+#[cfg(test)]
 pub fn commit_walls(
     doc: &mut Document,
     plane: EntityId,
@@ -207,20 +210,66 @@ pub fn commit_walls(
     Ok(elements)
 }
 
-/// A wall run to (re)build: its points on the base plane, open or
-/// closed, thickness side, thickness, and height mode.
-#[derive(Debug, Clone, PartialEq)]
-pub struct RunSpec {
-    pub base: EntityId,
-    pub level: EntityId,
-    pub points: Vec<P2>,
-    pub closed: bool,
-    pub flip: bool,
-    pub thickness: f64,
-    pub height: WallHeight,
+/// Commit a drawn wall run as ONE `WallRun` on the construction
+/// `plane` (a closed loop made counter-clockwise so the material is
+/// inward; `flip` puts it on the other side), owned by one element
+/// associated with `level` (the plane's root story level). The library
+/// miters the joins. Refused, with the reason, when the run would be
+/// invalid. Returns the element.
+#[allow(clippy::too_many_arguments)] // the drawn run's fields, named at the call
+pub fn commit_run(
+    doc: &mut Document,
+    plane: EntityId,
+    level: EntityId,
+    points: &[P2],
+    closed: bool,
+    flip: bool,
+    thickness: f64,
+    height: WallHeight,
+) -> Result<EntityId, String> {
+    let run = super::runs::new_run(points, closed, flip, thickness, height.height_m, height.top_offset_m);
+    vim_design_lib::wall_run::validate(&run).map_err(|e| super::runs::run_error(e).message().to_owned())?;
+    let id = create_run(doc, plane, height.top, run)?;
+    let name = next_element_name(doc, "Wall");
+    one(doc, Command::CreateElement { name, members: vec![id], level })
 }
 
-/// The top reference height a wall of `height` gets on `base`.
+fn create_run(doc: &mut Document, base: EntityId, top: Option<EntityId>, run: WallRunData) -> Result<EntityId, String> {
+    one(
+        doc,
+        Command::CreateWallRun {
+            base,
+            top,
+            points: run.points,
+            closed: run.closed,
+            thickness_m: run.thickness_m,
+            height_m: run.height_m,
+            top_offset_m: run.top_offset_m,
+            openings: run.openings,
+            profiles: run.profiles,
+        },
+    )
+}
+
+/// An `UpdateWallRun` of the run's data (points, closed, thickness,
+/// openings, profiles).
+pub fn update_run(id: EntityId, run: &WallRunData, coalesce: bool) -> Command {
+    Command::UpdateWallRun {
+        id,
+        base: None,
+        top: None,
+        points: Some(run.points.clone()),
+        closed: Some(run.closed),
+        thickness_m: Some(run.thickness_m),
+        height_m: None,
+        top_offset_m: None,
+        openings: Some(run.openings.clone()),
+        profiles: Some(run.profiles.clone()),
+        coalesce,
+    }
+}
+
+/// The top reference a wall of `height` gets on `base` (meters).
 fn top_height(doc: &Document, base: EntityId, height: &WallHeight) -> f64 {
     let elevation = |p: EntityId| vim_design_lib::workplane::plane_elevation(doc, p).unwrap_or(0.0);
     match height.top {
@@ -229,79 +278,76 @@ fn top_height(doc: &Document, base: EntityId, height: &WallHeight) -> f64 {
     }
 }
 
-/// A wall's profile for a new length and thickness: the default
-/// rectangle, with the old wall's void faces (openings) kept where they
-/// still fit — mirrored along the wall when its line was reversed.
-fn resized_profile(old: &WallModel, length: f64, thickness: f64, reversed: bool, h: f64) -> (Sketch, Vec<u32>) {
-    let (mut profile, mut anchors) = vim_design_lib::wall::default_profile(length, thickness);
-    let effective = old.effective();
-    for f in &effective.faces {
-        let SketchFaceKind::Void { depth } = f.kind else { continue };
-        let Ok(poly) = vim_design_lib::sketch::face_polygon(&effective, f.id) else { continue };
-        let poly: Vec<P2> = poly.iter().map(|p| if reversed { [old.length() - p[0], p[1]] } else { *p }).collect();
-        if poly.iter().any(|p| p[0] <= 0.0 || p[0] >= length) {
-            continue; // no longer on the wall
-        }
-        if let Ok((p, a)) = vim_design_lib::wall::ops::add_face(&profile, &anchors, h, &poly, SketchFaceKind::Void { depth }) {
-            (profile, anchors) = (p, a);
-        }
+/// Convert the chain of `Wall`s that `element` belongs to (walls joined
+/// end to end or by the butt joins of the first wall tool) into ONE wall
+/// run element, in place: the first wall's element (its name and level)
+/// owns the run, the other walls' elements go. Each wall is first put
+/// corner to corner, on the first wall's height mode, keeping its shape
+/// (a wall of another height keeps it as its segment's profile); then
+/// the library's `wall_run::from_walls` converts the chain (rectangular
+/// voids become openings). The caller wraps this in one gesture.
+/// Returns the run's element.
+pub fn convert_chain_to_run(doc: &mut Document, walls: &[WallModel], element: EntityId) -> Result<EntityId, String> {
+    let refs: Vec<&WallModel> = walls.iter().collect();
+    let chain = super::runs::chain_of(&refs, element).ok_or("this wall is not in a chain")?;
+    let stored = chain.stored();
+    let by_element = |e: EntityId| walls.iter().find(|w| w.element == e);
+    let first = by_element(stored[0].0).ok_or("the wall no longer exists")?;
+    let height = WallHeight { height_m: first.height_m, top: first.top, top_offset_m: first.top_offset_m };
+    let h_run = top_height(doc, first.base, &height);
+    for (e, start, end) in &stored {
+        let w = by_element(*e).ok_or("the wall no longer exists")?;
+        let (profile, top_points) = corner_profile(w, *start, *end, h_run)?;
+        ok(
+            doc,
+            Command::UpdateWall {
+                id: w.wall,
+                base: None,
+                top: Some(height.top),
+                start: Some(*start),
+                end: Some(*end),
+                height_m: Some(height.height_m),
+                top_offset_m: Some(height.top_offset_m),
+                profile: Some(profile),
+                top_points: Some(top_points),
+                coalesce: false,
+            },
+        )?;
     }
-    (profile, anchors)
+    let ids: Vec<EntityId> = stored.iter().filter_map(|(e, ..)| by_element(*e).map(|w| w.wall)).collect();
+    let (run, base, top) = vim_design_lib::wall_run::from_walls(doc, &ids).map_err(|e| e.to_string())?;
+    let id = create_run(doc, base, top, run)?;
+    ok(doc, Command::UpdateElement { id: first.element, name: None, members: Some(vec![id]), coalesce: false })?;
+    ok(doc, Command::DeleteWall { id: first.wall })?;
+    for (e, ..) in stored.iter().skip(1) {
+        delete_element(doc, *e)?;
+    }
+    Ok(first.element)
 }
 
-/// Build a run as walls, reusing `existing` (the run's current walls, in
-/// run order): segment i updates the i-th wall (only when it changed),
-/// new segments create walls, extra walls are deleted. Butt joins as in
-/// the wall tool. A changed wall's profile is rebuilt (openings kept);
-/// an unchanged wall keeps its own. Returns the run's elements in order.
-/// The caller wraps this in one gesture.
-pub fn rewrite_run(doc: &mut Document, existing: &[WallModel], spec: &RunSpec) -> Result<Vec<EntityId>, String> {
-    let segs = super::walls::wall_segments(&spec.points, spec.closed, spec.thickness, spec.flip)
-        .map_err(|e| e.message().to_owned())?;
-    let h = top_height(doc, spec.base, &spec.height);
-    let mut out = Vec::with_capacity(segs.len());
-    for (i, seg) in segs.iter().enumerate() {
-        let (start, end) = wall_line(seg);
-        let Some(old) = existing.get(i) else {
-            let made = commit_walls(doc, spec.base, spec.level, std::slice::from_ref(seg), spec.height, spec.thickness)?;
-            out.extend(made);
-            continue;
+/// A wall's profile once its line runs corner to corner (`start` ->
+/// `end`, the line it had before extended or trimmed at its ends): its
+/// current shape (effective at its own height), its end edges moved to
+/// the new ends and everything else shifted along, stored against the
+/// run's top reference `h_run`.
+fn corner_profile(w: &WallModel, start: P2, end: P2, h_run: f64) -> Result<(Sketch, Vec<u32>), String> {
+    let (old_len, new_len) = (w.length(), dist(start, end));
+    let d = w.dir();
+    // How far the old start lies past the new one along the line.
+    let shift = (w.start[0] - start[0]) * d[0] + (w.start[1] - start[1]) * d[1];
+    let mut effective = w.effective();
+    for p in &mut effective.points {
+        p.uv[0] = if p.uv[0].abs() < 1e-9 {
+            0.0
+        } else if (p.uv[0] - old_len).abs() < 1e-9 {
+            new_len
+        } else {
+            p.uv[0] + shift
         };
-        let same_line = |a: P2, b: P2| dist(a, b) < 1e-9;
-        let unchanged = same_line(old.start, start)
-            && same_line(old.end, end)
-            && (old.thickness() - spec.thickness).abs() < 1e-12
-            && old.base == spec.base
-            && old.top == spec.height.top
-            && (old.top_offset_m - spec.height.top_offset_m).abs() < 1e-12
-            && (spec.height.top.is_some() || (old.height_m - spec.height.height_m).abs() < 1e-12);
-        if !unchanged {
-            let od = old.dir();
-            let nd = [end[0] - start[0], end[1] - start[1]];
-            let reversed = od[0] * nd[0] + od[1] * nd[1] < 0.0;
-            let (profile, top_points) = resized_profile(old, dist(start, end), spec.thickness, reversed, h);
-            ok(
-                doc,
-                Command::UpdateWall {
-                    id: old.wall,
-                    base: Some(spec.base),
-                    top: Some(spec.height.top),
-                    start: Some(start),
-                    end: Some(end),
-                    height_m: Some(spec.height.height_m),
-                    top_offset_m: Some(spec.height.top_offset_m),
-                    profile: Some(profile),
-                    top_points: Some(top_points),
-                    coalesce: false,
-                },
-            )?;
-        }
-        out.push(old.element);
     }
-    for old in existing.iter().skip(segs.len()) {
-        delete_element(doc, old.element)?;
-    }
-    Ok(out)
+    vim_design_lib::sketch::validate_structure(&effective).map_err(|e| e.to_string())?;
+    let anchors = w.top_points.clone();
+    Ok((vim_design_lib::wall::stored_profile(&effective, &anchors, h_run), anchors))
 }
 
 /// Convert a legacy (extrusion) wall into a library `Wall` in place: the
@@ -366,10 +412,6 @@ pub fn convert_legacy_wall(doc: &mut Document, wall: &LegacyWallModel) -> Result
     Ok(id)
 }
 
-/// Height a wall keeps when its top plane is deleted while its top
-/// reference is at or below its base (meters).
-const MIN_UNWIRED_WALL_HEIGHT_M: f64 = 0.1;
-
 /// One workplane's params and parent, read back for the tree and the
 /// level manager.
 #[derive(Debug, Clone, PartialEq)]
@@ -402,9 +444,10 @@ pub fn workplanes(doc: &Document) -> Vec<WorkplaneInfo> {
     out
 }
 
-/// What deleting a workplane takes with it: nested workplanes, floor
-/// plates and walls standing on them, and walls that only reach up to
-/// one of them (those keep their current height instead).
+/// What deleting a workplane takes with it (the library's
+/// `DeleteWorkplaneCascade`): nested workplanes, floor plates and walls
+/// standing on them; walls that only reach up to one of them are
+/// disconnected (they keep their current height).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct WorkplaneContents {
     pub workplanes: Vec<EntityId>,
@@ -433,8 +476,8 @@ pub fn workplane_contents(doc: &Document, id: EntityId) -> WorkplaneContents {
             let on_base = || record.inputs.get(slot::WALL_BASE).and_then(|s| s.referenced().next()) == Some(plane);
             match record.kind() {
                 EntityKind::Workplane => stack.push(dep),
-                EntityKind::Wall if !on_base() => out.topped_walls.push(dep),
-                EntityKind::Sketch | EntityKind::Wall | EntityKind::ControlPoint => {
+                EntityKind::Wall | EntityKind::WallRun if !on_base() => out.topped_walls.push(dep),
+                EntityKind::Sketch | EntityKind::Wall | EntityKind::WallRun | EntityKind::ControlPoint => {
                     let owner = if record.kind() == EntityKind::ControlPoint { None } else { element_of(doc, dep) };
                     if let Some(e) = owner.filter(|e| !out.elements.contains(e)) {
                         out.elements.push(e);
@@ -447,39 +490,6 @@ pub fn workplane_contents(doc: &Document, id: EntityId) -> WorkplaneContents {
     // A wall both on and up to the deleted planes is simply deleted.
     out.topped_walls.retain(|w| element_of(doc, *w).is_none_or(|e| !out.elements.contains(&e)));
     out
-}
-
-/// Delete a workplane with its contents (see [`WorkplaneContents`]).
-/// The caller wraps this in one gesture.
-pub fn delete_workplane_cascade(doc: &mut Document, id: EntityId) -> Result<(), String> {
-    let contents = workplane_contents(doc, id);
-    for wall in &contents.topped_walls {
-        let h = vim_design_lib::wall::wall_top_height(doc, *wall).ok_or("a wall has no height")?;
-        ok(
-            doc,
-            Command::UpdateWall {
-                id: *wall,
-                base: None,
-                top: Some(None),
-                start: None,
-                end: None,
-                // A wall whose top was at or below its base keeps a
-                // valid (tiny) height the user can fix.
-                height_m: Some(h.max(MIN_UNWIRED_WALL_HEIGHT_M)),
-                top_offset_m: Some(0.0),
-                profile: None,
-                top_points: None,
-                coalesce: false,
-            },
-        )?;
-    }
-    for element in &contents.elements {
-        delete_element(doc, *element)?;
-    }
-    for plane in contents.workplanes.iter().rev() {
-        ok(doc, Command::DeleteWorkplane { id: *plane })?;
-    }
-    Ok(())
 }
 
 /// Append a window (hole wire from level-frame (u, v, w) points) to a
@@ -768,6 +778,7 @@ fn delete_command(kind: EntityKind, id: EntityId) -> Option<Command> {
         EntityKind::Chamfer => Command::DeleteChamfer { id },
         EntityKind::Sketch => Command::DeleteSketch { id },
         EntityKind::Wall => Command::DeleteWall { id },
+        EntityKind::WallRun => Command::DeleteWallRun { id },
         _ => return None, // levels, materials, elements, ...: never swept
     })
 }

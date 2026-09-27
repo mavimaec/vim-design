@@ -206,18 +206,19 @@ test("model tree: levels top first, grouped elements; a row selects and frames; 
   expect(t.levels.map((l) => l.name)).toEqual(["Level 2", "Ground"]);
   const ground = t.levels[1];
   expect(ground.active).toBe(true);
-  expect(ground.groups.map((g) => [g.key, g.items.length])).toEqual([["floors", 1], ["walls", 4]]);
+  expect(ground.groups.map((g) => [g.key, g.items.length])).toEqual([["floors", 1], ["walls", 1]]);
+  expect(ground.groups[1].items[0]).toMatchObject({ name: "Wall 1", kind: "wall", meta: "4 segments · h 2.70 m" });
   expect(ground.groups[0].items[0]).toMatchObject({ name: "Floor plate 1", kind: "floor_plate", editable: true });
   expect(t.levels[0].groups.every((g) => g.items.length === 0)).toBe(true);
 
   let body = await openTree(page);
   await expect(body.locator(".tree-row.level").first()).toContainText("Level 2");
   await expect(body.locator(".tree-row.level").nth(1)).toContainText("Ground");
-  await expect(body.locator(`[data-tree-item]`)).toHaveCount(5);
+  await expect(body.locator(`[data-tree-item]`)).toHaveCount(2);
   // Floors and walls carry a pencil (Edit Mode).
   const plate = ground.groups[0].items[0];
   await expect(body.locator(`[data-tree-item="${plate.id}"] .tree-edit`)).toHaveCount(1);
-  const wall = ground.groups[1].items[2];
+  const wall = ground.groups[1].items[0];
   await expect(body.locator(`[data-tree-item="${wall.id}"] .tree-edit`)).toHaveCount(1);
   await shot(page, "tree");
 
@@ -230,7 +231,7 @@ test("model tree: levels top first, grouped elements; a row selects and frames; 
   expect((await stats(page)).selection).toBe(wall.id);
   await expect(page.locator("#sheet-title")).toHaveText(wall.name);
   const w = (await walls(page)).find((x) => x.id === wall.id);
-  const mid = await worldToClient(page, (w.start[0] + w.end[0]) / 2, (w.start[1] + w.end[1]) / 2);
+  const mid = await worldToClient(page, (w.points[0][0] + w.points[1][0]) / 2, (w.points[0][1] + w.points[1][1]) / 2);
   const vp = page.viewportSize();
   expect(mid[0] > 0 && mid[0] < vp.width && mid[1] > 0 && mid[1] < vp.height, "the wall is framed").toBe(true);
   if (!mobile()) await expect(page.locator(`#tree-body [data-tree-item="${wall.id}"]`)).toHaveClass(/selected/);
@@ -258,7 +259,7 @@ test("model tree: levels top first, grouped elements; a row selects and frames; 
   await expect(body.locator(`[data-tree-level="${ground.id}"]`)).toBeVisible();
   await expect(body.locator("[data-tree-item]")).toHaveCount(0);
   await body.locator(`[data-tree-level="${ground.id}"] [data-twist]`).click();
-  await expect(body.locator("[data-tree-item]")).toHaveCount(5);
+  await expect(body.locator("[data-tree-item]")).toHaveCount(2);
 
   if (mobile()) {
     // Selecting a row closes the sheet and reveals the element.
@@ -361,7 +362,7 @@ test("workplanes: add in the tree, rename, nest, draw a ceiling on one; it follo
   const msg = await page.locator("#dialog-message").textContent();
   expect(msg).toContain("1 element drawn on it");
   expect(msg).toContain("1 nested workplane");
-  expect(msg).toContain("1 wall reaches up to it: it keeps its current height");
+  expect(msg).toContain("Walls that go up to it keep their current height (1 wall)");
   await page.locator("#dialog-ok").click();
   expect(await page.evaluate(() => JSON.parse(window.__author.app.workplanes_json()))).toHaveLength(0);
   expect((await elements(page)).filter((e) => e.kind === "floor_plate")).toHaveLength(0);
@@ -397,14 +398,13 @@ test("walls up to a plane: new walls and properties; the top level drags the hei
   expect(ws.effectiveHeight).toBeCloseTo(2.5, 9);
   await expect(page.locator("#hint")).toContainText("2.50 m high");
 
-  // New walls are up to Level 2 (their height follows it).
+  // A new run is up to Level 2 (its height follows it).
   await shape(page, "rect");
   await tapWorld(page, -3, -2);
   await tapWorld(page, 3, 2);
-  const made = await walls(page);
-  expect(made).toHaveLength(4);
-  for (const w of made) expect(w).toMatchObject({ mode: "upto", topPlane: level2.id, topOffset: -0.5, legacy: false });
-  for (const w of made) expect(w.height).toBeCloseTo(2.5, 9);
+  const [room] = await walls(page);
+  expect(room).toMatchObject({ run: true, mode: "upto", topPlane: level2.id, topOffset: -0.5, legacy: false, segments: 4 });
+  expect(room.height).toBeCloseTo(2.5, 9);
   await shot(page, "wall-height-mode");
 
   // A top plane below the base is refused.
@@ -413,51 +413,51 @@ test("walls up to a plane: new walls and properties; the top level drags the hei
   expect(ws.effectiveHeight).toBeNull();
   await page.locator('#wall-mode-toggle button[data-wall-mode="fixed"]').click();
 
-  // A window in the bottom wall (the Window tool: Openings mode).
-  const bottom = made.find((w) => w.start[1] === -2 && w.end[1] === -2);
+  // A window in the bottom segment (the Window tool: Openings mode).
   await page.locator('.tool[data-tool="window"]').click();
   await tapWorld(page, 0, -1.92);
   await page.locator("#edit-confirm").click();
-  expect(voidsOf(await wallById(page, bottom.id))).toHaveLength(1);
+  const runOpenings = () => page.evaluate(() => JSON.parse(window.__author.app.openings_json()));
+  expect(await runOpenings()).toHaveLength(1);
 
-  // Drag Level 2 up: the walls re-mesh (their top follows), the window
+  // Drag Level 2 up: the run re-meshes (its top follows), the window
   // keeps its sill.
   let s = await setLevelElevation(page, "Level 2", 3.5);
-  expect(s.lastMeshUpserts, "walls with a top constraint re-mesh").toBe(4);
-  let w = await wallById(page, bottom.id);
+  expect(s.lastMeshUpserts, "a run with a top constraint re-meshes").toBe(1);
+  let w = await wallById(page, room.id);
   expect(w.height).toBeCloseTo(3.0, 9);
-  const sill = Math.min(...voidsOf(w)[0].outline.map((p) => p[1]));
-  expect(sill).toBeCloseTo(0.9, 9);
+  expect((await runOpenings())[0].sill).toBeCloseTo(0.9, 9);
   expect(w.bbox[1][2]).toBeCloseTo(3.0, 4);
 
   // Properties: Up to Level 2, offset 0.2 -> 3.7 m; one undo restores it.
   await tool(page, "select");
   await tapWorld(page, 0, -1.92);
-  expect((await stats(page)).selection).toBe(bottom.id);
+  expect((await stats(page)).selection).toBe(room.id);
   await expect(page.locator('#prop-wall-mode button[data-wall-mode="upto"]')).toHaveClass(/on/);
   await expect(page.locator("#prop-height")).toBeHidden();
   await expect(page.locator("#prop-wall-top")).toHaveValue(String(level2.id));
   await page.locator("#prop-wall-offset").fill("0.2");
   await page.locator("#prop-wall-offset").press("Enter");
-  expect((await wallById(page, bottom.id)).height).toBeCloseTo(3.7, 9);
+  expect((await wallById(page, room.id)).height).toBeCloseTo(3.7, 9);
   await expect(page.locator("#prop-wall-effective")).toHaveText("3.70 m");
   await shot(page, "wall-height-props");
   await page.locator("#undo").click();
-  expect((await wallById(page, bottom.id)).height).toBeCloseTo(3.0, 9);
+  expect((await wallById(page, room.id)).height).toBeCloseTo(3.0, 9);
 
-  // Fixed: the wall keeps its height and no longer follows Level 2.
+  // Fixed: the run keeps its height and no longer follows Level 2; a
+  // drag of its base level is then transform-only.
   await page.locator('#prop-wall-mode button[data-wall-mode="fixed"]').click();
-  w = await wallById(page, bottom.id);
+  w = await wallById(page, room.id);
   expect(w).toMatchObject({ mode: "fixed", topPlane: null });
   expect(w.height).toBeCloseTo(3.0, 9);
   await expect(page.locator("#prop-height")).toBeVisible();
   await page.locator("#sheet-close").click();
   s = await setLevelElevation(page, "Level 2", 3);
-  expect((await wallById(page, bottom.id)).height).toBeCloseTo(3.0, 9);
-  expect(s.lastMeshUpserts, "only the three walls still up to Level 2").toBe(3);
-  // A base drag with a fixed wall present: that wall moves by transform.
+  expect((await wallById(page, room.id)).height).toBeCloseTo(3.0, 9);
+  expect(s.lastMeshUpserts, "nothing follows Level 2 any more").toBe(0);
   s = await setLevelElevation(page, "Ground", 0.5);
-  expect(s.lastMeshUpserts, "the up-to walls re-mesh, the fixed one does not").toBe(3);
+  expect(s.lastMeshUpserts, "a base-only run moves by transform").toBe(0);
+  expect(s.lastBaseTransforms).toBe(1);
   expect((await stats(page)).errors).toEqual([]);
   expect(errors).toEqual([]);
 });
@@ -478,7 +478,9 @@ test("legacy walls (v2 fixture): shown and selectable; the pencil converts them 
   const bytes = await savedBytes(page);
 
   // The pencil converts the level's legacy walls inside the session and
-  // edits their run: the room is one closed run of four walls.
+  // edits their run: the room becomes ONE closed wall run of four
+  // segments, with its two windows in place.
+  const runOpenings = () => page.evaluate(() => JSON.parse(window.__author.app.openings_json()));
   await tool(page, "select");
   await tapWorld(page, 4, 0.1);
   expect((await stats(page)).selection).toBe(w1.id);
@@ -486,35 +488,49 @@ test("legacy walls (v2 fixture): shown and selectable; the pencil converts them 
   await page.locator("#prop-edit").click();
   let es = await editState(page);
   expect(es).toMatchObject({ active: true, target: "run" });
-  expect(es.run).toMatchObject({ walls: 4, closed: true, thickness: 0.2 });
+  expect(es.run).toMatchObject({ segments: 4, closed: true, thickness: 0.2, openings: 2 });
   expect(es.canUndo, "the conversion is not an edit to step back over").toBe(false);
   let w = await wallById(page, w1.id);
-  expect([w.legacy, w.name, w.levelId]).toEqual([false, "Wall 1", w1.levelId]);
+  expect([w.run, w.legacy, w.name, w.levelId]).toEqual([true, false, "Wall 1", w1.levelId]);
+  expect(await walls(page)).toHaveLength(1);
   expect(w.height).toBeCloseTo(2.7, 9);
-  expect(w.length).toBeCloseTo(7.8, 9);
-  const [win] = voidsOf(w);
-  expect(win.depth).toBe(null);
-  expect(sortedOutline(win.outline)).toEqual(sortedOutline([[2, 0.9], [3.2, 0.9], [3.2, 1.9], [2, 1.9]]));
+  let os = await runOpenings();
+  expect(os).toHaveLength(2);
+  for (const o of os) {
+    expect([o.kind, o.depth]).toEqual(["window", null]);
+    for (const [k, v] of [["width", 1.2], ["height", 1.0], ["sill", 0.9]]) expect(o[k]).toBeCloseTo(v, 9);
+  }
+  // Wall 1's window was 2.0 m from its trimmed start (0.2, 0): 2.2 m from
+  // the corner.
+  const seg0 = w.points.findIndex(([x, y]) => x === 0 && y === 0);
+  expect(os.find((o) => o.segment === seg0).offset).toBeCloseTo(2.2, 9);
   // ✗: back to the legacy walls, byte for byte.
   await page.locator("#edit-cancel").click();
   expect(await savedBytes(page)).toBe(bytes);
-  expect((await wallById(page, w1.id)).legacy).toBe(true);
+  expect((await walls(page)).every((x) => x.legacy)).toBe(true);
 
-  // ✓: the converted walls stay; undo steps back over the conversion.
+  // ✓: the run stays; undo steps back over the conversion (two steps:
+  // legacy walls to walls, walls to one run).
   await tapWorld(page, 4, 0.1);
   await page.locator("#prop-edit").click();
   await page.locator("#edit-confirm").click();
-  expect((await walls(page)).every((x) => !x.legacy)).toBe(true);
+  expect(await walls(page)).toHaveLength(1);
   expect((await stats(page)).errors).toEqual([]);
+  await page.locator("#undo").click();
   await page.locator("#undo").click();
   expect(await savedBytes(page)).toBe(bytes);
 
-  // Openings mode converts a legacy wall when an opening goes into it.
+  // Openings mode converts a legacy wall (its whole room) when an opening
+  // goes into it.
+  // (Beside Wall 2's window, which spans y 2.2 .. 3.4.)
   await page.locator('.tool[data-tool="window"]').click();
-  await tapWorld(page, 7.9, 3);
-
-  expect((await wallById(page, ws[1].id)).legacy).toBe(false);
-  expect(voidsOf(await wallById(page, ws[1].id))).toHaveLength(2);
+  await page.evaluate(() => {
+    window.__author.app.set_camera_json('{"tx":4,"ty":3,"halfH":10}');
+    window.__author.refresh();
+  });
+  await tapWorld(page, 7.9, 4.8);
+  expect(await walls(page)).toHaveLength(1);
+  expect(await runOpenings()).toHaveLength(3);
   await page.locator("#edit-cancel").click();
   await page.locator("#dialog-ok").click();
   expect(await savedBytes(page)).toBe(bytes);

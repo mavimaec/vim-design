@@ -212,56 +212,58 @@ Hole tool opens the tapped plate with the Void tool armed. Edit Mode is modal:
   solid face with its thickness, each hole → through void; the old construction chain
   is deleted) inside the Edit Mode session, so ✗ undoes the conversion too.
 
-**Walls** are the library's `Wall` entity (§10). The drawn line is one face of the wall;
-the thickness grows to the left of the drawing direction (to the right with "flip
-side": the stored reference line is then reversed, since a `Wall` always has its
-material on the left). A closed loop is normalized counter-clockwise first, so an
-unflipped loop grows inward. Butt joins at corners: at a convex corner (turning toward
-the thickness side) the next segment's start is trimmed by the thickness; at a reflex
-corner the previous segment's end is extended by it. Each segment becomes one `Wall` on
-the active plane with the default profile (a rectangle whose top corners are anchored to
-the top), owned by one element.
+**One history.** Every change is one step of one linear undo history, in or out of an
+Edit Mode, with one Undo / Redo control in the same place in every mode (toasts carry
+no Undo). An Edit Mode is a span of that history: inside it Undo stops at the entry;
+✓ keeps its steps as they are; ✗ undoes back to the entry and drops them.
 
-**Wall height.** The wall tool bar and the wall properties offer **Fixed** (a height) or
-**Up to** a plane (any level or workplane, plus an offset): the wall's top slot is wired
-to that plane, so the height follows it — drag the level above and the walls re-mesh to
-it, while their windows keep their sill height. A top that would not clear the base (or
-the wall's openings) is refused. Switching back to Fixed keeps the current height. Walls
-with a top plane are evaluated in world space; walls with only a base plane move by
-transform only when their level is dragged.
+**View.** Fit (always shown, also in Edit Modes) frames the element being edited, else
+the selection, else the model, in the part of the canvas the panels leave free; the
+camera stays near the model. The View menu switches Shaded / Shaded + wireframe /
+Wireframe (the triangle edges) and shows the focus's triangle count. Two fingers pan
+or zoom — classified once, then locked until a finger lifts; in 3D a clearly dominant
+twist orbits.
 
-**Wall Edit Mode.** The pencil on a wall opens its elevation (orthographic, facing the
-wall: `u` along it from its start, `v` up from its base) with the same Edit Mode as floor
-plates (§9 operations through `wall::ops`, one `UpdateWall` per edit, ✓ one undo step,
-✗ byte-identical), plus two quick tools: **Window** (1.2 × 1.2 m at a 0.9 m sill) and
-**Door** (0.9 × 2.1 m, reaching 5 cm below the base so it cuts the bottom edge) —
-preset voids placed where tapped, then edited like any face. A void with a depth under
-the thickness is a niche. **Anchor Bottom | Top** re-anchors the selected points: a
-top-anchored point (square handle) follows the wall height, a bottom-anchored one
-(round) keeps its height above the base. A point inserted on the top edge follows the
-top, so a gable is: hold on the top edge, drag the new point up. The Window tool in the
-main dock (with its Window | Door choice) opens the tapped wall's Edit Mode with the
-preset armed, and comes back after ✓ for the next wall. The properties list a wall's
-openings (window / door / niche) with delete.
+**Walls are wall runs** (§11). The Wall tool draws one `WallRun` per run — open, or
+closed by tapping the first point — as one element; the drawn line is one face of the
+walls and the thickness grows to its left (a closed loop is made counter-clockwise, so
+it grows inward; "flip side" reverses the run). The library miters the joins at any
+angle (beveled past 4 thicknesses); the preview shows the same footprint. The height is
+**Fixed**, or **Up to** a plane (a level or a workplane, plus an offset): the run's top
+follows it, and deleting that plane disconnects the run at its current height. A
+base-only run moves by transform only when its level is dragged.
 
-**Legacy walls** (extrusion + window hole wires, from before the `Wall` entity) still
-display, select, and delete; their height and thickness stay editable. The pencil — or
-the Window tool — converts one in place inside the Edit Mode session (same element,
-name, and level; its base line becomes the reference line, its level the base, a fixed
-height, the profile a solid face of its thickness with the top corners anchored, each
-window a through void; the old construction chain is deleted), so ✗ undoes the
-conversion too.
+**Wall Edit Mode** (the pencil) edits the run in plan on its base plane: Points | Edges
+selection, drag to move (snapped, validated by `wall_run::validate`), hold on a segment
+to insert a point, Delete (a point merges its segments; an edge merges its points into
+the first), Extend from an end, Closed / Open, and the run's thickness, side, and height
+mode. Each edit is one `wall_run::ops` call and one `UpdateWallRun`.
 
-**Attachment.** Sketches and walls live on their construction plane, in the space of its
-root level, so a level elevation edit moves everything on it (and on its workplanes) as
-a transform only — except walls whose top follows another plane, which re-mesh.
+**Openings mode** (the Window tool, with its Window | Door choice): tap any wall, in plan
+or 3D, to place the preset (window 1.2 × 1.2 m at a 0.9 m sill; door 0.9 × 2.1 m, cut
+through the bottom edge) centred on the tap along that segment; tap an opening to
+select it; drag it along the segment (a window also up and down) on a 0.1 m grid,
+inside the segment's clear span (clear of the corner joins); set its width, height,
+sill, and Through or niche depth; Delete. "Wall" faces the segment worked on. Each
+change is one structured-opening operation and one `UpdateWallRun`.
+
+**Earlier walls** convert when worked on (the pencil, or an opening placed in them),
+inside the session so ✗ undoes it: legacy extrusion walls on the level become `Wall`s,
+then the connected chain of `Wall`s (end to end, or butt joined) becomes ONE run —
+corner to corner, on the first wall's height mode, its rectangular voids openings in
+place (`wall_run::from_walls`); a wall of another height keeps its shape as its
+segment's profile. They still display, select, and delete before that.
+
+**Attachment.** Sketches and wall runs live on their construction plane, in the space
+of its root level, so a level elevation edit moves everything on it (and on its
+workplanes) as a transform only — except runs whose top follows another plane, which
+re-mesh.
 
 **Known limitations.**
-- Butt joins are exact only at 90°; at other angles the corner blocks overlap or leave
-  a sliver. Joins are computed when a run is drawn: separately drawn runs are not
-  joined, and a later thickness edit does not re-trim neighbours.
-- Walls are not re-joined after edits: moving or re-heightening one does not re-trim its
-  neighbours, and a gable does not trim the walls it meets.
+- Separately drawn runs are not joined to each other (a run's own joins are exact).
+- Custom elevation profiles of a run's segments (gables) are kept but not yet editable
+  in the app; converting a wall chain drops no shape, but a changed profile is not
+  re-fitted to new joins.
 
 ## 9. Edit Mode data model: the `Sketch` entity
 

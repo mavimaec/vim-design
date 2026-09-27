@@ -9,6 +9,9 @@
 //!   (a horizontal profile), and whose path is a vertical line attached
 //!   to the same level. Its holes are the face's hole wires (same
 //!   rules). Thickness = the path's `w` extent.
+//! - **Wall run** = an `Element` whose first member is a library
+//!   `WallRun` (a whole chain of wall segments, mitered joins): what the
+//!   wall tool draws.
 //! - **Wall** = an `Element` whose first member is a library `Wall`
 //!   entity (a reference line on a construction plane plus an elevation
 //!   profile, `vim_design_lib::wall`).
@@ -160,6 +163,12 @@ impl WallModel {
         [(self.end[0] - self.start[0]) / l, (self.end[1] - self.start[1]) / l]
     }
 
+    /// The point `u` along the reference line from its start.
+    pub fn to_level_uv(&self, u: f64) -> P2 {
+        let d = self.dir();
+        [self.start[0] + d[0] * u, self.start[1] + d[1] * u]
+    }
+
     /// Unit vector into the material: the left of start -> end.
     pub fn normal(&self) -> P2 {
         // `+ 0.0` turns a negative zero into zero.
@@ -190,11 +199,58 @@ impl WallModel {
     }
 }
 
+/// A wall run (the library's `WallRun`, the current wall tool).
+#[derive(Debug, Clone, PartialEq)]
+pub struct WallRunModel {
+    pub element: EntityId,
+    pub name: String,
+    /// Association (data): the element's level slot.
+    pub level: EntityId,
+    /// The `WallRun` entity.
+    pub run: EntityId,
+    pub base: EntityId,
+    pub top: Option<EntityId>,
+    pub data: vim_design_lib::wall_run::WallRunData,
+    /// Top reference height H above the base (`wall_run::run_top_height`).
+    pub top_height: f64,
+}
+
+impl WallRunModel {
+    /// Total length of the reference line (m).
+    pub fn length(&self) -> f64 {
+        self.data.segments().iter().filter_map(|s| self.data.segment_length(*s)).sum()
+    }
+
+    /// Each segment's reference line.
+    pub fn lines(&self) -> Vec<WallLine> {
+        (0..self.data.segment_count())
+            .filter_map(|i| {
+                let (start, end) = self.data.segment_ends(i)?;
+                let l = super::geom::dist(start, end).max(1e-12);
+                let d = [(end[0] - start[0]) / l, (end[1] - start[1]) / l];
+                Some(WallLine {
+                    element: self.element,
+                    segment: Some(self.data.points[i].id),
+                    plane: self.base,
+                    start,
+                    end,
+                    base_w: 0.0,
+                    height: self.top_height,
+                    thickness: self.data.thickness_m,
+                    normal: super::walls::left(d).map(|c| c + 0.0),
+                })
+            })
+            .collect()
+    }
+}
+
 /// What the app needs of any wall to face it, pick it, and snap to it:
 /// its reference line on a plane, height, thickness side.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct WallLine {
     pub element: EntityId,
+    /// A wall run's segment (by its start point id).
+    pub segment: Option<u32>,
     /// The construction plane the reference line lies on.
     pub plane: EntityId,
     pub start: P2,
@@ -242,6 +298,7 @@ pub struct OtherModel {
 pub enum ElementModel {
     Plate(PlateModel),
     SketchPlate(SketchPlateModel),
+    Run(WallRunModel),
     Wall(WallModel),
     LegacyWall(LegacyWallModel),
     Other(OtherModel),
@@ -252,6 +309,7 @@ impl ElementModel {
         match self {
             ElementModel::Plate(p) => p.element,
             ElementModel::SketchPlate(p) => p.element,
+            ElementModel::Run(r) => r.element,
             ElementModel::Wall(w) => w.element,
             ElementModel::LegacyWall(w) => w.element,
             ElementModel::Other(o) => o.element,
@@ -262,6 +320,7 @@ impl ElementModel {
         match self {
             ElementModel::Plate(p) => &p.name,
             ElementModel::SketchPlate(p) => &p.name,
+            ElementModel::Run(r) => &r.name,
             ElementModel::Wall(w) => &w.name,
             ElementModel::LegacyWall(w) => &w.name,
             ElementModel::Other(o) => &o.name,
@@ -272,6 +331,7 @@ impl ElementModel {
         match self {
             ElementModel::Plate(p) => Some(p.level),
             ElementModel::SketchPlate(p) => Some(p.level),
+            ElementModel::Run(r) => Some(r.level),
             ElementModel::Wall(w) => Some(w.level),
             ElementModel::LegacyWall(w) => Some(w.level),
             ElementModel::Other(o) => o.level,
@@ -281,16 +341,30 @@ impl ElementModel {
     pub fn kind_name(&self) -> &'static str {
         match self {
             ElementModel::Plate(_) | ElementModel::SketchPlate(_) => "floor_plate",
-            ElementModel::Wall(_) | ElementModel::LegacyWall(_) => "wall",
+            ElementModel::Run(_) | ElementModel::Wall(_) | ElementModel::LegacyWall(_) => "wall",
             ElementModel::Other(_) => "element",
         }
     }
 
-    /// The wall's reference line and extent (walls only).
+    /// A wall's reference lines (one per run segment).
+    pub fn wall_lines(&self) -> Vec<WallLine> {
+        match self {
+            ElementModel::Run(r) => r.lines(),
+            _ => self.wall_line().into_iter().collect(),
+        }
+    }
+
+    pub fn is_wall(&self) -> bool {
+        matches!(self, ElementModel::Run(_) | ElementModel::Wall(_) | ElementModel::LegacyWall(_))
+    }
+
+    /// A single-segment wall's reference line and extent (`Wall` and
+    /// legacy walls; a run has [`ElementModel::wall_lines`]).
     pub fn wall_line(&self) -> Option<WallLine> {
         match self {
             ElementModel::Wall(w) => Some(WallLine {
                 element: w.element,
+                segment: None,
                 plane: w.base,
                 start: w.start,
                 end: w.end,
@@ -301,6 +375,7 @@ impl ElementModel {
             }),
             ElementModel::LegacyWall(w) => Some(WallLine {
                 element: w.element,
+                segment: None,
                 plane: w.plane_level,
                 start: w.start,
                 end: w.end,
@@ -599,6 +674,21 @@ fn derive_sketch_plate(
     })
 }
 
+fn derive_run(doc: &Document, element: EntityId, name: &str, level: EntityId) -> Option<WallRunModel> {
+    let run = first_input(doc, element, slot::ELEMENT_MEMBERS)?;
+    let data = vim_design_lib::wall_run::WallRunData::from_params(&doc.entity(run)?.params)?;
+    Some(WallRunModel {
+        element,
+        name: name.to_owned(),
+        level,
+        run,
+        base: first_input(doc, run, slot::WALL_RUN_BASE)?,
+        top: first_input(doc, run, slot::WALL_RUN_TOP),
+        top_height: vim_design_lib::wall_run::run_top_height(doc, run).unwrap_or(data.height_m),
+        data,
+    })
+}
+
 fn derive_wall(doc: &Document, element: EntityId, name: &str, level: EntityId) -> Option<WallModel> {
     let wall = first_input(doc, element, slot::ELEMENT_MEMBERS)?;
     let Params::Wall { start, end, height_m, top_offset_m, profile, top_points } = &doc.entity(wall)?.params
@@ -641,6 +731,7 @@ pub fn derive(doc: &Document) -> Vec<ElementModel> {
                     derive_plate(doc, *id, name, l)
                         .map(ElementModel::Plate)
                         .or_else(|| derive_sketch_plate(doc, *id, name, l).map(ElementModel::SketchPlate))
+                        .or_else(|| derive_run(doc, *id, name, l).map(ElementModel::Run))
                         .or_else(|| derive_wall(doc, *id, name, l).map(ElementModel::Wall))
                         .or_else(|| derive_legacy_wall(doc, *id, name, l).map(ElementModel::LegacyWall))
                 });
@@ -1010,7 +1101,7 @@ mod tests {
         // turns the topped wall fixed at its current height.
         assert_eq!(doc.submit(Command::DeleteWorkplane { id: ceiling }).err(), Some(vim_design_lib::VimStatus::HasDependents));
         let depth = doc.undo_depth();
-        ops::delete_workplane_cascade(&mut doc, ceiling).expect("cascade");
+        doc.submit(Command::DeleteWorkplaneCascade { id: ceiling }).expect("cascade");
         assert!(ops::workplanes(&doc).is_empty());
         let model = derive(&doc);
         assert_eq!(model.len(), 1);
@@ -1022,69 +1113,130 @@ mod tests {
         assert_eq!(derive(&doc).len(), 3);
     }
 
+    /// Mesh volume (m³) of each element mesh the engine produced.
+    fn volumes(doc: &mut Document) -> Vec<(EntityId, f64, usize)> {
+        use vim_design_lib::eval::Engine;
+        let mut engine = Engine::new();
+        engine.evaluate_pending(doc);
+        let up = engine.poll_updates(doc);
+        assert!(up.errors.is_empty(), "{:?}", up.errors);
+        up.meshes
+            .iter()
+            .map(|m| {
+                let p = &m.mesh.positions;
+                let v: f64 = m
+                    .mesh
+                    .indices
+                    .chunks(3)
+                    .map(|t| {
+                        let [a, b, c] = [p[t[0] as usize], p[t[1] as usize], p[t[2] as usize]].map(|q| q.map(f64::from));
+                        (a[0] * (b[1] * c[2] - b[2] * c[1]) - a[1] * (b[0] * c[2] - b[2] * c[0]) + a[2] * (b[0] * c[1] - b[1] * c[0])) / 6.0
+                    })
+                    .sum();
+                (m.id, v.abs(), m.mesh.triangle_count())
+            })
+            .collect()
+    }
+
+    fn runs_of(doc: &Document) -> Vec<WallRunModel> {
+        derive(doc).into_iter().filter_map(|e| if let ElementModel::Run(r) = e { Some(r) } else { None }).collect()
+    }
+
     #[test]
-    fn runs_are_recovered_from_their_walls_and_rewritten() {
+    fn drawn_runs_are_one_wall_run_with_mitered_joins_at_any_angle() {
+        use crate::authoring::runs::footprint_area;
+        let mut doc = Document::new();
+        let ground = ops::seed_new_project(&mut doc).expect("seed");
+        let fixed = ops::WallHeight { height_m: 2.7, top: None, top_offset_m: 0.0 };
+        // Open, turning 60° then 135°; a closed pentagon (drawn clockwise).
+        let open = [[0.0, 0.0], [4.0, 0.0], [6.0, 3.464_101_615_137_754], [3.0, 5.0]];
+        let e1 = ops::commit_run(&mut doc, ground, ground, &open, false, false, 0.2, fixed).expect("open run");
+        let pentagon: Vec<[f64; 2]> =
+            (0..5).map(|k| { let a = -(k as f64) * std::f64::consts::TAU / 5.0; [10.0 + 3.0 * a.cos(), 3.0 * a.sin()] }).collect();
+        let e2 = ops::commit_run(&mut doc, ground, ground, &pentagon, true, false, 0.25, fixed).expect("pentagon");
+        let runs = runs_of(&doc);
+        assert_eq!(runs.len(), 2);
+        let (r1, r2) = (&runs[0], &runs[1]);
+        assert_eq!((r1.element, r1.name.as_str(), r1.data.segment_count(), r1.data.closed), (e1, "Wall 1", 3, false));
+        assert_eq!((r2.element, r2.name.as_str(), r2.data.segment_count(), r2.data.closed), (e2, "Wall 2", 5, true));
+        let pts: Vec<[f64; 2]> = r2.data.points.iter().map(|p| p.uv).collect();
+        assert!(signed_area(&pts) > 0.0, "a closed run is counter-clockwise: material inward");
+        // Volume = footprint × H: the app's mitered footprint is the
+        // library's.
+        for (id, v, _) in volumes(&mut doc) {
+            let r = runs.iter().find(|r| r.element == id).expect("run mesh");
+            assert!((v - footprint_area(&r.data) * 2.7).abs() < 1e-3, "{}: {v} vs {}", r.name, footprint_area(&r.data) * 2.7);
+        }
+        // Flip: the same line, material on the other side (outward).
+        let e3 = ops::commit_run(&mut doc, ground, ground, &[[0.0, 10.0], [4.0, 10.0], [4.0, 13.0], [0.0, 13.0]], true, true, 0.2, fixed)
+            .expect("flipped");
+        let r3 = runs_of(&doc).into_iter().find(|r| r.element == e3).expect("r3");
+        assert!((footprint_area(&r3.data) - (4.4 * 3.4 - 12.0)).abs() < 1e-9);
+        // A folding run is refused before anything is written.
+        let before = doc.entity_count();
+        assert!(ops::commit_run(&mut doc, ground, ground, &[[0.0, 0.0], [4.0, 0.0], [0.5, 0.1]], false, false, 0.2, fixed).is_err());
+        assert_eq!(doc.entity_count(), before);
+    }
+
+    #[test]
+    fn m4_wall_chains_convert_to_one_run_keeping_openings_in_place() {
         use crate::authoring::runs::chain_of;
         use crate::authoring::walls;
         let mut doc = Document::new();
         let ground = ops::seed_new_project(&mut doc).expect("seed");
         let fixed = ops::WallHeight { height_m: 2.7, top: None, top_offset_m: 0.0 };
-        // A room drawn clockwise (normalized CCW, grows inward) and a
-        // flipped open run of two segments at 60°.
-        let room = [[0.0, 0.0], [0.0, 3.0], [4.0, 3.0], [4.0, 0.0]];
+        // A butt-joined room of the M4 wall tool, a window in its bottom wall.
+        let room = [[0.0, 0.0], [4.0, 0.0], [4.0, 3.0], [0.0, 3.0]];
         let segs = walls::wall_segments(&room, true, 0.2, false).expect("room");
-        ops::commit_walls(&mut doc, ground, ground, &segs, fixed, 0.2).expect("room walls");
-        let run = [[10.0, 0.0], [14.0, 0.0], [16.0, 3.4641016151377544]];
-        let segs = walls::wall_segments(&run, false, 0.2, true).expect("run");
-        ops::commit_walls(&mut doc, ground, ground, &segs, fixed, 0.2).expect("run walls");
+        ops::commit_walls(&mut doc, ground, ground, &segs, fixed, 0.2).expect("walls");
         let ws = walls_of(&doc);
-        assert_eq!(ws.len(), 6);
+        let bottom = ws.iter().find(|w| w.start[1] == 0.0 && w.end[1] == 0.0).expect("bottom").clone();
+        let (profile, top) = vim_design_lib::wall::ops::add_face(
+            &bottom.profile,
+            &bottom.top_points,
+            2.7,
+            &[[1.0, 0.9], [2.0, 0.9], [2.0, 2.1], [1.0, 2.1]],
+            SketchFaceKind::Void { depth: None },
+        )
+        .expect("window");
+        doc.submit(vim_design_lib::Command::UpdateWall {
+            id: bottom.wall, base: None, top: None, start: None, end: None, height_m: None, top_offset_m: None,
+            profile: Some(profile), top_points: Some(top), coalesce: false,
+        })
+        .expect("window");
+        let ws = walls_of(&doc);
         let refs: Vec<&WallModel> = ws.iter().collect();
-        for w in &ws[..4] {
-            let c = chain_of(&refs, w.element).expect("room chain");
-            assert!(c.closed && !c.flip, "{c:?}");
-            assert_eq!(c.elements.len(), 4);
-            let mut pts = c.points.clone();
-            pts.sort_by(|a, b| a[0].total_cmp(&b[0]).then(a[1].total_cmp(&b[1])));
-            let near = |a: [f64; 2], b: [f64; 2]| (a[0] - b[0]).abs() < 1e-9 && (a[1] - b[1]).abs() < 1e-9;
-            assert!(pts.iter().zip([[0.0, 0.0], [0.0, 3.0], [4.0, 0.0], [4.0, 3.0]]).all(|(a, b)| near(*a, b)), "{pts:?}");
-            assert!(signed_area(&c.points) > 0.0, "counter-clockwise");
-        }
-        // An open run may come back in either direction: drawn flipped,
-        // or reversed and unflipped — the same walls.
-        let open = chain_of(&refs, ws[5].element).expect("open chain");
-        assert!(!open.closed);
-        let (mut order, mut expect) = (vec![ws[4].element, ws[5].element], run.to_vec());
-        if !open.flip {
-            order.reverse();
-            expect.reverse();
-        }
-        assert_eq!(open.elements, order);
-        for (a, b) in open.points.iter().zip(expect.iter()) {
-            assert!((a[0] - b[0]).abs() < 1e-9 && (a[1] - b[1]).abs() < 1e-9, "{:?}", open.points);
-        }
-
-        // Rewrite the room with a corner moved and a point inserted: the
-        // four walls are reused (in order), a fifth is created.
-        let room_chain = chain_of(&refs, ws[0].element).expect("room");
-        let existing: Vec<WallModel> =
-            room_chain.elements.iter().filter_map(|e| ws.iter().find(|w| w.element == *e).cloned()).collect();
-        let mut pts = room_chain.points.clone();
-        pts.insert(1, [(pts[0][0] + pts[1][0]) / 2.0, (pts[0][1] + pts[1][1]) / 2.0 - 1.0]);
-        let spec = ops::RunSpec { base: ground, level: ground, points: pts, closed: true, flip: false, thickness: 0.2, height: fixed };
-        let out = ops::rewrite_run(&mut doc, &existing, &spec).expect("rewrite");
-        assert_eq!(out.len(), 5);
-        assert_eq!(&out[..4], &room_chain.elements[..]);
-        let after = walls_of(&doc);
-        assert_eq!(after.len(), 7);
-        let refs: Vec<&WallModel> = after.iter().collect();
-        let c = chain_of(&refs, out[0]).expect("rewritten chain");
-        assert_eq!((c.elements.len(), c.closed), (5, true));
-        // Fewer points: the extra walls are deleted.
-        let spec = ops::RunSpec { points: room_chain.points[..3].to_vec(), ..spec };
-        let out = ops::rewrite_run(&mut doc, &after.iter().filter(|w| c.elements.contains(&w.element)).cloned().collect::<Vec<_>>(), &spec)
-            .expect("shrink");
-        assert_eq!(out.len(), 3);
-        assert_eq!(walls_of(&doc).len(), 5);
+        let chain = chain_of(&refs, bottom.element).expect("chain");
+        assert!(chain.closed && chain.elements.len() == 4);
+        // The window in plan before: 1.0 .. 2.0 along the bottom wall.
+        let win_start = bottom.to_level_uv(1.0);
+        let element = ops::convert_chain_to_run(&mut doc, &ws, bottom.element).expect("convert");
+        let runs = runs_of(&doc);
+        assert_eq!(runs.len(), 1);
+        assert!(walls_of(&doc).is_empty(), "the walls are gone");
+        let r = &runs[0];
+        assert!(r.data.closed && r.data.segment_count() == 4);
+        let mut corners: Vec<[f64; 2]> = r.data.points.iter().map(|p| p.uv).collect();
+        corners.sort_by(|a, b| a[0].total_cmp(&b[0]).then(a[1].total_cmp(&b[1])));
+        assert_eq!(corners, vec![[0.0, 0.0], [0.0, 3.0], [4.0, 0.0], [4.0, 3.0]], "corner to corner");
+        assert_eq!(r.data.openings.len(), 1);
+        let o = r.data.openings[0];
+        let i = r.data.segment_index(o.segment).expect("segment");
+        let (a, b) = r.data.segment_ends(i).expect("ends");
+        let d = [(b[0] - a[0]) / 4.0, (b[1] - a[1]) / 4.0];
+        let at = [a[0] + d[0] * o.offset_m, a[1] + d[1] * o.offset_m];
+        assert!((at[0] - win_start[0]).abs() < 1e-9 && (at[1] - win_start[1]).abs() < 1e-9, "the window stays in place: {at:?}");
+        assert!((o.sill_m - 0.9).abs() < 1e-9 && (o.width_m - 1.0).abs() < 1e-9);
+        assert_eq!(element, runs[0].element);
+        assert_eq!(volumes(&mut doc).len(), 1);
+        // A flipped open chain converts too (its walls are stored reversed).
+        let run = [[10.0, 0.0], [14.0, 0.0], [14.0, 3.0]];
+        let segs = walls::wall_segments(&run, false, 0.2, true).expect("run");
+        ops::commit_walls(&mut doc, ground, ground, &segs, fixed, 0.2).expect("walls");
+        let ws = walls_of(&doc);
+        let e = ops::convert_chain_to_run(&mut doc, &ws, ws[1].element).expect("convert flipped");
+        let r = runs_of(&doc).into_iter().find(|r| r.element == e).expect("run");
+        assert_eq!((r.data.segment_count(), r.data.closed), (2, false));
+        assert_eq!(volumes(&mut doc).len(), 2);
     }
 }

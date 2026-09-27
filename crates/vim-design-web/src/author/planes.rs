@@ -135,22 +135,20 @@ impl AuthorApp {
         }
     }
 
-    /// Confirmed cascade delete: the workplane, its nested workplanes,
-    /// and the elements on them; walls that only reach up to them keep
-    /// their current height — ONE undo step.
+    /// Confirmed cascade delete (the library's `DeleteWorkplaneCascade`):
+    /// the workplane, its nested workplanes, and what stands on them;
+    /// walls that only go up to them are disconnected and keep their
+    /// current height — ONE undo step.
     pub fn delete_workplane_cascade(&mut self, id: f64) -> bool {
         let depth = self.doc.undo_depth();
-        match ops::delete_workplane_cascade(&mut self.doc, eid(id)) {
-            Ok(()) => {
+        match self.doc.submit(Command::DeleteWorkplaneCascade { id: eid(id) }) {
+            Ok(_) => {
                 self.gestures.one_shot(depth);
                 self.sync("delete workplane (cascade)");
                 true
             }
-            Err(e) => {
-                ops::rollback_to(&mut self.doc, depth);
-                self.gestures.invalidate_redo();
-                web_sys::console::error_1(&JsValue::from_str(&format!("delete workplane: {e}")));
-                self.sync("delete workplane (failed)");
+            Err(status) => {
+                web_sys::console::error_1(&JsValue::from_str(&format!("DeleteWorkplaneCascade rejected: {status:?}")));
                 false
             }
         }

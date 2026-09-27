@@ -651,21 +651,7 @@ test("touch: press-drag-release placement, two fingers never place", async ({ pa
 
 const walls = async (page) => (await elements(page)).filter((e) => e.kind === "wall");
 
-/** Tap a wall-local point (u along the wall, v up) in the elevation view. */
-async function tapWall(page, wallId, u, v) {
-  const w = await page.evaluate(([id, u, v]) => window.__author.wallToWorld(id, u, v), [wallId, u, v]);
-  expect(w, `wall ${wallId} exists`).toBeTruthy();
-  await tapWorld(page, w[0], w[1], w[2]);
-}
-
-/** The wall's body stays inside the axis-aligned box (x0, y0, x1, y1). */
-function wallInside(w, [x0, y0, x1, y1]) {
-  const t = w.thickness;
-  const pts = [w.start, w.end].flatMap((p) => [p, [p[0] + w.normal[0] * t, p[1] + w.normal[1] * t]]);
-  return pts.every(([x, y]) => x >= x0 - 1e-9 && x <= x1 + 1e-9 && y >= y0 - 1e-9 && y <= y1 + 1e-9);
-}
-
-test("walls: a closed loop traced on a plate grows inward; open run joins; one undo per run", async ({ page }) => {
+test("walls: a closed loop traced on a plate is ONE wall run growing inward (mitered corners); an open run; one undo per run", async ({ page }) => {
   const errors = await openApp(page);
   await drawPlate(page, [-3, -2], [3, 2]);
 
@@ -676,42 +662,36 @@ test("walls: a closed loop traced on a plate grows inward; open run joins; one u
     await tapWorld(page, x, y);
   }
   const hud = await page.evaluate(() => window.__author.hud());
-  expect(hud.bands.length, "the preview shows the wall footprints").toBeGreaterThan(0);
+  expect(hud.bands.length, "the preview shows the wall footprint").toBeGreaterThan(0);
   const near = await worldToClient(page, -2.2, -1.4);
   if (!mobile()) await page.mouse.move(near[0], near[1]);
   await shot(page, "wall-drawing");
   await tapWorld(page, -2.98, -2.02); // first point: closes the loop
   let ws = await walls(page);
-  expect(ws).toHaveLength(4);
-  expect(ws.map((w) => w.name)).toEqual(["Wall 1", "Wall 2", "Wall 3", "Wall 4"]);
-  for (const w of ws) {
-    expect(w.height).toBeCloseTo(2.7, 9);
-    expect(w.thickness).toBeCloseTo(0.2, 9);
-    expect(wallInside(w, [-3, -2, 3, 2]), `${w.name} inside the plate`).toBe(true);
-  }
-  const bottom = ws.find((w) => w.start[1] === -2 && w.end[1] === -2);
-  expect(bottom.normal).toEqual([0, 1]);
-  // Butt joins: every corner of a CCW loop is convex -> trims, no overlap.
-  const band = ws.reduce((a, w) => a + w.length * w.thickness, 0);
-  expect(band).toBeCloseTo(6 * 4 - 5.6 * 3.6, 6);
+  expect(ws).toHaveLength(1);
+  const [room] = ws;
+  expect(room).toMatchObject({ name: "Wall 1", run: true, closed: true, segments: 4 });
+  expect(room.height).toBeCloseTo(2.7, 9);
+  expect(room.thickness).toBeCloseTo(0.2, 9);
+  // Inward on the plate edge, mitered: the band inside the outline.
+  expect(room.footprintArea).toBeCloseTo(6 * 4 - 5.6 * 3.6, 6);
+  expect(room.volume).toBeCloseTo(room.footprintArea * 2.7, 3);
+  expect(room.points.every(([x, y]) => Math.abs(Math.abs(x) - 3) < 1e-9 && Math.abs(Math.abs(y) - 2) < 1e-9)).toBe(true);
 
   // One undo removes the whole run; redo restores it.
   await page.locator("#undo").click();
   expect(await walls(page)).toHaveLength(0);
   expect(await plates(page)).toHaveLength(1);
   await page.locator("#redo").click();
-  expect(await walls(page)).toHaveLength(4);
+  expect(await walls(page)).toHaveLength(1);
 
-  // An open run (Finish): the convex corner trims the next wall's start.
+  // An open run (Finish): its points as drawn, the corner mitered.
   for (const [x, y] of [[-4, 3], [0, 3], [0, 4.5]]) await tapWorld(page, x, y);
   await page.locator("#finish-draw").click();
   ws = await walls(page);
-  expect(ws).toHaveLength(6);
-  const [w5, w6] = ws.slice(4);
-  expect([w5.start, w5.end]).toEqual([[-4, 3], [0, 3]]);
-  expect(w6.start[0]).toBeCloseTo(0, 9);
-  expect(w6.start[1]).toBeCloseTo(3.2, 9);
-  expect(w6.length).toBeCloseTo(1.3, 9);
+  expect(ws).toHaveLength(2);
+  expect(ws[1]).toMatchObject({ name: "Wall 2", closed: false, segments: 2, points: [[-4, 3], [0, 3], [0, 4.5]] });
+  expect(ws[1].footprintArea).toBeCloseTo(4 * 0.2 + 1.3 * 0.2, 6);
   await tool(page, "select");
   await shot(page, "walls");
   expect((await stats(page)).errors).toEqual([]);
@@ -727,28 +707,26 @@ test("wall properties: height and thickness edits with undo, flip side, delete",
   await shape(page, "rect");
   await tapWorld(page, -2, -1.5);
   await tapWorld(page, 2, 1.5);
-  let ws = await walls(page);
-  expect(ws).toHaveLength(4);
-  expect(ws.every((w) => !wallInside(w, [-2, -1.5, 2, 1.5]))).toBe(true);
+  let [room] = await walls(page);
+  expect(room.footprintArea).toBeCloseTo(4.4 * 3.4 - 12, 6);
   await page.locator("#undo").click();
   await page.locator("#flip-toggle").click();
   expect((await stats(page)).wall.flip).toBe(false);
   await tapWorld(page, -2, -1.5);
   await tapWorld(page, 2, 1.5);
-  ws = await walls(page);
-  expect(ws.every((w) => wallInside(w, [-2, -1.5, 2, 1.5]))).toBe(true);
+  [room] = await walls(page);
+  expect(room.footprintArea).toBeCloseTo(12 - 3.6 * 2.6, 6);
 
-  // Select the bottom wall by tapping its thin band in plan.
+  // Select the run by tapping its thin band in plan.
   await tool(page, "select");
-  const bottom = ws.find((w) => w.start[1] === -1.5 && w.end[1] === -1.5);
   await tapWorld(page, 0, -1.42);
-  expect((await stats(page)).selection).toBe(bottom.id);
-  await expect(page.locator("#sheet-title")).toHaveText(bottom.name);
+  expect((await stats(page)).selection).toBe(room.id);
+  await expect(page.locator("#sheet-title")).toHaveText(room.name);
   await expect(page.locator("#prop-height")).toHaveValue("2.70");
-  await expect(page.locator("#prop-length")).toHaveText("3.80 m");
+  await expect(page.locator("#prop-length")).toHaveText("14.00 m");
   await shot(page, "wall-properties");
 
-  const byId = async () => (await walls(page)).find((w) => w.id === bottom.id);
+  const byId = async () => (await walls(page)).find((w) => w.id === room.id);
   await page.locator("#prop-height").fill("3.1");
   await page.locator("#prop-height").press("Enter");
   expect((await byId()).height).toBeCloseTo(3.1, 9);
@@ -758,19 +736,20 @@ test("wall properties: height and thickness edits with undo, flip side, delete",
   await page.locator("#redo").click();
   expect((await byId()).height).toBeCloseTo(3.1, 9);
 
-  // Thickness moves only the extrusion end: face, length, normal unchanged.
+  // Thickness: the whole run, the line stays.
   await page.locator("#prop-wall-thickness").fill("0.3");
   await page.locator("#prop-wall-thickness").press("Enter");
   const thick = await byId();
   expect(thick.thickness).toBeCloseTo(0.3, 9);
-  expect([thick.start, thick.end, thick.normal]).toEqual([bottom.start, bottom.end, bottom.normal]);
+  expect(thick.points).toEqual(room.points);
+  expect(thick.footprintArea).toBeCloseTo(12 - 3.4 * 2.4, 6);
   await page.locator("#undo").click();
   expect((await byId()).thickness).toBeCloseTo(0.2, 9);
 
   await page.locator("#prop-delete").click();
-  expect(await walls(page)).toHaveLength(3);
+  expect(await walls(page)).toHaveLength(0);
   await page.locator("#undo").click();
-  expect(await walls(page)).toHaveLength(4);
+  expect(await walls(page)).toHaveLength(1);
   expect(errors).toEqual([]);
 });
 
@@ -781,10 +760,8 @@ test("openings: placed from the Window tool (Openings mode), kept by ✓, listed
   await shape(page, "rect");
   await tapWorld(page, -3, -2);
   await tapWorld(page, 3, 2);
-  let ws = await walls(page);
-  expect(ws).toHaveLength(4);
-  const bottom = ws.find((w) => w.start[1] === -2 && w.end[1] === -2);
-  const voidsOf = async () => (await walls(page)).find((w) => w.id === bottom.id).faces.filter((f) => f.kind === "void");
+  let [room] = await walls(page);
+  const runOpenings = () => page.evaluate(() => JSON.parse(window.__author.app.openings_json()));
 
   // The Window tool: Openings mode; a window, then a door, on the wall.
   await page.locator('.tool[data-tool="window"]').click();
@@ -793,27 +770,27 @@ test("openings: placed from the Window tool (Openings mode), kept by ✓, listed
   await tapWorld(page, 1.5, -1.9);
   await shot(page, "window-elevation");
   await page.locator("#edit-confirm").click();
-  let voids = await voidsOf();
-  expect(voids).toHaveLength(2);
-  expect(Math.min(...voids[1].outline.map((p) => p[1])), "a door crosses the bottom edge").toBeLessThan(0);
+  let os = await runOpenings();
+  expect(os.map((o) => o.kind)).toEqual(["window", "door"]);
+  expect(os[0].segment, "both on the bottom segment").toBe(os[1].segment);
 
   // Height stays above the highest opening (the door, 2.1 m + 0.05 m).
   await tool(page, "select");
   await tapWorld(page, 0, -1.9);
-  expect((await stats(page)).selection).toBe(bottom.id);
+  expect((await stats(page)).selection).toBe(room.id);
   await expect(page.locator("#prop-window-count")).toHaveText("2");
   await page.locator("#prop-height").fill("1.0");
   await page.locator("#prop-height").press("Enter");
-  const lowered = (await walls(page)).find((w) => w.id === bottom.id);
+  const lowered = (await walls(page))[0];
   expect(lowered.minHeight).toBeCloseTo(2.15, 9);
   expect(lowered.height).toBeCloseTo(2.15, 9);
   await page.locator("#undo").click();
 
   // Delete an opening from the properties; undo restores it.
   await page.locator('[data-testid="delete-opening"]').first().click();
-  expect(await voidsOf()).toHaveLength(1);
+  expect(await runOpenings()).toHaveLength(1);
   await page.locator("#undo").click();
-  expect(await voidsOf()).toHaveLength(2);
+  expect(await runOpenings()).toHaveLength(2);
   await page.locator("#sheet-close").click();
 
   // Walls and openings survive a reload.
@@ -821,11 +798,10 @@ test("openings: placed from the Window tool (Openings mode), kept by ✓, listed
   await page.evaluate(() => window.__author.saveNow());
   await page.reload();
   await page.waitForFunction(() => window.__author?.ready === true, null, { timeout: 90_000 });
-  ws = await walls(page);
-  expect(ws).toHaveLength(4);
-  expect(ws.find((w) => w.name === bottom.name).faces.filter((f) => f.kind === "void")).toHaveLength(2);
+  expect(await walls(page)).toHaveLength(1);
+  expect(await runOpenings()).toHaveLength(2);
 
-  // Level elevation edit (walls without a top constraint): transform-only.
+  // Level elevation edit (a run without a top constraint): transform-only.
   await page.locator("#menu-btn").click();
   await page.locator('[data-testid="menu-levels"]').click();
   const levels = await page.evaluate(() => window.__author.levels());
@@ -833,7 +809,7 @@ test("openings: placed from the Window tool (Openings mode), kept by ✓, listed
   await page.locator(`.level-row[data-id="${ground.id}"] .lvl-elev`).fill("0.5");
   let s = await stats(page);
   expect(s.lastMeshUpserts, "no mesh re-upload").toBe(0);
-  expect(s.lastBaseTransforms, "plate + 4 walls re-placed").toBe(5);
+  expect(s.lastBaseTransforms, "the plate and the run re-placed").toBe(2);
   await page.locator(`.level-row[data-id="${ground.id}"] .lvl-elev`).fill("0");
   await page.locator("#sheet-close").click();
   s = await stats(page);

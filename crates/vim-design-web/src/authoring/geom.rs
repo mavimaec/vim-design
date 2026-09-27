@@ -35,6 +35,8 @@ pub enum Invalid {
     TooFewWallPoints,
     /// Wall tool: a segment is shorter than its corner joins need.
     WallTooShort,
+    /// Wall tool: the wall folds back on itself or its parts overlap.
+    WallOverlaps,
 }
 
 impl Invalid {
@@ -48,6 +50,7 @@ impl Invalid {
             Invalid::HoleOverlapsHole => "Holes must not touch or overlap",
             Invalid::TooFewWallPoints => "Place at least 2 points",
             Invalid::WallTooShort => "A wall segment is too short for the wall thickness",
+            Invalid::WallOverlaps => "The wall would fold back or overlap itself",
         }
     }
 
@@ -61,6 +64,7 @@ impl Invalid {
             Invalid::HoleOverlapsHole => "hole_overlaps_hole",
             Invalid::TooFewWallPoints => "too_few_wall_points",
             Invalid::WallTooShort => "wall_too_short",
+            Invalid::WallOverlaps => "wall_overlaps",
         }
     }
 }

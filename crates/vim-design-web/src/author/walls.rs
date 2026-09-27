@@ -18,7 +18,7 @@ use super::camera::ViewMode;
 use super::{
     AuthorApp, MAX_WALL_HEIGHT_M, MAX_WALL_THICKNESS_M, MIN_WALL_HEIGHT_M, MIN_WALL_THICKNESS_M, eid,
 };
-use crate::authoring::model::{LegacyWallModel, WallModel};
+use crate::authoring::model::{LegacyWallModel, WallModel, WallRunModel};
 use crate::authoring::ops::{self, WallHeight};
 use crate::authoring::walls::WINDOW_MARGIN_M;
 
@@ -94,6 +94,9 @@ impl AuthorApp {
     /// [`AuthorApp::end_gesture`]. Returns the new height, or -1 when
     /// refused (the top would not clear the openings or the base).
     pub fn set_wall_top(&mut self, id: f64, plane: f64, offset: f64) -> f64 {
+        if let Some(r) = self.run_model(eid(id)).cloned() {
+            return self.set_run_top(&r, plane, offset);
+        }
         let Some(wall) = self.wall(eid(id)).cloned() else { return -1.0 };
         let top = (plane >= 0.0).then(|| eid(plane));
         let offset = if offset.is_finite() { offset.clamp(-MAX_WALL_HEIGHT_M, MAX_WALL_HEIGHT_M) } else { 0.0 };
@@ -126,14 +129,13 @@ impl AuthorApp {
     /// Returns the element id or -1.
     pub fn pick_wall(&self, px: f32, py: f32, tol_px: f32) -> f64 {
         let hit = self.pick(px, py);
-        if hit >= 0.0 && self.wall_line(eid(hit)).is_some() {
+        if hit >= 0.0 && self.is_wall(eid(hit)) {
             return hit;
         }
         let (w, h) = self.size_f();
         let plan = self.camera.mode == ViewMode::Plan;
         let mut best: Option<(f32, EntityId)> = None;
-        for e in &self.model {
-            let Some(wall) = e.wall_line() else { continue };
+        for (e, wall) in self.model.iter().flat_map(|e| e.wall_lines().into_iter().map(move |w| (e, w))) {
             if plan && e.level() != self.active_level {
                 continue;
             }
@@ -161,6 +163,18 @@ impl AuthorApp {
     pub fn set_wall_height(&mut self, id: f64, height: f64) {
         let id = eid(id);
         if !height.is_finite() {
+            return;
+        }
+        if let Some(r) = self.run_model(id).cloned() {
+            let h = height.clamp(self.run_min_height(&r), MAX_WALL_HEIGHT_M);
+            let coalesce = self.gestures.begin_continuing(&self.doc, &format!("wall_height_{}", id.0));
+            self.submit(run_update(r.run, coalesce, |top, _offset, height_m, _t| {
+                *height_m = Some(h);
+                if r.top.is_some() {
+                    *top = Some(None);
+                }
+            }));
+            self.sync("wall height");
             return;
         }
         if let Some(wall) = self.wall(id).cloned() {
@@ -202,6 +216,18 @@ impl AuthorApp {
             return;
         }
         let t = thickness.clamp(MIN_WALL_THICKNESS_M, MAX_WALL_THICKNESS_M);
+        if let Some(r) = self.run_model(id).cloned() {
+            let mut data = r.data.clone();
+            data.thickness_m = t;
+            if let Err(e) = vim_design_lib::wall_run::validate(&data) {
+                self.notice = Some(crate::authoring::runs::run_error(e).message().to_owned());
+                return;
+            }
+            let coalesce = self.gestures.begin_continuing(&self.doc, &format!("wall_thickness_{}", id.0));
+            self.submit(run_update(r.run, coalesce, |_top, _offset, _height, th| *th = Some(t)));
+            self.sync("wall thickness");
+            return;
+        }
         let coalesce = self.gestures.begin_continuing(&self.doc, &format!("wall_thickness_{}", id.0));
         if let Some(wall) = self.wall(id).cloned() {
             let mut profile = wall.profile.clone();
@@ -233,9 +259,17 @@ impl AuthorApp {
         self.delete_hole(wall, wire)
     }
 
-    /// Remove an opening (a void face) from a wall's profile — one undo
-    /// step.
+    /// Remove an opening — one undo step: a wall run's opening (by id),
+    /// or a void face of a `Wall`'s profile.
     pub fn delete_opening(&mut self, wall: f64, face: f64) -> bool {
+        if let Some(r) = self.run_model(eid(wall)).cloned() {
+            let Ok(data) = vim_design_lib::wall_run::ops::delete_opening(&r.data, face as u32) else { return false };
+            let depth = self.doc.undo_depth();
+            self.submit(ops::update_run(r.run, &data, false));
+            self.gestures.one_shot(depth);
+            self.sync("delete opening");
+            return true;
+        }
         let Some(w) = self.wall(eid(wall)).cloned() else { return false };
         let face = face as u32;
         if !w.profile.faces.iter().any(|f| f.id == face && matches!(f.kind, SketchFaceKind::Void { .. })) {
@@ -259,7 +293,73 @@ impl AuthorApp {
     }
 }
 
+/// An `UpdateWallRun` changing only the height fields and the thickness
+/// set by `f(top, top_offset, height, thickness)`.
+fn run_update(
+    id: EntityId,
+    coalesce: bool,
+    f: impl FnOnce(&mut Option<Option<EntityId>>, &mut Option<f64>, &mut Option<f64>, &mut Option<f64>),
+) -> Command {
+    let (mut top, mut offset, mut height, mut thickness) = (None, None, None, None);
+    f(&mut top, &mut offset, &mut height, &mut thickness);
+    Command::UpdateWallRun {
+        id,
+        base: None,
+        top,
+        points: None,
+        closed: None,
+        thickness_m: thickness,
+        height_m: height,
+        top_offset_m: offset,
+        openings: None,
+        profiles: None,
+        coalesce,
+    }
+}
+
 impl AuthorApp {
+    /// A wall run's height mode (see [`AuthorApp::set_wall_top`]).
+    fn set_run_top(&mut self, r: &WallRunModel, plane: f64, offset: f64) -> f64 {
+        let top = (plane >= 0.0).then(|| eid(plane));
+        let offset = if offset.is_finite() { offset.clamp(-MAX_WALL_HEIGHT_M, MAX_WALL_HEIGHT_M) } else { 0.0 };
+        let height = match top {
+            Some(t) if self.root_level(t).is_none() => return -1.0,
+            Some(t) => self.plane_elevation(t) + offset - self.plane_elevation(r.base),
+            None => r.top_height,
+        };
+        if height < self.run_min_height(r) - 1e-9 {
+            return -1.0;
+        }
+        let coalesce = self.gestures.begin_continuing(&self.doc, &format!("wall_top_{}", r.run.0));
+        self.submit(run_update(r.run, coalesce, |t, o, h, _| {
+            *t = Some(top);
+            match top {
+                Some(_) => {
+                    *o = Some(offset);
+                    // The fixed height is the fallback if the top goes.
+                    *h = Some(height.clamp(MIN_WALL_HEIGHT_M, MAX_WALL_HEIGHT_M));
+                }
+                None => *h = Some(height.clamp(MIN_WALL_HEIGHT_M, MAX_WALL_HEIGHT_M)),
+            }
+        }));
+        self.sync("wall top");
+        height
+    }
+
+    /// Lowest top reference a wall run may take: above its openings by
+    /// the window margin.
+    pub(super) fn run_min_height(&self, r: &WallRunModel) -> f64 {
+        r.data
+            .openings
+            .iter()
+            .map(|o| match o.kind {
+                vim_design_lib::wall_run::OpeningKind::Door => o.height_m,
+                vim_design_lib::wall_run::OpeningKind::Window => o.sill_m + o.height_m,
+            })
+            .fold(MIN_WALL_HEIGHT_M - WINDOW_MARGIN_M, f64::max)
+            + WINDOW_MARGIN_M
+    }
+
     /// Planes a wall top can reach: every construction plane (levels and
     /// workplanes), highest first, with its path and elevation.
     fn top_plane_candidates(&self) -> Vec<serde_json::Value> {

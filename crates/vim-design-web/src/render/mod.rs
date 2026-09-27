@@ -115,9 +115,20 @@ fn vs_wire(
     @location(2) c: vec3<f32>,
 ) -> VsOut {
     var out: VsOut = transform(p, n, c);
-    // Pull the wireframe slightly toward the camera so it wins the depth
-    // test against the triangles it outlines.
-    out.pos.z = out.pos.z - 8e-4 * out.pos.w;
+    // The wireframe must win the depth test against the triangles it
+    // outlines without showing through the faces in front of it: pull it
+    // toward the eye by a fraction of its distance, like feature edges.
+    // A constant clip-z bias maps to metres at viewing distance in a
+    // perspective projection. Without a nudge anchor, fall back to it.
+    if (globals.eye.w > 0.0) {
+        let world = (model.m * vec4<f32>(p, 1.0)).xyz;
+        let eye = globals.eye.xyz;
+        let pulled = eye + (world - eye) * (1.0 - globals.eye.w);
+        out.pos = globals.view_proj * vec4<f32>(pulled, 1.0);
+        out.pos.z = out.pos.z + model.params.x * out.pos.w;
+    } else {
+        out.pos.z = out.pos.z - 8e-4 * out.pos.w;
+    }
     return out;
 }
 
