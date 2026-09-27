@@ -19,6 +19,14 @@ struct PickMesh {
     max: Vec3,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct MeshStats {
+    pub triangles: usize,
+    pub top_area: f64,
+    pub volume: f64,
+    pub bbox: [[f32; 3]; 2],
+}
+
 #[derive(Default)]
 pub struct PickScene {
     meshes: HashMap<EntityId, PickMesh>,
@@ -83,6 +91,43 @@ impl PickScene {
         if placed.is_empty() { vec![base] } else { placed }
     }
 
+    /// Measures of an owner's drawn mesh (its first placement): triangle
+    /// count, area of its top (upward faces at its highest level),
+    /// enclosed volume, and world AABB.
+    pub fn owner_stats(&self, id: EntityId) -> Option<MeshStats> {
+        let mesh = self.meshes.get(&id)?;
+        let world = *self.placements(id, mesh.base).first()?;
+        let pts: Vec<Vec3> = mesh.positions.iter().map(|p| world.transform_point3(*p)).collect();
+        let top = pts.iter().map(|p| p.z).fold(f32::NEG_INFINITY, f32::max);
+        let (mut area, mut volume, mut triangles) = (0.0f64, 0.0f64, 0usize);
+        let (mut min, mut max) = (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY));
+        for p in &pts {
+            min = min.min(*p);
+            max = max.max(*p);
+        }
+        for tri in mesh.indices.as_chunks::<3>().0 {
+            let (Some(a), Some(b), Some(c)) =
+                (pts.get(tri[0] as usize), pts.get(tri[1] as usize), pts.get(tri[2] as usize))
+            else {
+                continue;
+            };
+            triangles += 1;
+            let n = (*b - *a).cross(*c - *a);
+            volume += f64::from(a.dot(b.cross(*c))) / 6.0;
+            let len = n.length();
+            let at_top = [a, b, c].iter().all(|p| (p.z - top).abs() < 1e-4);
+            if len > 0.0 && at_top && (n.z / len).abs() > 0.999 {
+                area += f64::from(len) / 2.0;
+            }
+        }
+        Some(MeshStats {
+            triangles,
+            top_area: area,
+            volume: volume.abs(),
+            bbox: [min.to_array(), max.to_array()],
+        })
+    }
+
     /// Every owner the ray hits, nearest hit per owner, sorted by world
     /// distance (the caller breaks ties, e.g. wall over plate).
     pub fn pick_all(&self, origin: Vec3, dir: Vec3) -> Vec<(EntityId, f32)> {
@@ -96,7 +141,7 @@ impl PickScene {
                 if !ray_hits_aabb(o, d, mesh.min, mesh.max) {
                     continue;
                 }
-                for tri in mesh.indices.chunks_exact(3) {
+                for tri in mesh.indices.as_chunks::<3>().0 {
                     let (Some(a), Some(b), Some(c)) = (
                         mesh.positions.get(tri[0] as usize),
                         mesh.positions.get(tri[1] as usize),

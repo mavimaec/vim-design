@@ -13,7 +13,12 @@
 use vim_design_lib::entity::slot;
 use vim_design_lib::{Command, Document, EntityId, EntityKind, Params, VimStatus};
 
+use vim_design_lib::sketch::{Sketch, SketchDirection};
+
+use super::edit::FaceKind;
+use super::edit::profile::sketch_from_faces;
 use super::geom::{P2, normalized_ccw};
+use super::model::PlateModel;
 use super::walls::WallSeg;
 
 /// Site defaults: downtown Montreal. The default lives in the app, not
@@ -403,6 +408,107 @@ pub fn delete_element(doc: &mut Document, element: EntityId) -> Result<(), Strin
         }
     }
     ok(doc, Command::DeleteElement { id: element, sweep_orphans: true }).map(|_| ())
+}
+
+/// Create a floor plate from a sketch: the sketch hangs below `level`
+/// and one element (associated with `level`) owns it. Returns
+/// (element, sketch).
+pub fn create_sketch_element(
+    doc: &mut Document,
+    level: EntityId,
+    sketch: &Sketch,
+    name: &str,
+) -> Result<(EntityId, EntityId), String> {
+    let sketch_id = one(
+        doc,
+        Command::CreateSketch { plane: level, sketch: sketch.clone(), direction: SketchDirection::Below },
+    )?;
+    let element = one(
+        doc,
+        Command::CreateElement { name: name.to_owned(), members: vec![sketch_id], level },
+    )?;
+    Ok((element, sketch_id))
+}
+
+fn delete_command(kind: EntityKind, id: EntityId) -> Option<Command> {
+    Some(match kind {
+        EntityKind::ControlPoint => Command::DeleteControlPoint { id },
+        EntityKind::Line => Command::DeleteLine { id },
+        EntityKind::Circle => Command::DeleteCircle { id },
+        EntityKind::Spline => Command::DeleteSpline { id },
+        EntityKind::Edge => Command::DeleteEdge { id },
+        EntityKind::Wire => Command::DeleteWire { id },
+        EntityKind::Face => Command::DeleteFace { id },
+        EntityKind::Solid => Command::DeleteSolid { id },
+        EntityKind::Extrusion => Command::DeleteExtrusion { id },
+        EntityKind::Revolve => Command::DeleteRevolve { id },
+        EntityKind::Chamfer => Command::DeleteChamfer { id },
+        EntityKind::Sketch => Command::DeleteSketch { id },
+        _ => return None, // levels, materials, elements, ...: never swept
+    })
+}
+
+/// Delete `root` and then every construction entity of its input
+/// closure that nothing else uses any more (leaf-first by repetition).
+pub fn delete_construction_closure(doc: &mut Document, root: EntityId) -> Result<(), String> {
+    let mut closure = std::collections::BTreeSet::new();
+    let mut stack = vec![root];
+    while let Some(id) = stack.pop() {
+        let Some(record) = doc.entity(id) else { continue };
+        if delete_command(record.kind(), id).is_none() || !closure.insert(id) {
+            continue;
+        }
+        stack.extend(record.referenced());
+    }
+    loop {
+        let mut progress = false;
+        for id in closure.iter().rev() {
+            let Some(kind) = doc.entity(*id).map(|e| e.kind()) else { continue };
+            if !doc.dependents(*id).map_err(|s| format!("{s:?}"))?.is_empty() {
+                continue;
+            }
+            if let Some(cmd) = delete_command(kind, *id) {
+                ok(doc, cmd)?;
+                progress = true;
+            }
+        }
+        if !progress {
+            break;
+        }
+    }
+    if doc.entity(root).is_some() {
+        return Err("the old geometry is still in use".to_owned());
+    }
+    Ok(())
+}
+
+/// Convert a legacy (extrusion) floor plate into a sketch plate in
+/// place: the same element, name, and level; the outline becomes a solid
+/// face with the plate's thickness and every hole a through void; the
+/// old construction chain is deleted. Returns the sketch id.
+pub fn convert_legacy_plate(doc: &mut Document, plate: &PlateModel) -> Result<EntityId, String> {
+    if plate.top_w.abs() > 1e-9 || !plate.downward {
+        return Err("this plate is not a plain floor plate".to_owned());
+    }
+    let mut faces = vec![(plate.outline.clone(), FaceKind::Solid { thickness: plate.thickness })];
+    faces.extend(
+        plate
+            .holes
+            .iter()
+            .filter(|h| h.outline.len() >= 3)
+            .map(|h| (h.outline.clone(), FaceKind::Void { depth: None })),
+    );
+    let sketch = sketch_from_faces(&faces).map_err(|e| e.message().to_owned())?;
+    let sketch_id = one(
+        doc,
+        Command::CreateSketch { plane: plate.plane_level, sketch, direction: SketchDirection::Below },
+    )?;
+    ok(
+        doc,
+        Command::UpdateElement { id: plate.element, name: None, members: Some(vec![sketch_id]), coalesce: false },
+    )?;
+    delete_construction_closure(doc, plate.extrusion)?;
+    Ok(sketch_id)
 }
 
 /// Next free "Floor plate N" name, derived from the document (never a

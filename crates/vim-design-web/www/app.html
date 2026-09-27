@@ -45,6 +45,96 @@
     </button>
   </header>
 
+  <header id="edit-bar" hidden aria-label="Edit Mode">
+    <button id="edit-cancel" class="edit-btn cancel" type="button" title="Cancel editing — discard changes" aria-label="Cancel editing">
+      <svg class="ico" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg>
+    </button>
+    <div class="edit-title">
+      <span class="edit-caption">Editing</span>
+      <span id="edit-name" class="edit-name"></span>
+    </div>
+    <div class="seg dark" id="edit-view-toggle" role="tablist" aria-label="View">
+      <button type="button" data-view="plan" role="tab">Plan</button>
+      <button type="button" data-view="3d" role="tab">3D</button>
+    </div>
+    <button id="edit-undo" class="icon-btn on-dark" type="button" title="Undo (Ctrl+Z)" aria-label="Undo">
+      <svg class="ico" viewBox="0 0 24 24"><path d="M9 14L4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 010 11H11"/></svg>
+    </button>
+    <button id="edit-redo" class="icon-btn on-dark" type="button" title="Redo (Ctrl+Shift+Z)" aria-label="Redo">
+      <svg class="ico" viewBox="0 0 24 24"><path d="M15 14l5-5-5-5"/><path d="M20 9H9.5a5.5 5.5 0 000 11H13"/></svg>
+    </button>
+    <button id="edit-confirm" class="edit-btn confirm" type="button" title="Done — keep changes (Enter)" aria-label="Done editing">
+      <svg class="ico" viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>
+    </button>
+  </header>
+
+  <nav id="edit-dock" hidden aria-label="Edit tools">
+    <div class="dock-group" role="tablist" aria-label="Select">
+      <button class="tool" type="button" data-edit-mode="points" title="Select points (1)">
+        <svg class="ico" viewBox="0 0 24 24"><path d="M5 17L9 6l10 4" class="thin"/><circle cx="5" cy="17" r="2.4" class="fill"/><circle cx="9" cy="6" r="2.4" class="fill"/><circle cx="19" cy="10" r="2.4" class="fill"/></svg>
+        <span>Points</span>
+      </button>
+      <button class="tool" type="button" data-edit-mode="edges" title="Select edges (2)">
+        <svg class="ico" viewBox="0 0 24 24"><path d="M4 18L10 5l10 5"/><path d="M10 5l10 5" stroke-width="3.2"/></svg>
+        <span>Edges</span>
+      </button>
+      <button class="tool" type="button" data-edit-mode="faces" title="Select faces (3)">
+        <svg class="ico" viewBox="0 0 24 24"><path d="M4 18L9 5l11 4-3 10z" class="fill-soft"/></svg>
+        <span>Faces</span>
+      </button>
+    </div>
+    <div class="tool-sep" aria-hidden="true"></div>
+    <button class="tool" type="button" data-edit-tool="solid" title="Draw a solid face">
+      <svg class="ico" viewBox="0 0 24 24"><rect x="4.5" y="4.5" width="15" height="15" rx="1.5" class="fill-soft"/></svg>
+      <span>Solid</span>
+    </button>
+    <button class="tool" type="button" data-edit-tool="void" title="Draw a void face (a hole or an indentation)">
+      <svg class="ico" viewBox="0 0 24 24"><rect x="4.5" y="4.5" width="15" height="15" rx="1.5" stroke-dasharray="3 2.6"/></svg>
+      <span>Void</span>
+    </button>
+    <button class="tool" type="button" data-edit-tool="split" title="Split faces with a line">
+      <svg class="ico" viewBox="0 0 24 24"><rect x="4.5" y="4.5" width="15" height="15" rx="1.5"/><path d="M8 21L16 3"/></svg>
+      <span>Split</span>
+    </button>
+    <div class="tool-sep" aria-hidden="true"></div>
+    <button id="edit-delete" class="tool danger" type="button" title="Delete the selection (Delete)">
+      <svg class="ico" viewBox="0 0 24 24"><path d="M4 7h16M9 7V4.5h6V7M6.5 7l1 13h9l1-13"/></svg>
+      <span>Delete</span>
+    </button>
+  </nav>
+
+  <section id="edit-panel" hidden aria-label="Thickness">
+    <div class="edit-panel-head">
+      <span id="edit-panel-title">New faces</span>
+      <span id="edit-panel-note" class="edit-panel-note"></span>
+    </div>
+    <div class="edit-row" id="edit-solid-row">
+      <div class="edit-row-line">
+        <span class="edit-row-label"><i class="swatch solid"></i>Thickness</span>
+        <div class="stepper">
+          <button type="button" data-edit-step="thickness" data-step="-1" aria-label="Thinner">−</button>
+          <input id="edit-thickness" type="text" inputmode="decimal" aria-label="Thickness (m)" />
+          <span class="unit">m</span>
+          <button type="button" data-edit-step="thickness" data-step="1" aria-label="Thicker">+</button>
+        </div>
+      </div>
+      <input id="edit-thickness-slider" class="edit-slider" type="range" min="0.05" max="1.00" step="0.01" aria-label="Thickness" />
+    </div>
+    <div class="edit-row" id="edit-void-row">
+      <div class="edit-row-line">
+        <span class="edit-row-label"><i class="swatch void"></i>Depth</span>
+        <div class="stepper">
+          <button type="button" data-edit-step="depth" data-step="-1" aria-label="Shallower">−</button>
+          <input id="edit-depth" type="text" inputmode="decimal" aria-label="Void depth (m)" />
+          <span class="unit">m</span>
+          <button type="button" data-edit-step="depth" data-step="1" aria-label="Deeper">+</button>
+        </div>
+        <button id="edit-through" class="chip-toggle" type="button" aria-pressed="true" title="Cut all the way through">Through</button>
+      </div>
+      <input id="edit-depth-slider" class="edit-slider" type="range" min="0.02" max="1.00" step="0.01" aria-label="Depth" />
+    </div>
+  </section>
+
   <div id="level-popover" class="popover" hidden role="listbox" aria-label="Levels"></div>
 
   <nav id="toolbar" aria-label="Tools">

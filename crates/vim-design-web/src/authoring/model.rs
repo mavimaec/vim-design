@@ -15,10 +15,15 @@
 //!   across that plane (the thickness). The wall axis (`u`) is the
 //!   drawn direction, read from the profile's first edge along the base;
 //!   `v` is world up. Its windows are the face's hole wires.
+//! - **Sketch plate** = an `Element` whose first member is a `Sketch` on
+//!   a level hanging below it: the profile-edited floor plate (faces of
+//!   their own thickness, voids). The legacy extrusion plate above stays
+//!   recognized for documents from before sketches.
 //! - Anything else is listed as a generic element (name + level +
 //!   delete).
 
 use vim_design_lib::entity::slot;
+use vim_design_lib::sketch::{Sketch, SketchDirection};
 use vim_design_lib::{Document, EntityId, EntityKind, Params};
 
 use super::geom::{P2, signed_area};
@@ -117,6 +122,18 @@ impl WallModel {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct SketchPlateModel {
+    pub element: EntityId,
+    pub name: String,
+    /// Association (data): the element's level slot.
+    pub level: EntityId,
+    /// The sketch's construction plane (a level).
+    pub plane_level: EntityId,
+    pub sketch_entity: EntityId,
+    pub sketch: Sketch,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct OtherModel {
     pub element: EntityId,
     pub name: String,
@@ -126,6 +143,7 @@ pub struct OtherModel {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ElementModel {
     Plate(PlateModel),
+    SketchPlate(SketchPlateModel),
     Wall(WallModel),
     Other(OtherModel),
 }
@@ -134,6 +152,7 @@ impl ElementModel {
     pub fn element(&self) -> EntityId {
         match self {
             ElementModel::Plate(p) => p.element,
+            ElementModel::SketchPlate(p) => p.element,
             ElementModel::Wall(w) => w.element,
             ElementModel::Other(o) => o.element,
         }
@@ -142,6 +161,7 @@ impl ElementModel {
     pub fn name(&self) -> &str {
         match self {
             ElementModel::Plate(p) => &p.name,
+            ElementModel::SketchPlate(p) => &p.name,
             ElementModel::Wall(w) => &w.name,
             ElementModel::Other(o) => &o.name,
         }
@@ -150,6 +170,7 @@ impl ElementModel {
     pub fn level(&self) -> Option<EntityId> {
         match self {
             ElementModel::Plate(p) => Some(p.level),
+            ElementModel::SketchPlate(p) => Some(p.level),
             ElementModel::Wall(w) => Some(w.level),
             ElementModel::Other(o) => o.level,
         }
@@ -157,7 +178,7 @@ impl ElementModel {
 
     pub fn kind_name(&self) -> &'static str {
         match self {
-            ElementModel::Plate(_) => "floor_plate",
+            ElementModel::Plate(_) | ElementModel::SketchPlate(_) => "floor_plate",
             ElementModel::Wall(_) => "wall",
             ElementModel::Other(_) => "element",
         }
@@ -425,6 +446,36 @@ fn derive_wall(doc: &Document, element: EntityId, name: &str, level: EntityId) -
     })
 }
 
+fn derive_sketch_plate(
+    doc: &Document,
+    element: EntityId,
+    name: &str,
+    level: EntityId,
+) -> Option<SketchPlateModel> {
+    let sketch_entity = first_input(doc, element, slot::ELEMENT_MEMBERS)?;
+    let (sketch, direction) = sketch_params(doc, sketch_entity)?;
+    let plane_level = first_input(doc, sketch_entity, slot::SKETCH_PLANE)?;
+    if direction != SketchDirection::Below || kind_of(doc, plane_level)? != EntityKind::Level {
+        return None;
+    }
+    Some(SketchPlateModel {
+        element,
+        name: name.to_owned(),
+        level,
+        plane_level,
+        sketch_entity,
+        sketch,
+    })
+}
+
+/// A sketch entity's profile and direction.
+pub fn sketch_params(doc: &Document, id: EntityId) -> Option<(Sketch, SketchDirection)> {
+    match doc.entity(id).map(|e| &e.params) {
+        Some(Params::Sketch { sketch, direction }) => Some((sketch.clone(), *direction)),
+        _ => None,
+    }
+}
+
 /// Derive the element list from the document, ordered by element id
 /// (creation order).
 pub fn derive(doc: &Document) -> Vec<ElementModel> {
@@ -435,6 +486,7 @@ pub fn derive(doc: &Document) -> Vec<ElementModel> {
                 let recognized = level.and_then(|l| {
                     derive_plate(doc, *id, name, l)
                         .map(ElementModel::Plate)
+                        .or_else(|| derive_sketch_plate(doc, *id, name, l).map(ElementModel::SketchPlate))
                         .or_else(|| derive_wall(doc, *id, name, l).map(ElementModel::Wall))
                 });
                 Some(recognized.unwrap_or_else(|| {
@@ -598,5 +650,30 @@ mod tests {
         let before = doc.entity_count();
         ops::delete_hole(&mut doc, face, wire).expect("delete window");
         assert_eq!(doc.entity_count(), before - 13);
+    }
+
+    #[test]
+    fn legacy_plate_converts_to_a_sketch_in_place() {
+        use vim_design_lib::eval::Engine;
+        let mut doc = Document::new();
+        let ground = ops::seed_new_project(&mut doc).expect("seed");
+        let ids = ops::commit_plate(&mut doc, ground, &[[0.0, 0.0], [6.0, 0.0], [6.0, 4.0], [0.0, 4.0]], 0.3, "Floor plate 1")
+            .expect("plate");
+        ops::commit_hole(&mut doc, ground, ids.face, &[[1.0, 1.0], [2.0, 1.0], [2.0, 2.0], [1.0, 2.0]]).expect("hole");
+        let ElementModel::Plate(p) = derive(&doc)[0].clone() else { panic!("legacy plate") };
+        ops::convert_legacy_plate(&mut doc, &p).expect("convert");
+        let model = derive(&doc);
+        assert_eq!(model.len(), 1);
+        let ElementModel::SketchPlate(sp) = &model[0] else { panic!("sketch plate, got {model:?}") };
+        assert_eq!((sp.element, sp.name.as_str(), sp.level), (ids.element, "Floor plate 1", ground));
+        assert_eq!(sp.sketch.faces.len(), 2);
+        // Only site + 2 levels + element + instance + sketch remain.
+        assert_eq!(doc.entity_count(), 6, "the old construction chain is gone");
+        let mut engine = Engine::new();
+        engine.set_translation_factoring(true);
+        engine.evaluate_pending(&mut doc);
+        let up = engine.poll_updates(&doc);
+        assert!(up.errors.is_empty(), "{:?}", up.errors);
+        assert_eq!(up.meshes.len(), 1);
     }
 }

@@ -8,7 +8,8 @@
 // Tap targets are computed from WORLD coordinates via
 // window.__author.worldToClient, never hardcoded pixels. Model state is
 // read through the debug hooks (window.__author.*), which expose the
-// element list DERIVED from the document.
+// element list DERIVED from the document. Floor plates are authored in
+// Edit Mode: the Floor tool opens a new plate's profile, ✓ keeps it.
 
 import { test, expect } from "@playwright/test";
 import path from "node:path";
@@ -34,10 +35,10 @@ async function settleFrames(page) {
   );
 }
 
-async function openApp(page) {
+async function openApp(page, query = "") {
   const errors = [];
   page.on("pageerror", (e) => errors.push(String(e)));
-  await page.goto(APP_URL);
+  await page.goto(APP_URL + query);
   await page.waitForFunction(() => window.__author?.ready === true || window.__author?.error, null, {
     timeout: 90_000,
   });
@@ -91,6 +92,83 @@ async function drawPolygon(page, pts) {
 
 const sortedOutline = (o) => [...o].map(([x, y]) => [+x.toFixed(6), +y.toFixed(6)]).sort((a, b) => a[0] - b[0] || a[1] - b[1]);
 
+const FIXTURE = path.join(here, "..", "..", "crates", "vim-design-test", "fixtures", "authoring_project.vimd");
+
+async function cdpTouch(page) {
+  const cdp = await page.context().newCDPSession(page);
+  return (type, points) => cdp.send("Input.dispatchTouchEvent", {
+    type, touchPoints: points.map(([x, y], id) => ({ x, y, id })),
+  });
+}
+
+/** Press at world `a`, drag to world `b`, release (mouse or touch). */
+async function dragWorld(page, a, b, steps = 10) {
+  const pa = await worldToClient(page, ...a);
+  const pb = await worldToClient(page, ...b);
+  if (mobile()) {
+    const touch = await cdpTouch(page);
+    await touch("touchStart", [pa]);
+    for (let i = 1; i <= steps; i++) {
+      await touch("touchMove", [[pa[0] + ((pb[0] - pa[0]) * i) / steps, pa[1] + ((pb[1] - pa[1]) * i) / steps]]);
+    }
+    await touch("touchEnd", []);
+  } else {
+    await page.mouse.move(pa[0], pa[1]);
+    await page.mouse.down();
+    await page.mouse.move(pb[0], pb[1], { steps });
+    await page.mouse.up();
+  }
+}
+
+/** Press and hold at a world point. */
+async function longPressWorld(page, a, ms = 800) {
+  const p = await worldToClient(page, ...a);
+  if (mobile()) {
+    const touch = await cdpTouch(page);
+    await touch("touchStart", [p]);
+    await page.waitForTimeout(ms);
+    await touch("touchEnd", []);
+  } else {
+    await page.mouse.move(p[0], p[1]);
+    await page.mouse.down();
+    await page.waitForTimeout(ms);
+    await page.mouse.up();
+  }
+}
+
+const editState = (page) => page.evaluate(() => window.__author.editState());
+const profile = (page) => page.evaluate(() => window.__author.editProfile());
+const hasPoint = (prof, [u, v]) => prof.points.some((p) => Math.abs(p.uv[0] - u) < 1e-6 && Math.abs(p.uv[1] - v) < 1e-6);
+const solidOutline = (plate) => sortedOutline(plate.faces.find((f) => f.kind === "solid").outline);
+/** The document's saved bytes (for byte-identity checks). */
+const savedBytes = (page) => page.evaluate(() => Array.from(window.__author.app.save_document()).join(","));
+
+async function editTool(page, name) {
+  await page.locator(`[data-edit-tool="${name}"]`).click();
+  expect((await editState(page)).tool).toBe(name);
+}
+
+async function editMode(page, name) {
+  await page.locator(`[data-edit-mode="${name}"]`).click();
+  expect((await editState(page)).mode).toBe(name);
+}
+
+/** Floor tool: a new plate in Edit Mode; a rectangle; ✓. */
+async function drawPlate(page, a, b) {
+  await page.locator('.tool[data-tool="plate"]').click();
+  expect((await editState(page)).active).toBe(true);
+  await shape(page, "rect");
+  await tapWorld(page, ...a);
+  await tapWorld(page, ...b);
+  await page.locator("#edit-confirm").click();
+  expect((await editState(page)).active).toBe(false);
+}
+
+async function selectAt(page, x, y) {
+  await tool(page, "select");
+  await tapWorld(page, x, y);
+}
+
 test("loads settled: Montreal site, two levels, plan view, clean chrome", async ({ page }) => {
   const errors = await openApp(page);
   const s = await stats(page);
@@ -119,167 +197,300 @@ test("loads settled: Montreal site, two levels, plan view, clean chrome", async 
   expect(errors).toEqual([]);
 });
 
-test("draw plates with snapping, auto-targeted hole, validation, undo/redo", async ({ page }) => {
+
+test("floor plates in Edit Mode: rectangle + polygon with snapping, validation, ✓ one undo, ✗ leaves no trace", async ({ page }) => {
   const errors = await openApp(page);
   const step = await snapStep(page);
+  const bytes0 = await savedBytes(page);
 
-  // --- Rectangle plate: two opposite corners, slightly off-grid ---------
-  await tool(page, "plate");
+  // The Floor tool opens a NEW plate's profile with the Solid tool armed.
+  await page.locator('.tool[data-tool="plate"]').click();
+  let st = await editState(page);
+  expect([st.active, st.isNew, st.tool, st.name]).toEqual([true, true, "solid", "Floor plate 1"]);
+  await expect(page.locator("#edit-bar")).toBeVisible();
+  await expect(page.locator("#toolbar")).toBeHidden();
   await shape(page, "rect");
-  const gen0 = (await stats(page)).committed;
   await tapWorld(page, -3.93, -1.92);
   await tapWorld(page, -1.08, 2.07);
-  let ps = await plates(page);
-  expect(ps).toHaveLength(1);
-  expect(ps[0].name).toBe("Floor plate 1");
-  expect(sortedOutline(ps[0].outline)).toEqual(sortedOutline([
+  let prof = await profile(page);
+  expect(prof.faces).toHaveLength(1);
+  expect(sortedOutline(prof.faces[0].outline)).toEqual(sortedOutline([
     [snapTo(-3.93, step), snapTo(-1.92, step)], [snapTo(-1.08, step), snapTo(-1.92, step)],
     [snapTo(-1.08, step), snapTo(2.07, step)], [snapTo(-3.93, step), snapTo(2.07, step)],
   ]));
-  expect(ps[0].thickness).toBeCloseTo(0.3, 9);
-  expect((await stats(page)).committed).toBeGreaterThan(gen0);
+  expect((await stats(page)).elements, "the first face creates the plate").toBe(1);
 
-  // --- Polygon plate (L-shape), closed by tapping the first vertex -------
+  // A second, disjoint face in the same element: an L-shaped polygon,
+  // closed by tapping its first vertex.
   await shape(page, "polygon");
   const L = [[1.04, -1.97], [4.46, -2.03], [4.52, 0.98], [3.03, 1.04], [2.97, 3.02], [0.98, 2.96]];
   for (const [x, y] of L) await tapWorld(page, x, y);
-  // Mid-sketch screenshot: rubber band + snapped cursor.
   const hover = await worldToClient(page, 1.1, -1.2);
   if (!mobile()) await page.mouse.move(hover[0], hover[1]);
   await shot(page, "drawing");
-  await tapWorld(page, 1.02, -2.01); // first vertex: closes the loop
-  ps = await plates(page);
-  expect(ps).toHaveLength(2);
-  const lPlate = ps.find((p) => p.name === "Floor plate 2");
-  expect(sortedOutline(lPlate.outline)).toEqual(sortedOutline(L.map(([x, y]) => [snapTo(x, 0.5), snapTo(y, 0.5)])));
-  expect(lPlate.area).toBeCloseTo(3.5 * 3 + 2 * 2, 6);
+  await tapWorld(page, 1.02, -2.01);
+  prof = await profile(page);
+  expect(prof.faces).toHaveLength(2);
+  expect(sortedOutline(prof.faces[1].outline)).toEqual(sortedOutline(L.map(([x, y]) => [snapTo(x, 0.5), snapTo(y, 0.5)])));
 
-  // --- Hole: auto-targets the plate that contains it ---------------------
-  await tool(page, "hole");
-  await shape(page, "rect");
-  await tapWorld(page, 3.52, -1.46);
-  await tapWorld(page, 3.98, 0.47);
-  ps = await plates(page);
-  expect(ps.find((p) => p.name === "Floor plate 1").holes).toHaveLength(0);
-  const holed = ps.find((p) => p.name === "Floor plate 2");
-  expect(holed.holes).toHaveLength(1);
-  expect(holed.area).toBeCloseTo(14.5 - 0.5 * 2, 6);
-  await shot(page, "plates");
-
-  // --- Invalid hole (outside every plate): rejected, nothing changes ------
-  let gen = (await stats(page)).committed;
-  await tapWorld(page, -0.4, -0.5);
-  await tapWorld(page, 0.6, 0.5);
-  expect(await page.evaluate(() => window.__author.toasts.map((t) => t.msg))).toContain(
-    "A hole must lie inside a floor plate",
-  );
-  expect((await stats(page)).committed, "rejected hole never touched the document").toBe(gen);
-  // Hole overlapping the existing hole: rejected too.
-  await page.locator("#cancel-draw").click();
-  await tapWorld(page, 3.02, -1.02);
-  await tapWorld(page, 4.02, 0.02);
-  expect(await page.evaluate(() => window.__author.toasts.map((t) => t.msg))).toContain(
-    "Holes must not touch or overlap",
-  );
-  expect((await stats(page)).committed).toBe(gen);
-
-  // --- Self-intersecting outline: red preview, Finish disabled ------------
-  await page.locator("#cancel-draw").click(); // clear the pending corner
-  await page.locator("#cancel-draw").click(); // no points: back to Select
-  expect((await stats(page)).tool).toBe("select");
-  await tool(page, "plate");
-  await shape(page, "polygon");
+  // A self-crossing outline is refused live: red preview, no Finish.
   for (const [x, y] of [[-4, 3], [-1, 5], [-1, 3], [-4, 5]]) await tapWorld(page, x, y);
   const hud = await page.evaluate(() => window.__author.hud());
   expect(hud.canFinish).toBe(false);
   expect(hud.reason).toBe("The outline crosses itself");
   await expect(page.locator("#finish-draw")).toBeDisabled();
-  await expect(page.locator("#draw-reason")).toHaveText("The outline crosses itself");
-  await tapWorld(page, -4, 3); // tapping the first vertex tries to close
-  expect((await stats(page)).committed, "bowtie rejected").toBe(gen);
-  expect(await page.evaluate(() => window.__author.sketch().points.length)).toBe(4);
-  await page.locator("#undo-point").click();
-  expect(await page.evaluate(() => window.__author.sketch().points.length)).toBe(3);
   await page.locator("#cancel-draw").click();
-  await page.locator("#cancel-draw").click();
+  expect((await profile(page)).faces).toHaveLength(2);
 
-  // --- Undo/redo: one step per gesture ---------------------------------
-  await page.locator("#undo").click(); // the hole
-  expect((await plates(page)).find((p) => p.name === "Floor plate 2").holes).toHaveLength(0);
-  await page.locator("#undo").click(); // the L plate
-  expect(await plates(page)).toHaveLength(1);
+  // ✓: the whole session is ONE step of the main history.
+  await page.locator("#edit-confirm").click();
+  let [plate] = await plates(page);
+  expect([plate.name, plate.sketch, plate.faceCount]).toEqual(["Floor plate 1", true, 2]);
+  expect(plate.area).toBeCloseTo(3 * 4 + (3.5 * 3 + 2 * 2), 4);
+  expect(plate.volume).toBeCloseTo(0.3 * (12 + 14.5), 4);
+  await page.locator("#undo").click();
+  expect(await elements(page)).toHaveLength(0);
+  expect(await savedBytes(page), "undo restores the document exactly").toBe(bytes0);
   await page.locator("#redo").click();
-  expect(await plates(page)).toHaveLength(2);
-  await page.locator("#redo").click();
-  expect((await plates(page)).find((p) => p.name === "Floor plate 2").holes).toHaveLength(1);
-  await expect(page.locator("#redo")).toBeDisabled();
+  expect((await plates(page))[0].faceCount).toBe(2);
+
+  // ✗ on a new plate leaves no trace, byte for byte.
+  const bytes1 = await savedBytes(page);
+  await page.locator('.tool[data-tool="plate"]').click();
+  await shape(page, "rect");
+  await tapWorld(page, -4, 3.5);
+  await tapWorld(page, -2, 4.5);
+  expect((await stats(page)).elements).toBe(2);
+  await page.locator("#edit-cancel").click();
+  await page.locator("#dialog-ok").click();
+  expect((await editState(page)).active).toBe(false);
+  expect(await savedBytes(page)).toBe(bytes1);
+  // ✓ with no face leaves nothing either.
+  await page.locator('.tool[data-tool="plate"]').click();
+  await page.locator("#edit-confirm").click();
+  expect(await savedBytes(page)).toBe(bytes1);
   expect((await stats(page)).errors).toEqual([]);
   expect(errors).toEqual([]);
 });
 
-test("select a plate: properties, thickness, delete hole, delete plate", async ({ page }) => {
+test("Edit Mode: voids (outside, pocket), per-face thickness, split — the mesh follows live", async ({ page }) => {
   const errors = await openApp(page);
-  await tool(page, "plate");
+  await drawPlate(page, [-3, -2], [3, 2]);
+  let [plate] = await plates(page);
+  expect(plate.area).toBeCloseTo(24, 4);
+  expect(plate.volume).toBeCloseTo(7.2, 4);
+  const bbox0 = plate.bbox;
+
+  // Properties outside Edit Mode: faces, area, the pencil.
+  await selectAt(page, 0, 0);
+  await expect(page.locator("#prop-face-count")).toHaveText("1");
+  await expect(page.locator("#prop-area")).toHaveText("24.00 m²");
+  await shot(page, "edit-properties");
+  await page.locator("#prop-edit").click();
+  expect((await editState(page)).active).toBe(true);
+
+  // A through void reaching OUTSIDE the plate removes only what it covers.
+  await editTool(page, "void");
   await shape(page, "rect");
-  await tapWorld(page, -3, -2);
-  await tapWorld(page, 3, 2);
-  await tool(page, "hole");
+  await tapWorld(page, 2, -1);
+  await tapWorld(page, 4.5, 1);
+  [plate] = await plates(page);
+  expect(plate.area).toBeCloseTo(24 - 2, 4);
+  expect(plate.volume).toBeCloseTo(7.2 - 0.6, 4);
+
+  // A pocket: a void shallower than the plate.
   await tapWorld(page, -2, -1);
   await tapWorld(page, -1, 1);
-  await tapWorld(page, 1, -1);
-  await tapWorld(page, 2, 1);
+  const trisThrough = (await plates(page))[0].triangles;
+  await editMode(page, "faces");
+  await tapWorld(page, -1.5, 0);
+  let st = await editState(page);
+  expect(st.panel.void.through).toBe(true);
+  await page.locator("#edit-depth").fill("0.1");
+  [plate] = await plates(page);
+  expect(plate.faces.find((f) => f.kind === "void" && f.outline.some(([x]) => x === -2)).depth).toBeCloseTo(0.1, 9);
+  expect(plate.volume).toBeCloseTo(6.6 - 2 * 0.1, 4); // a 2 m² pocket, 0.1 deep
+  expect(plate.triangles, "the pocket adds a floor and walls").toBeGreaterThan(trisThrough);
+  expect(plate.bbox).toEqual(bbox0);
+
+  // Split the solid, then give one half its own thickness.
+  await editTool(page, "split");
+  await tapWorld(page, 0, -3);
+  await tapWorld(page, 0, 3);
+  let prof = await profile(page);
+  expect(prof.faces.filter((f) => f.kind.solid !== undefined)).toHaveLength(2);
+  await editMode(page, "faces");
+  await tapWorld(page, 1, 1.5);
+  await page.locator("#edit-thickness").fill("0.5");
+  await page.locator("#edit-thickness").press("Enter");
+  [plate] = await plates(page);
+  expect(plate.bbox[0][2]).toBeCloseTo(-0.5, 4);
+  await shot(page, "edit-faces");
+  await page.locator('#edit-view-toggle button[data-view="3d"]').click();
+  await page.evaluate(() => window.__author.app.zoom_fit());
+  await shot(page, "edit-3d");
+  await page.locator('#edit-view-toggle button[data-view="plan"]').click();
+
+  // Undo inside Edit Mode steps back one edit (the thickness).
+  await page.locator("#edit-undo").click();
+  expect((await plates(page))[0].bbox[0][2]).toBeCloseTo(-0.3, 4);
+  await page.locator("#edit-redo").click();
+  await page.locator("#edit-confirm").click();
+
+  // Reload: the sketch plate comes back with all its faces.
+  await page.evaluate(() => window.__author.saveNow());
+  const before = (await plates(page))[0];
+  await page.reload();
+  await page.waitForFunction(() => window.__author?.ready === true, null, { timeout: 90_000 });
+  const after = (await plates(page))[0];
+  expect(after.faces.map((f) => [f.kind, f.thickness ?? f.depth, sortedOutline(f.outline)]))
+    .toEqual(before.faces.map((f) => [f.kind, f.thickness ?? f.depth, sortedOutline(f.outline)]));
+  expect(after.volume).toBeCloseTo(before.volume, 6);
+  expect((await stats(page)).errors).toEqual([]);
+  expect(errors).toEqual([]);
+});
+
+test("Edit Mode: select, drag point/edge/face, long-press insert, marquee, the three deletes, ✓/✗", async ({ page }) => {
+  const errors = await openApp(page);
+  await drawPlate(page, [-3, -2], [3, 2]);
+  await selectAt(page, 0, 0);
+  await page.locator("#prop-edit").click();
+
+  // Points: tap selects; drag moves (snapped); a crossing move snaps back.
+  await editMode(page, "points");
+  await tapWorld(page, 3, -2);
+  expect((await editState(page)).selection).toBe(1);
+  await dragWorld(page, [3, 2], [4.07, 2.94]);
+  let prof = await profile(page);
+  expect(hasPoint(prof, [4, 3])).toBe(true);
+  await dragWorld(page, [3, -2], [-4, 0.1]);
+  prof = await profile(page);
+  expect(hasPoint(prof, [3, -2]), "the crossing move was rejected").toBe(true);
+  expect(await page.evaluate(() => window.__author.toasts.map((t) => t.msg).join("|"))).toContain("the move was undone");
+
+  // Edges: dragging the bottom edge moves both its points.
+  await editMode(page, "edges");
+  await dragWorld(page, [0, -2], [0.03, -2.46]);
+  prof = await profile(page);
+  expect(hasPoint(prof, [-3, -2.5]) && hasPoint(prof, [3, -2.5])).toBe(true);
+
+  // Faces: a void, dragged by its face.
+  await editTool(page, "void");
+  await shape(page, "rect");
+  await tapWorld(page, -1, -0.5);
+  await tapWorld(page, 1, 0.5);
+  await editMode(page, "faces");
+  await dragWorld(page, [0, 0], [0.5, 0.02]);
+  prof = await profile(page);
+  const voidFace = () => prof.faces.find((f) => f.kind.void !== undefined);
+  expect(sortedOutline(voidFace().outline)).toEqual(sortedOutline([[-0.5, -0.5], [1.5, -0.5], [1.5, 0.5], [-0.5, 0.5]]));
+
+  // Long press on an edge (Points mode) inserts a point there.
+  await editMode(page, "points");
+  const solidPoints = () => prof.faces.find((f) => f.kind.solid !== undefined).points.length;
+  await longPressWorld(page, [-3, 0.4]);
+  prof = await profile(page);
+  expect(solidPoints()).toBe(5);
+  expect(hasPoint(prof, [-3, 0.4])).toBe(true);
+  // Marquee selects it; Delete removes it and reconnects its neighbours.
+  await dragWorld(page, [-3.9, -0.4], [-2.4, 1.4]);
+  expect((await editState(page)).selection).toBe(1);
+  await page.locator("#edit-delete").click();
+  prof = await profile(page);
+  expect(solidPoints()).toBe(4);
+  // Delete an edge: its two points merge (the void becomes a triangle).
+  await editMode(page, "edges");
+  await tapWorld(page, 0.5, 0.5);
+  await page.locator("#edit-delete").click();
+  prof = await profile(page);
+  expect(voidFace().points).toHaveLength(3);
+  // Delete a face: its points go with it.
+  await editMode(page, "faces");
+  await tapWorld(page, 1.1, -0.2);
+  await page.locator("#edit-delete").click();
+  prof = await profile(page);
+  expect(prof.faces).toHaveLength(1);
+  expect(prof.points).toHaveLength(4);
+  await shot(page, "edit-mode");
+
+  // ✓ collapses the session into one main undo step.
+  await page.locator("#edit-confirm").click();
   let [plate] = await plates(page);
-  expect(plate.holes).toHaveLength(2);
-  const entitiesBefore = (await page.evaluate(() => window.__author.debugInfo())).document.entities;
-
-  await tool(page, "select");
-  await tapWorld(page, 0, 1.5);
-  expect((await stats(page)).selection).toBe(plate.id);
-  await expect(page.locator("#sheet")).toBeVisible();
-  await expect(page.locator("#sheet-title")).toHaveText("Floor plate 1");
-  await expect(page.locator("#prop-area")).toHaveText("20.00 m²");
-  // The tap that opened the sheet must not focus a field (no keyboard).
-  expect(await page.evaluate(() => document.activeElement?.tagName)).not.toBe("INPUT");
-  await shot(page, "properties");
-
-  // Thickness edit: one undo step for the whole typed edit.
-  const input = page.locator("#prop-thickness");
-  await input.fill("0.45");
-  await input.press("Enter");
-  [plate] = await plates(page);
-  expect(plate.thickness).toBeCloseTo(0.45, 9);
+  expect(sortedOutline(plate.faces[0].outline)).toContainEqual([4, 3]);
   await page.locator("#undo").click();
-  expect((await plates(page))[0].thickness).toBeCloseTo(0.3, 9);
-  await expect(input).toHaveValue("0.30"); // the panel follows the document (dirty pump)
-  await page.locator("#redo").click();
-  expect((await plates(page))[0].thickness).toBeCloseTo(0.45, 9);
-
-  // Delete a hole: the face loses the wire AND its geometry is swept.
-  await page.locator('[data-testid="delete-hole"]').first().click();
   [plate] = await plates(page);
-  expect(plate.holes).toHaveLength(1);
-  const entitiesAfter = (await page.evaluate(() => window.__author.debugInfo())).document.entities;
-  expect(entitiesBefore - entitiesAfter, "wire + 4 edges + 4 lines + 4 points").toBe(13);
-  await expect(page.locator("#prop-hole-count")).toHaveText("1");
+  expect(solidOutline(plate)).toEqual(sortedOutline([[-3, -2], [3, -2], [3, 2], [-3, 2]]));
 
-  // Delete the plate (orphan sweep): nothing left but site + levels.
-  await page.locator("#prop-delete").click();
-  expect(await elements(page)).toHaveLength(0);
-  await expect(page.locator("#sheet")).toBeHidden();
-  const doc = (await page.evaluate(() => window.__author.debugInfo())).document;
-  expect(doc.entities, "site + 2 levels remain").toBe(3);
-  // Undo restores the plate in one step.
+  // ✗ after edits: the document is byte-identical to before the session.
+  const bytes = await savedBytes(page);
+  await selectAt(page, 0, 0);
+  await page.locator("#prop-edit").click();
+  await editMode(page, "points");
+  await dragWorld(page, [3, 2], [3.5, 2.5]);
+  await page.locator("#edit-cancel").click();
+  await page.locator("#dialog-ok").click();
+  expect(await savedBytes(page)).toBe(bytes);
+  expect(errors).toEqual([]);
+});
+
+test("legacy plates: import the fixture, convert with the pencil; ✗ undoes the conversion, ✓ keeps it", async ({ page }) => {
+  const errors = await openApp(page);
+  await page.locator("#menu-btn").click();
+  const [chooser] = await Promise.all([
+    page.waitForEvent("filechooser"),
+    page.locator('[data-testid="menu-import"]').click(),
+  ]);
+  await chooser.setFiles(FIXTURE);
+  await page.locator("#dialog-ok").click();
+  await page.waitForFunction(() => window.__author.stats().walls === 4);
+  if (mobile()) {
+    await page.evaluate(() => {
+      window.__author.app.set_camera_json('{"tx":4,"ty":3,"halfH":10}');
+      window.__author.refresh();
+    });
+  }
+  let [plate] = await plates(page);
+  expect([plate.name, plate.sketch ?? false, plate.holes.length]).toEqual(["Floor plate 1", false, 2]);
+  const bytes = await savedBytes(page);
+
+  // The pencil converts it (inside the session) and opens Edit Mode.
+  await selectAt(page, 4, 3);
+  await expect(page.locator("#prop-edit")).toBeVisible();
+  await page.locator("#prop-edit").click();
+  let st = await editState(page);
+  expect(st.active).toBe(true);
+  [plate] = await plates(page);
+  expect([plate.name, plate.sketch, plate.faceCount]).toEqual(["Floor plate 1", true, 3]);
+  expect(plate.area).toBeCloseTo(48 - 1 - 1.5, 4);
+  expect(st.canUndo, "the conversion is not an edit to step back over").toBe(false);
+  // ✗: back to the legacy plate, byte for byte.
+  await page.locator("#edit-cancel").click();
+  expect(await savedBytes(page)).toBe(bytes);
+  expect((await plates(page))[0].sketch ?? false).toBe(false);
+
+  // ✓: the converted plate stays (one main undo step reverts it).
+  await selectAt(page, 4, 3);
+  await page.locator("#prop-edit").click();
+  await page.locator("#edit-confirm").click();
+  [plate] = await plates(page);
+  expect([plate.sketch, plate.faceCount]).toEqual([true, 3]);
+  expect((await stats(page)).walls).toBe(4);
   await page.locator("#undo").click();
-  expect(await plates(page)).toHaveLength(1);
+  expect(await savedBytes(page)).toBe(bytes);
+
+  // The Hole tool on a plate opens Edit Mode with the Void tool armed.
+  await tool(page, "hole");
+  await tapWorld(page, 4, 3);
+  st = await editState(page);
+  expect([st.active, st.tool]).toEqual([true, "void"]);
+  await page.locator("#edit-cancel").click();
+  expect((await stats(page)).errors).toEqual([]);
   expect(errors).toEqual([]);
 });
 
 test("persistence: reload restores the model; corrupt storage starts fresh with a backup", async ({ page }) => {
   await openApp(page);
-  await tool(page, "plate");
-  await shape(page, "rect");
-  await tapWorld(page, -2, -2);
-  await tapWorld(page, 2, 1);
+  await drawPlate(page, [-2, -2], [2, 1]);
   const before = await plates(page);
   expect(before).toHaveLength(1);
   // The debounced save lands ~300 ms after the change.
@@ -288,8 +499,8 @@ test("persistence: reload restores the model; corrupt storage starts fresh with 
   await page.reload();
   await page.waitForFunction(() => window.__author?.ready === true, null, { timeout: 90_000 });
   const after = await plates(page);
-  expect(after.map((p) => [p.name, sortedOutline(p.outline), p.thickness]))
-    .toEqual(before.map((p) => [p.name, sortedOutline(p.outline), p.thickness]));
+  expect(after.map((p) => [p.name, solidOutline(p), p.faces[0].thickness]))
+    .toEqual(before.map((p) => [p.name, solidOutline(p), p.faces[0].thickness]));
   // Undo history is not persisted (by design).
   expect((await stats(page)).canUndo).toBe(false);
 
@@ -312,10 +523,7 @@ test("persistence: reload restores the model; corrupt storage starts fresh with 
 
 test("export / import round trip via the menu", async ({ page }) => {
   await openApp(page);
-  await tool(page, "plate");
-  await shape(page, "rect");
-  await tapWorld(page, -2, -1);
-  await tapWorld(page, 3, 2);
+  await drawPlate(page, [-2, -1], [3, 2]);
   const before = await plates(page);
 
   await page.locator("#menu-btn").click();
@@ -346,15 +554,12 @@ test("export / import round trip via the menu", async ({ page }) => {
   await page.locator("#dialog-ok").click();
   await page.waitForFunction(() => window.__author.stats().elements === 1);
   const after = await plates(page);
-  expect(after.map((p) => sortedOutline(p.outline))).toEqual(before.map((p) => sortedOutline(p.outline)));
+  expect(after.map(solidOutline)).toEqual(before.map(solidOutline));
 });
 
 test("Plan/3D toggle; drawing works in 3D; level elevation edit is transform-only", async ({ page }) => {
   const errors = await openApp(page);
-  await tool(page, "plate");
-  await shape(page, "rect");
-  await tapWorld(page, -3, -2);
-  await tapWorld(page, 2, 2);
+  await drawPlate(page, [-3, -2], [2, 2]);
   await page.locator('#view-toggle button[data-view="3d"]').click();
   expect((await stats(page)).view).toBe("3d");
   // Draw on Level 2 in the 3D view.
@@ -362,11 +567,14 @@ test("Plan/3D toggle; drawing works in 3D; level elevation edit is transform-onl
   await page.locator('#level-popover [data-level]').first().click(); // top of the list = Level 2
   const levels = await page.evaluate(() => window.__author.levels());
   expect(levels.levels.find((l) => l.id === levels.activeId).name).toBe("Level 2");
+  await page.locator('.tool[data-tool="plate"]').click();
+  await shape(page, "rect");
   await tapWorld(page, -1, -1, 3);
   await tapWorld(page, 1, 1, 3);
+  await page.locator("#edit-confirm").click();
   expect(await plates(page)).toHaveLength(2);
   const upper = (await plates(page)).find((p) => p.levelName === "Level 2");
-  expect(sortedOutline(upper.outline)).toEqual(sortedOutline([[-1, -1], [1, -1], [1, 1], [-1, 1]]));
+  expect(solidOutline(upper)).toEqual(sortedOutline([[-1, -1], [1, -1], [1, 1], [-1, 1]]));
   await tool(page, "select");
   await page.locator("#fit-btn").click();
   await shot(page, "3d");
@@ -393,31 +601,19 @@ test("Plan/3D toggle; drawing works in 3D; level elevation edit is transform-onl
 test("touch: press-drag-release placement, two fingers never place", async ({ page }) => {
   test.skip(!mobile(), "touch gestures are exercised in the mobile project");
   await openApp(page);
-  const cdp = await page.context().newCDPSession(page);
-  const touch = (type, points) => cdp.send("Input.dispatchTouchEvent", {
-    type, touchPoints: points.map(([x, y], id) => ({ x, y, id })),
-  });
-  const drag = async (from, to, steps = 8) => {
-    const a = await worldToClient(page, ...from);
-    const b = await worldToClient(page, ...to);
-    await touch("touchStart", [a]);
-    for (let i = 1; i <= steps; i++) {
-      await touch("touchMove", [[a[0] + ((b[0] - a[0]) * i) / steps, a[1] + ((b[1] - a[1]) * i) / steps]]);
-    }
-    await touch("touchEnd", []);
-  };
+  const touch = await cdpTouch(page);
 
-  // Rectangle: press at one corner, drag, release at the other.
-  await tool(page, "plate");
+  // Rectangle face: press at one corner, drag, release at the other.
+  await page.locator('.tool[data-tool="plate"]').click();
   await shape(page, "rect");
-  await drag([-2.1, -1.1], [1.9, 2.1]);
-  let ps = await plates(page);
-  expect(ps).toHaveLength(1);
-  expect(sortedOutline(ps[0].outline)).toEqual(sortedOutline([[-2, -1], [2, -1], [2, 2], [-2, 2]]));
+  await dragWorld(page, [-2.1, -1.1], [1.9, 2.1], 8);
+  const prof = await profile(page);
+  expect(prof.faces).toHaveLength(1);
+  expect(sortedOutline(prof.faces[0].outline)).toEqual(sortedOutline([[-2, -1], [2, -1], [2, 2], [-2, 2]]));
 
   // Polygon: the vertex lands where the finger is RELEASED (snapped).
   await shape(page, "polygon");
-  await drag([4, 4], [3.1, 3.9]);
+  await dragWorld(page, [4, 4], [3.1, 3.9], 8);
   let sk = await page.evaluate(() => window.__author.sketch());
   expect(sk.points).toEqual([[3, 4]]);
 
@@ -451,13 +647,6 @@ function wallInside(w, [x0, y0, x1, y1]) {
   const t = w.thickness;
   const pts = [w.start, w.end].flatMap((p) => [p, [p[0] + w.normal[0] * t, p[1] + w.normal[1] * t]]);
   return pts.every(([x, y]) => x >= x0 - 1e-9 && x <= x1 + 1e-9 && y >= y0 - 1e-9 && y <= y1 + 1e-9);
-}
-
-async function drawPlate(page, a, b) {
-  await tool(page, "plate");
-  await shape(page, "rect");
-  await tapWorld(page, ...a);
-  await tapWorld(page, ...b);
 }
 
 test("walls: a closed loop traced on a plate grows inward; open run joins; one undo per run", async ({ page }) => {

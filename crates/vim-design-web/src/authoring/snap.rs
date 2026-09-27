@@ -114,11 +114,10 @@ fn snap_to_edges(raw: P2, input: &SnapInput) -> Option<P2> {
 
 pub fn snap(input: &SnapInput) -> SnapResult {
     let raw = input.raw;
-    if let Some(first) = input.close_target {
-        if dist(raw, first) <= input.tolerance {
+    if let Some(first) = input.close_target
+        && dist(raw, first) <= input.tolerance {
             return SnapResult { point: first, kind: SnapKind::First, guides: vec![] };
         }
-    }
     if !input.enabled {
         return SnapResult { point: raw, kind: SnapKind::Free, guides: vec![] };
     }
@@ -160,15 +159,14 @@ pub fn snap(input: &SnapInput) -> SnapResult {
     }
     // Both locks from the same anchor would collapse onto the anchor
     // itself: keep only the tighter one.
-    if let (Some((_, ax, dx)), Some((_, ay, dy))) = (lock_x, lock_y) {
-        if dist(ax, ay) <= 1e-9 {
+    if let (Some((_, ax, dx)), Some((_, ay, dy))) = (lock_x, lock_y)
+        && dist(ax, ay) <= 1e-9 {
             if dx <= dy {
                 lock_y = None;
             } else {
                 lock_x = None;
             }
         }
-    }
     if lock_x.is_none() && lock_y.is_none() {
         return SnapResult { point: grid, kind: SnapKind::Grid, guides: vec![] };
     }

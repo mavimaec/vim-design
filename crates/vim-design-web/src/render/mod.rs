@@ -356,7 +356,7 @@ fn feature_edges(verts: &[f32], indices: &[u32]) -> Vec<u32> {
     };
     type Key = (i64, i64, i64);
     let mut edges: HashMap<(Key, Key), (u32, u32, Vec<Vec3>)> = HashMap::new();
-    for tri in indices.chunks_exact(3) {
+    for tri in indices.as_chunks::<3>().0 {
         let n = (pos(tri[1]) - pos(tri[0])).cross(pos(tri[2]) - pos(tri[0]));
         let len = n.length();
         if len <= 1e-12 {
@@ -875,7 +875,7 @@ impl Renderer {
             let Some(range) = mesh.indices.get(start..end) else {
                 continue;
             };
-            for tri in range.chunks_exact(3) {
+            for tri in range.as_chunks::<3>().0 {
                 let in_range = tri.iter().all(|&i| {
                     (i as usize) < mesh.positions.len() && (i as usize) < mesh.normals.len()
                 });
@@ -899,7 +899,7 @@ impl Renderer {
 
         // Deduplicated edge list for the wireframe overlay.
         let mut edges: HashSet<(u32, u32)> = HashSet::new();
-        for tri in indices.chunks_exact(3) {
+        for tri in indices.as_chunks::<3>().0 {
             for (a, b) in [(tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])] {
                 edges.insert((a.min(b), a.max(b)));
             }

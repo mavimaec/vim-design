@@ -492,3 +492,116 @@ button.row:active { background: rgba(16, 24, 40, 0.04); }
   .tool { width: 46px; }
   #wall-settings .stepper-label { display: none; }
 }
+
+/* ---- Edit Mode ------------------------------------------------------------------------------ */
+/* A calm, distinct chrome: a dark edit bar with large Cancel / Done
+   targets replaces the top bar; the edit dock replaces the tool dock. */
+body.editing #topbar,
+body.editing #toolbar,
+body.editing #level-popover { display: none !important; }
+
+#edit-bar {
+  position: fixed; z-index: 20;
+  top: calc(var(--gap) + var(--st));
+  left: calc(var(--gap) + var(--sl)); right: calc(var(--gap) + var(--sr));
+  height: var(--top-h);
+  display: flex; align-items: center; gap: 6px;
+  padding: 0 5px;
+  background: #1f2940; color: #fff;
+  border-radius: var(--r);
+  box-shadow: var(--shadow);
+  user-select: none; -webkit-user-select: none;
+}
+.edit-btn {
+  width: 48px; height: 42px; flex: none;
+  display: inline-grid; place-items: center;
+  border: 0; border-radius: 11px;
+}
+.edit-btn .ico { width: 24px; height: 24px; stroke-width: 2.2; }
+.edit-btn.cancel { background: rgba(255, 255, 255, 0.1); color: #fff; }
+.edit-btn.cancel:active { background: rgba(255, 255, 255, 0.2); }
+.edit-btn.confirm { background: #16a34a; color: #fff; box-shadow: 0 2px 8px rgba(22, 163, 74, 0.45); }
+.edit-btn.confirm:active { background: #15803d; }
+.edit-title { flex: 1; min-width: 0; display: flex; flex-direction: column; line-height: 1.1; padding: 0 4px; }
+.edit-caption { font-size: 10.5px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: #93c5fd; }
+.edit-name { font-size: 15px; font-weight: 650; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.icon-btn.on-dark { color: #e2e8f0; }
+.icon-btn.on-dark:hover:not(:disabled) { background: rgba(255, 255, 255, 0.08); }
+.icon-btn.on-dark:disabled { color: rgba(226, 232, 240, 0.3); }
+.seg.dark { background: rgba(255, 255, 255, 0.08); border-color: rgba(255, 255, 255, 0.12); }
+.seg.dark button { color: rgba(226, 232, 240, 0.7); }
+.seg.dark button.on { background: rgba(255, 255, 255, 0.92); color: #1f2940; }
+
+#edit-dock {
+  position: fixed; z-index: 20;
+  bottom: calc(var(--gap) + var(--sb));
+  left: 50%; transform: translateX(-50%);
+  display: flex; align-items: center; gap: 2px;
+  padding: 4px;
+  background: var(--surface);
+  border-radius: 18px;
+  box-shadow: var(--shadow);
+  backdrop-filter: saturate(1.4) blur(10px); -webkit-backdrop-filter: saturate(1.4) blur(10px);
+  user-select: none; -webkit-user-select: none;
+}
+.dock-group { display: flex; gap: 2px; padding: 2px; border-radius: 15px; background: var(--surface-2); }
+.dock-group .tool.on { color: var(--accent); background: var(--surface-solid); box-shadow: var(--shadow-sm); }
+.tool.danger:not(:disabled) { color: var(--danger); }
+.ico .thin { stroke-width: 1.3; }
+.ico .fill-soft { fill: currentColor; fill-opacity: 0.18; }
+
+#edit-panel {
+  position: fixed; z-index: 19;
+  bottom: calc(var(--gap) + var(--sb) + var(--dock-h) + 10px);
+  left: 50%; transform: translateX(-50%);
+  width: min(420px, calc(100vw - 16px));
+  padding: 8px 10px 6px;
+  background: var(--surface);
+  border-radius: 16px;
+  box-shadow: var(--shadow);
+  backdrop-filter: saturate(1.4) blur(10px); -webkit-backdrop-filter: saturate(1.4) blur(10px);
+  user-select: none; -webkit-user-select: none;
+}
+body.drawing #edit-panel { display: none; }
+.edit-panel-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; margin: 0 2px 4px; }
+#edit-panel-title { font-size: 12px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; }
+.edit-panel-note { font-size: 12px; color: var(--muted); }
+.edit-row { padding: 2px 0; }
+.edit-row + .edit-row { border-top: 1px solid var(--line); margin-top: 4px; padding-top: 6px; }
+.edit-row-line { display: flex; align-items: center; gap: 8px; }
+.edit-row-label { flex: 1; display: inline-flex; align-items: center; gap: 7px; font-weight: 600; font-size: 14px; }
+.swatch.solid, .swatch.void { width: 12px; height: 12px; border-radius: 3px; flex: none; }
+.swatch.solid { background: rgba(47, 111, 237, 0.35); border: 1.5px solid var(--accent); }
+.swatch.void { border: 1.5px dashed var(--accent); }
+.edit-slider { width: 100%; margin: 6px 0 2px; accent-color: var(--accent); }
+#edit-through { height: 40px; }
+/* A through void: the depth reads as inactive; setting one turns
+   "Through" off. */
+.edit-row.dim .stepper, .edit-row.dim .edit-slider { opacity: 0.45; }
+
+/* Drawing inside Edit Mode: only the shape toggle and the actions. */
+body.editing #thickness-stepper, body.editing #flip-toggle,
+body.editing #wall-settings, body.editing #window-done { display: none !important; }
+
+@media (max-width: 520px) {
+  #edit-bar { gap: 4px; }
+  #edit-bar .seg button { padding: 0 9px; }
+  #edit-bar .icon-btn.on-dark { width: 38px; }
+  .edit-btn { width: 44px; }
+  /* Phones: sliders only when editing selected faces (space). */
+  #edit-panel.target-new .edit-slider { display: none; }
+}
+@media (min-width: 760px) {
+  #edit-dock {
+    left: calc(var(--gap) + var(--sl)); bottom: auto; top: 50%;
+    transform: translateY(-50%);
+    flex-direction: column; padding: 6px; gap: 4px;
+  }
+  .dock-group { flex-direction: column; }
+  #edit-panel {
+    left: auto; right: calc(var(--gap) + var(--sr)); transform: none;
+    top: calc(var(--gap) + var(--st) + var(--top-h) + 10px); bottom: auto;
+    width: 320px;
+  }
+  body.drawing #edit-panel { display: block; }
+}

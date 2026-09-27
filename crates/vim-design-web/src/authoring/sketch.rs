@@ -19,6 +19,10 @@ pub enum SketchTool {
     Wall,
     /// A window outline on a wall face (wall-local u/v coordinates).
     Window,
+    /// Edit Mode: a new solid or void face of the edited profile.
+    Profile,
+    /// Edit Mode: a two-point line that splits the faces it crosses.
+    Split,
 }
 
 impl SketchTool {
@@ -28,6 +32,8 @@ impl SketchTool {
             SketchTool::Hole => "hole",
             SketchTool::Wall => "wall",
             SketchTool::Window => "window",
+            SketchTool::Profile => "profile",
+            SketchTool::Split => "split",
         }
     }
 }
@@ -234,6 +240,9 @@ pub fn status(sketch: &Sketch, ctx: &SketchContext) -> SketchStatus {
         (SketchTool::Window, SketchContext::Window { profile, windows }) => {
             walls::validate_window(&outline, profile, windows)
         }
+        (SketchTool::Split, _) => {
+            if outline.len() >= 2 { Ok(()) } else { Err(Invalid::TooFewWallPoints) }
+        }
         _ => validate_plate(&outline),
     };
     let preview = sketch.preview();
@@ -267,7 +276,7 @@ pub fn status(sketch: &Sketch, ctx: &SketchContext) -> SketchStatus {
     }
     let enough = match (sketch.shape, sketch.tool) {
         (Shape::Rect, _) => sketch.points.len() >= 2,
-        (Shape::Polygon, SketchTool::Wall) => outline.len() >= 2,
+        (Shape::Polygon, SketchTool::Wall | SketchTool::Split) => outline.len() >= 2,
         (Shape::Polygon, _) => outline.len() >= 3,
     };
     let finish_err = finish.err().filter(|_| enough);

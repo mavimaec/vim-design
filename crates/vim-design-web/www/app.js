@@ -36,6 +36,19 @@ const WALL_THICKNESS_STEP_M = 0.05;
 // Double tap/click on empty space = zoom to fit.
 const DOUBLE_TAP_MS = 330;
 const DOUBLE_TAP_PX = 30;
+// A touch tap's compatibility click arrives this soon and this close to
+// the tap (CSS px): swallowed when it would hit a sheet the tap opened.
+const GHOST_CLICK_MS = 450;
+const GHOST_CLICK_PX = 24;
+// Edit Mode: press-and-hold on an edge (Points mode) inserts a point.
+const LONG_PRESS_MS = 500;
+const LONG_PRESS_VIBRATE_MS = 12;
+const INSERT_RING_MS = 450;
+// Edit Mode pick radius (CSS px) for points and edges.
+const EDIT_PICK_PX = { mouse: 10, pen: 14, touch: 22 };
+// Edit Mode stepper increments (meters).
+const FACE_THICKNESS_STEP_M = 0.05;
+const VOID_DEPTH_STEP_M = 0.05;
 const COARSE = matchMedia("(pointer: coarse)").matches;
 
 const $ = (id) => document.getElementById(id);
@@ -297,6 +310,7 @@ async function main() {
     saveTimer = 0;
     const rev = app.revision();
     if (rev === savedRevision) return true;
+    if (app.edit_active()) return false; // saved when the session ends
     if (autosaveBlocked) {
       const msg = "Autosave is off: storage is full and your old project could not be backed up. Use Export to keep your work.";
       if (msg !== lastSaveError) toast(msg, { kind: "error", ms: LONG_ERROR_TOAST_MS });
@@ -318,7 +332,7 @@ async function main() {
     }
   };
   const scheduleSave = () => {
-    if (app.revision() === savedRevision) return;
+    if (app.revision() === savedRevision || app.edit_active()) return;
     clearTimeout(saveTimer);
     saveTimer = setTimeout(saveNow, SAVE_DEBOUNCE_MS);
   };
@@ -389,8 +403,12 @@ async function main() {
   const tolPx = (type) => (SNAP_CAPTURE_PX[type] ?? SNAP_CAPTURE_PX.touch) * dpr;
   const wallPickPx = (type) => (WALL_PICK_PX[type] ?? WALL_PICK_PX.touch) * dpr;
   const inElevation = () => stats.windowHost != null;
+  const editPickPx = (type) => (EDIT_PICK_PX[type] ?? EDIT_PICK_PX.touch) * dpr;
+  let editState = { active: false };
+  const editing = () => editState.active === true;
   const isDrawing = () =>
-    stats.tool === "plate" || stats.tool === "hole" || stats.tool === "wall" || inElevation();
+    stats.tool === "wall" || inElevation() ||
+    (editing() && editState.tool !== "select");
 
   const pointers = new Map(); // id -> {x, y, type} (client px)
   let mode = "none"; // none | press | nav | pan | place | pinch | pinch-rest
@@ -398,7 +416,8 @@ async function main() {
   let pinch = null; // {d, mid, angle}
   let lastTap = null;
   let hoverType = "mouse";
-  let sheetOpenedAt = 0; // see the ghost-click shield on the sheet
+  // The touch tap that opened a sheet (see the ghost-click shield).
+  let ghostTap = null; // {x, y, t} client px
   let touchPlacing = false;
 
   const pinchState = () => {
@@ -429,6 +448,10 @@ async function main() {
         app.sketch_leave();
         touchPlacing = false;
       }
+      if (mode.startsWith("edit")) {
+        clearTimeout(longPressTimer);
+        app.edit_gesture_cancel();
+      }
       mode = "pinch";
       pinch = pinchState();
       requestRender();
@@ -448,6 +471,15 @@ async function main() {
       touchPlacing = e.pointerType !== "mouse";
       app.sketch_hover(dev[0], dev[1], tolPx(e.pointerType));
       requestRender();
+    } else if (editing()) {
+      // Tap = select, drag on an item = move, drag on empty = marquee,
+      // hold on an edge (Points mode) = insert a point.
+      mode = "edit-press";
+      press.additive = e.shiftKey || e.ctrlKey || e.metaKey;
+      clearTimeout(longPressTimer);
+      if (editState.mode === "points") {
+        longPressTimer = setTimeout(() => onLongPress(press), LONG_PRESS_MS);
+      }
     } else {
       mode = "press";
     }
@@ -461,6 +493,9 @@ async function main() {
       hoverType = e.pointerType;
       if (isDrawing() && e.pointerType !== "touch") {
         app.sketch_hover(dev[0], dev[1], tolPx(e.pointerType));
+        requestRender();
+      } else if (editing() && e.pointerType !== "touch") {
+        app.edit_hover(dev[0], dev[1], editPickPx(e.pointerType));
         requestRender();
       }
       return;
@@ -491,6 +526,22 @@ async function main() {
     const r = canvas.getBoundingClientRect();
     const s = canvas.width / r.width;
     const prevDev = [(prev.x - r.left) * s, (prev.y - r.top) * s];
+    if (mode === "edit-press" && press.moved && !press.consumed) {
+      clearTimeout(longPressTimer);
+      const kind = app.edit_drag_begin(press.dev[0], press.dev[1], editPickPx(press.type), press.additive);
+      mode = kind === "move" ? "edit-move" : "edit-marquee";
+    }
+    if (mode === "edit-move") {
+      app.edit_drag_move(dev[0], dev[1], editPickPx(press.type));
+      requestRender();
+      return;
+    }
+    if (mode === "edit-marquee") {
+      app.edit_marquee(press.dev[0], press.dev[1], dev[0], dev[1]);
+      renderChrome();
+      requestRender();
+      return;
+    }
     if (mode === "pan") {
       app.pan(prevDev[0], prevDev[1], dev[0], dev[1]);
       requestRender();
@@ -538,6 +589,19 @@ async function main() {
       if (press.type === "touch") app.sketch_leave();
     } else if (mode === "press" && press && !cancelled) {
       handleTap(press);
+    } else if (mode.startsWith("edit") && press) {
+      clearTimeout(longPressTimer);
+      if (cancelled) {
+        app.edit_gesture_cancel();
+      } else if (mode === "edit-press" && !press.consumed) {
+        app.edit_tap(press.dev[0], press.dev[1], editPickPx(press.type), press.additive);
+      } else if (mode === "edit-move") {
+        const res = JSON.parse(app.edit_drag_end());
+        if (res.result === "rejected") toast(`${res.reason} — the move was undone`, { kind: "error" });
+      } else if (mode === "edit-marquee") {
+        app.edit_marquee_end();
+      }
+      refreshEdit();
     }
     if (mode === "nav" || mode === "pan") sessionSave();
     mode = "none";
@@ -572,6 +636,14 @@ async function main() {
       else toast("Tap a wall to add windows to it", { ms: 1800 });
       return;
     }
+    if (stats.tool === "hole") {
+      // Hole tool: the tap picks the floor plate to cut voids into.
+      const hit = app.pick(p.dev[0], p.dev[1]);
+      const plate = JSON.parse(app.elements_json()).find((x) => x.id === hit && x.kind === "floor_plate");
+      if (plate) beginEdit(plate.id, "void");
+      else toast("Tap a floor plate to cut holes into it", { ms: 1800 });
+      return;
+    }
     let id = app.pick(p.dev[0], p.dev[1]);
     if (id < 0) id = app.pick_wall(p.dev[0], p.dev[1], wallPickPx(p.type));
     const isDouble = lastTap && now - lastTap.t < DOUBLE_TAP_MS &&
@@ -585,8 +657,25 @@ async function main() {
     }
     lastTap = { t: now, x: p.x, y: p.y, empty: id < 0 };
     // A touch tap that opens the sheet arms the ghost-click shield.
-    if (p.type !== "mouse") sheetOpenedAt = performance.now();
+    if (p.type !== "mouse") ghostTap = { x: p.x, y: p.y, t: performance.now() };
     selectElement(id);
+  }
+
+  // Long press (Edit Mode, Points mode): insert a point on the edge.
+  let longPressTimer = 0;
+  const rings = []; // {x, y, t0}: insert feedback animations
+  function onLongPress(p) {
+    if (!p || p.moved || mode !== "edit-press") return;
+    const res = JSON.parse(app.edit_long_press(p.dev[0], p.dev[1], editPickPx(p.type)));
+    if (res.result === "inserted") {
+      p.consumed = true;
+      rings.push({ x: res.x, y: res.y, t0: performance.now() });
+      try { navigator.vibrate?.(LONG_PRESS_VIBRATE_MS); } catch { /* not supported */ }
+      refreshEdit();
+    } else if (res.result === "rejected") {
+      p.consumed = true;
+      toast(res.reason, { kind: "error" });
+    }
   }
 
   function handlePlaced(json) {
@@ -645,17 +734,24 @@ async function main() {
   let lastHud = { active: false };
   function drawHud() {
     const ctx = hctx;
-    if (!isDrawing()) {
+    const edit = editing();
+    if (!isDrawing() && !edit && rings.length === 0) {
       if (hudActive) ctx.clearRect(0, 0, hud.width, hud.height);
       hudActive = false;
+      lastHud = { active: false };
+      return;
+    }
+    hudActive = true;
+    ctx.clearRect(0, 0, hud.width, hud.height);
+    if (edit) drawEditHud(ctx);
+    drawRings(ctx);
+    if (!isDrawing()) {
       lastHud = { active: false };
       return;
     }
     let h;
     try { h = JSON.parse(app.hud_json()); } catch { return; }
     lastHud = h;
-    hudActive = true;
-    ctx.clearRect(0, 0, hud.width, hud.height);
     if (!h.active) return;
     const ok = h.previewOk;
     const color = ok ? HUD.accent : HUD.bad;
@@ -806,6 +902,122 @@ async function main() {
     }
   }
 
+  /** Edit Mode overlay: the profile's faces (solid filled, void
+   *  dotted), edges, point handles, hover/selection, marquee, snap. */
+  function drawEditHud(ctx) {
+    let h;
+    try { h = JSON.parse(app.edit_hud_json()); } catch { return; }
+    if (!h.active) return;
+    const accent = h.invalid ? HUD.bad : HUD.accent;
+    const rgbaAccent = (a) => (h.invalid ? `rgba(217,45,32,${a})` : `rgba(47,111,237,${a})`);
+    const path = (pts) => {
+      ctx.beginPath();
+      pts.forEach(([x, y], i) => (i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)));
+      ctx.closePath();
+    };
+    const facesMode = h.mode === "faces";
+    ctx.lineJoin = "round";
+    ctx.lineCap = "round";
+    for (const f of h.faces) {
+      if (f.pts.length < 3) continue;
+      path(f.pts);
+      if (f.kind === "solid") {
+        ctx.fillStyle = rgbaAccent(f.sel ? 0.3 : f.hover ? 0.2 : 0.1);
+        ctx.fill();
+      } else {
+        // Voids: the background shows through, with a light hatch.
+        ctx.save();
+        ctx.clip();
+        ctx.clearRect(0, 0, hud.width, hud.height);
+        // Hatch only: the model under a void (a pocket floor, a cut)
+        // stays visible.
+        if (f.sel || f.hover) {
+          ctx.fillStyle = rgbaAccent(f.sel ? 0.16 : 0.1);
+          ctx.fill();
+        }
+        ctx.strokeStyle = rgbaAccent(f.sel ? 0.35 : 0.18);
+        ctx.lineWidth = 1 * dpr;
+        const xs = f.pts.map((p) => p[0]), ys = f.pts.map((p) => p[1]);
+        const [x0, x1, y0, y1] = [Math.min(...xs), Math.max(...xs), Math.min(...ys), Math.max(...ys)];
+        const gap = 9 * dpr;
+        ctx.beginPath();
+        for (let x = x0 - (y1 - y0); x < x1; x += gap) {
+          ctx.moveTo(x, y1);
+          ctx.lineTo(x + (y1 - y0), y0);
+        }
+        ctx.stroke();
+        ctx.restore();
+      }
+    }
+    for (const e of h.edges) {
+      const [x0, y0, x1, y1] = e.p;
+      ctx.beginPath();
+      ctx.moveTo(x0, y0);
+      ctx.lineTo(x1, y1);
+      ctx.setLineDash(e.void ? [5 * dpr, 4 * dpr] : []);
+      ctx.strokeStyle = e.sel || e.hover ? accent : rgbaAccent(0.75);
+      ctx.lineWidth = (e.sel ? 4 : e.hover ? 3.2 : 1.8) * dpr;
+      ctx.stroke();
+    }
+    ctx.setLineDash([]);
+    const r = (facesMode ? 3 : h.mode === "edges" ? 3.5 : 6) * dpr;
+    for (const p of h.points) {
+      const [x, y] = p.p;
+      ctx.beginPath();
+      ctx.arc(x, y, p.hover && !p.sel ? r * 1.35 : r, 0, Math.PI * 2);
+      ctx.fillStyle = p.sel ? accent : "#fff";
+      ctx.fill();
+      ctx.lineWidth = 2 * dpr;
+      ctx.strokeStyle = accent;
+      ctx.stroke();
+    }
+    for (const [x1, y1, x2, y2] of h.guides ?? []) {
+      ctx.beginPath();
+      ctx.moveTo(x1, y1);
+      ctx.lineTo(x2, y2);
+      ctx.setLineDash([5 * dpr, 5 * dpr]);
+      ctx.strokeStyle = HUD.guide;
+      ctx.lineWidth = 1.5 * dpr;
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+    if (h.dragging && h.snap && h.snap.kind !== "grid" && h.snap.kind !== "free") {
+      ctx.beginPath();
+      ctx.arc(h.snap.x, h.snap.y, 9 * dpr, 0, Math.PI * 2);
+      ctx.strokeStyle = h.snap.kind === "vertex" ? HUD.vertex : HUD.guide;
+      ctx.lineWidth = 2 * dpr;
+      ctx.stroke();
+    }
+    if (h.invalid && h.invalidReason && h.snap) {
+      pill(ctx, h.snap.x, h.snap.y - 34 * dpr, h.invalidReason, { bg: "rgba(217,45,32,0.95)", fg: "#fff", border: "rgba(0,0,0,0)" });
+    }
+    if (h.marquee) {
+      const [x0, y0, x1, y1] = h.marquee;
+      ctx.fillStyle = "rgba(47,111,237,0.08)";
+      ctx.fillRect(Math.min(x0, x1), Math.min(y0, y1), Math.abs(x1 - x0), Math.abs(y1 - y0));
+      ctx.setLineDash([6 * dpr, 4 * dpr]);
+      ctx.strokeStyle = HUD.accent;
+      ctx.lineWidth = 1.5 * dpr;
+      ctx.strokeRect(Math.min(x0, x1), Math.min(y0, y1), Math.abs(x1 - x0), Math.abs(y1 - y0));
+      ctx.setLineDash([]);
+    }
+  }
+
+  /** Point-insert feedback: an expanding, fading ring. */
+  function drawRings(ctx) {
+    const now = performance.now();
+    for (let i = rings.length - 1; i >= 0; i--) {
+      const t = (now - rings[i].t0) / INSERT_RING_MS;
+      if (t >= 1) { rings.splice(i, 1); continue; }
+      ctx.beginPath();
+      ctx.arc(rings[i].x, rings[i].y, (8 + 26 * t) * dpr, 0, Math.PI * 2);
+      ctx.strokeStyle = `rgba(47,111,237,${1 - t})`;
+      ctx.lineWidth = 3 * dpr * (1 - t) + 1;
+      ctx.stroke();
+    }
+    if (rings.length) requestRender(); // keep animating
+  }
+
   // ============================================================================
   // Chrome: top bar, tool dock, drawing bar, hint
   // ============================================================================
@@ -824,13 +1036,31 @@ async function main() {
   function hintText() {
     if (!stats.canAuthor) return "Add a level to start drawing (Menu → Levels)";
     const tap = COARSE ? "Tap" : "Click";
+    if (editing() && editState.tool === "select") {
+      if (editState.faces === 0) return "Draw a solid face to start the shape";
+      const noun = { points: "points", edges: "edges", faces: "faces" }[editState.mode];
+      if (COARSE) {
+        return editState.mode === "points"
+          ? "Tap · drag to move · hold an edge to add a point"
+          : `Tap ${noun} · drag to move or box-select`;
+      }
+      const hold = editState.mode === "points" ? " · hold an edge to add a point" : "";
+      return `${tap} ${noun} to select · drag to move · drag empty space to box-select${hold}`;
+    }
+    if (editing() && editState.tool === "split") {
+      return `${tap} two points: a line across the faces to split`;
+    }
     if (stats.tool === "window" && !inElevation()) {
       return stats.walls === 0 ? "Draw some walls first — windows go into walls" : `${tap} a wall to add windows to it`;
+    }
+    if (stats.tool === "hole") {
+      return stats.platesOnLevel === 0
+        ? "Draw a floor plate on this level first"
+        : `${tap} a floor plate to cut holes or indentations into it`;
     }
     if (!isDrawing()) return "";
     const h = lastHud.active ? lastHud : JSON.parse(app.hud_json());
     const n = h.count ?? 0;
-    if (stats.tool === "hole" && stats.platesOnLevel === 0) return "Draw a floor plate on this level first";
     if (stats.tool === "wall") {
       if (stats.shape === "rect") {
         return n === 0 ? `Drag, or ${tap.toLowerCase()} two opposite corners of the room` : `${tap} the opposite corner`;
@@ -849,6 +1079,8 @@ async function main() {
   }
 
   function renderChrome() {
+    editState = JSON.parse(app.edit_state_json());
+    renderEditChrome();
     $("undo").disabled = !stats.canUndo;
     $("redo").disabled = !stats.canRedo;
     for (const b of document.querySelectorAll("#view-toggle button")) {
@@ -968,6 +1200,12 @@ async function main() {
 
   // Tool dock ---------------------------------------------------------------------
   function setTool(tool) {
+    if (tool === "plate") {
+      // A new floor plate is authored as a profile, in Edit Mode.
+      if (app.edit_begin_new()) enterEditChrome();
+      else toast("Add a level first (Menu → Levels)", { kind: "error" });
+      return true;
+    }
     if (!app.set_tool(tool)) {
       toast("Add a level first (Menu → Levels)", { kind: "error" });
       return false;
@@ -1020,6 +1258,11 @@ async function main() {
   $("finish-draw").addEventListener("click", () => handlePlaced(app.sketch_finish()));
   function cancelDraw() {
     const discarded = app.sketch_cancel();
+    if (discarded === 0 && editing()) {
+      app.edit_set_tool("select");
+      refreshEdit();
+      return;
+    }
     if (discarded === 0 && inElevation()) endWindow();
     else if (discarded === 0) setTool("select");
     renderChrome();
@@ -1084,6 +1327,175 @@ async function main() {
   }
   $("window-done").addEventListener("click", () => endWindow());
 
+  // Edit Mode ---------------------------------------------------------------------------
+  // Autosave is suspended while editing: the document is saved as the
+  // session ends (✓), so an interrupted session (tab closed, crash) comes
+  // back as it was before editing — the same as ✗.
+  function refreshEdit() {
+    stats = JSON.parse(app.stats_json());
+    renderChrome();
+    requestRender();
+  }
+  /** Enter Edit Mode on a floor plate (a legacy plate is converted). */
+  function beginEdit(id, tool = null) {
+    if (!app.edit_begin(id)) {
+      toast("This element cannot be edited as a shape", { kind: "error" });
+      return;
+    }
+    if (tool) app.edit_set_tool(tool);
+    enterEditChrome();
+  }
+  function enterEditChrome() {
+    if (!$("sheet").hidden) closeSheet(false);
+    closePopover();
+    app.edit_set_mode(editState.mode ?? "faces");
+    refreshEdit();
+  }
+  function exitEditChrome() {
+    refreshEdit();
+    refresh();
+    saveNow();
+  }
+  function renderEditChrome() {
+    const on = editing();
+    document.body.classList.toggle("editing", on);
+    $("edit-bar").hidden = !on;
+    $("edit-dock").hidden = !on;
+    $("edit-panel").hidden = !on;
+    if (!on) return;
+    $("edit-name").textContent = editState.name;
+    $("edit-undo").disabled = !editState.canUndo;
+    $("edit-redo").disabled = !editState.canRedo;
+    for (const b of document.querySelectorAll("#edit-view-toggle button")) {
+      b.classList.toggle("on", b.dataset.view === stats.view);
+    }
+    for (const b of document.querySelectorAll("[data-edit-mode]")) {
+      b.classList.toggle("on", b.dataset.editMode === editState.mode && editState.tool === "select");
+    }
+    for (const b of document.querySelectorAll("[data-edit-tool]")) {
+      b.classList.toggle("on", b.dataset.editTool === editState.tool);
+    }
+    $("edit-delete").disabled = !editState.canDelete;
+    // Thickness panel: the selected faces, or the defaults for new faces.
+    const panel = editState.panel;
+    const sel = panel.target === "selection";
+    $("edit-panel").classList.toggle("target-new", !sel);
+    $("edit-panel-title").textContent = sel
+      ? `${editState.selection} face${editState.selection === 1 ? "" : "s"} selected`
+      : "New faces";
+    $("edit-panel-note").textContent = sel ? "" : "select faces to change them";
+    const solid = panel.solid, voidP = panel.void;
+    $("edit-solid-row").hidden = !solid;
+    $("edit-void-row").hidden = !voidP;
+    if (solid) {
+      guardValue($("edit-thickness"), solid.mixed ? "" : solid.thickness.toFixed(2));
+      $("edit-thickness").placeholder = solid.mixed ? "mixed" : "";
+      guardValue($("edit-thickness-slider"), String(solid.thickness));
+    }
+    if (voidP) {
+      guardValue($("edit-depth"), voidP.mixed ? "" : voidP.depth.toFixed(2));
+      guardValue($("edit-depth-slider"), String(voidP.depth));
+      $("edit-through").classList.toggle("on", voidP.through);
+      $("edit-through").setAttribute("aria-pressed", String(voidP.through));
+      $("edit-void-row").classList.toggle("dim", voidP.through);
+    }
+    const shapeRow = $("shape-toggle");
+    shapeRow.hidden = editState.tool === "split";
+  }
+  function guardValue(input, v) {
+    if (document.activeElement !== input && input.value !== v) input.value = v;
+  }
+  $("edit-confirm").addEventListener("click", () => editConfirm());
+  $("edit-cancel").addEventListener("click", () => editCancel());
+  function editConfirm() {
+    const res = JSON.parse(app.edit_confirm());
+    exitEditChrome();
+    if (res.deleted) {
+      toast(`${res.name} deleted — it had no faces left`, { action: { label: "Undo", fn: () => { if (app.undo()) refresh(); } } });
+    } else if (res.changed) {
+      toast(`${res.name} saved`, { kind: "ok", ms: 1600 });
+    }
+  }
+  async function editCancel() {
+    if (editState.canUndo) {
+      const ok = await confirmDialog({
+        title: "Discard your changes?",
+        message: `Everything you changed in ${editState.name} since you started editing will be undone.`,
+        ok: "Discard", danger: true,
+      });
+      if (!ok) return;
+    }
+    app.edit_cancel();
+    exitEditChrome();
+  }
+  $("edit-undo").addEventListener("click", () => { if (app.undo()) refreshEdit(); });
+  $("edit-redo").addEventListener("click", () => { if (app.redo()) refreshEdit(); });
+  for (const b of document.querySelectorAll("#edit-view-toggle button")) {
+    b.addEventListener("click", () => {
+      app.set_view_mode(b.dataset.view);
+      refreshEdit();
+      sessionSave();
+    });
+  }
+  for (const b of document.querySelectorAll("[data-edit-mode]")) {
+    b.addEventListener("click", () => {
+      app.edit_set_tool("select");
+      app.edit_set_mode(b.dataset.editMode);
+      refreshEdit();
+    });
+  }
+  for (const b of document.querySelectorAll("[data-edit-tool]")) {
+    b.addEventListener("click", () => {
+      const tool = editState.tool === b.dataset.editTool ? "select" : b.dataset.editTool;
+      app.edit_set_tool(tool);
+      refreshEdit();
+    });
+  }
+  $("edit-delete").addEventListener("click", () => editDelete());
+  function editDelete() {
+    const res = JSON.parse(app.edit_delete());
+    if (res.result === "rejected") toast(res.reason, { kind: "error" });
+    refreshEdit();
+  }
+  const editResult = (json) => {
+    const res = JSON.parse(json);
+    if (res.result === "rejected") toast(res.reason, { kind: "error" });
+    refreshEdit();
+  };
+  const bumpEdit = (which, step) => {
+    const panel = editState.panel;
+    if (which === "thickness" && panel.solid) {
+      editResult(app.edit_set_thickness(Math.round((panel.solid.thickness + step * FACE_THICKNESS_STEP_M) * 100) / 100));
+    } else if (which === "depth" && panel.void) {
+      editResult(app.edit_set_depth(Math.round((panel.void.depth + step * VOID_DEPTH_STEP_M) * 100) / 100));
+    }
+    app.edit_end_gesture();
+  };
+  for (const b of document.querySelectorAll("[data-edit-step]")) {
+    b.addEventListener("click", (e) => {
+      e.preventDefault();
+      bumpEdit(b.dataset.editStep, Number(b.dataset.step));
+    });
+  }
+  // Typing and slider drags coalesce into one undo step per gesture.
+  $("edit-thickness").addEventListener("input", (e) => {
+    const v = parseNum(e.target.value);
+    if (Number.isFinite(v)) editResult(app.edit_set_thickness(v));
+  });
+  $("edit-thickness").addEventListener("change", () => { app.edit_end_gesture(); refreshEdit(); });
+  $("edit-thickness-slider").addEventListener("input", (e) => editResult(app.edit_set_thickness(parseFloat(e.target.value))));
+  $("edit-thickness-slider").addEventListener("change", () => app.edit_end_gesture());
+  $("edit-depth").addEventListener("input", (e) => {
+    const v = parseNum(e.target.value);
+    if (Number.isFinite(v)) editResult(app.edit_set_depth(v));
+  });
+  $("edit-depth").addEventListener("change", () => { app.edit_end_gesture(); refreshEdit(); });
+  $("edit-depth-slider").addEventListener("input", (e) => editResult(app.edit_set_depth(parseFloat(e.target.value))));
+  $("edit-depth-slider").addEventListener("change", () => app.edit_end_gesture());
+  $("edit-through").addEventListener("click", () => {
+    editResult(app.edit_set_through(!(editState.panel.void?.through ?? true)));
+  });
+
   // Keyboard (desktop) ----------------------------------------------------------------
   window.addEventListener("keydown", (e) => {
     const t = e.target;
@@ -1106,6 +1518,16 @@ async function main() {
       return;
     }
     if (!$("dialog-backdrop").hidden) return;
+    if (editing() && !isDrawing()) {
+      if (e.key === "Enter") { e.preventDefault(); editConfirm(); }
+      else if (e.key === "Escape") { e.preventDefault(); app.edit_tap(-1e9, -1e9, 0, false); refreshEdit(); }
+      else if (e.key === "Delete" || e.key === "Backspace") { e.preventDefault(); editDelete(); }
+      else if (["1", "2", "3"].includes(e.key) && !mod) {
+        app.edit_set_mode(["points", "edges", "faces"][Number(e.key) - 1]);
+        refreshEdit();
+      }
+      return;
+    }
     if (isDrawing()) {
       if (e.key === "Enter") { e.preventDefault(); handlePlaced(app.sketch_finish()); }
       else if (e.key === "Escape") { e.preventDefault(); cancelDraw(); }
@@ -1122,7 +1544,7 @@ async function main() {
       e.preventDefault();
       deleteElement(app.selection());
     }
-    if (mod || e.altKey) return;
+    if (mod || e.altKey || editing()) return;
     const k = e.key.toLowerCase();
     if (k === "v" || k === "s") setTool("select");
     else if (k === "f") setTool("plate");
@@ -1153,7 +1575,7 @@ async function main() {
   function revealSelection() {
     if (innerWidth >= 760) return;
     const e = JSON.parse(app.selected_json());
-    const outline = e?.outline ?? (e?.start ? [e.start, e.end] : null);
+    const outline = e?.outline ?? e?.faces?.flatMap((f) => f.outline) ?? (e?.start ? [e.start, e.end] : null);
     if (!outline?.length) return;
     const lvl = JSON.parse(app.levels_json()).levels.find((l) => l.id === e.levelId);
     const z = lvl ? lvl.elevation : 0;
@@ -1229,12 +1651,16 @@ async function main() {
   // tap that OPENED the sheet is hit-tested after the sheet appears under
   // the finger — it must not focus an input (keyboard pop-up) or press a
   // button.
+  // Only an event at the tap's own position shortly after it is the
+  // ghost; deliberate taps elsewhere on the sheet pass.
   for (const type of ["mousedown", "click"]) {
     sheet.addEventListener(type, (e) => {
-      if (performance.now() - sheetOpenedAt < 450) {
-        e.preventDefault();
-        e.stopPropagation();
-      }
+      const g = ghostTap;
+      if (!g || performance.now() - g.t > GHOST_CLICK_MS) return;
+      if (Math.hypot(e.clientX - g.x, e.clientY - g.y) > GHOST_CLICK_PX) return;
+      e.preventDefault();
+      e.stopPropagation();
+      if (type === "click") ghostTap = null;
     }, true);
   }
 
@@ -1440,7 +1866,25 @@ async function main() {
         el("div", { class: "field" }, el("span", { class: "field-label", text: "Level" }), el("span", { class: "value", id: "prop-level", text: e.levelName ?? "—" })),
       ),
     ];
-    if (e.kind === "floor_plate") {
+    const editButton = (note) => el("button", {
+      type: "button", class: "btn primary block", id: "prop-edit", style: "margin-bottom:10px",
+      title: note ?? "Edit the shape: points, edges, faces, holes, thickness",
+      html: `<svg class="ico sm" viewBox="0 0 24 24"><path d="M4 20h4L19 9l-4-4L4 16z"/><path d="M13.5 6.5l4 4"/></svg> Edit shape`,
+      onclick: () => beginEdit(e.id),
+    });
+    if (e.kind === "floor_plate" && e.sketch) {
+      const solids = e.faces.filter((f) => f.kind === "solid").length;
+      children.push(
+        el("div", { class: "stat-grid" },
+          stat("Faces", "prop-face-count", String(e.faceCount)),
+          stat("Top area", "prop-area", fmtArea(e.area)),
+        ),
+        el("div", { class: "empty-note", id: "prop-face-note", style: "padding:0 4px 10px;text-align:left",
+          text: `${solids} solid · ${e.faceCount - solids} void — thickness is set per face in Edit shape.` }),
+        editButton(),
+      );
+    } else if (e.kind === "floor_plate") {
+      children.push(editButton("Converts this plate to an editable shape, then opens Edit Mode"));
       children.push(
         measureGroup({
           title: "Thickness", label: "Below level", id: "prop-thickness", value: e.thickness,
@@ -1509,7 +1953,10 @@ async function main() {
     const name = $("prop-name");
     if (name) guardAssign(name, e.name);
     if ($("prop-level")) $("prop-level").textContent = e.levelName ?? "—";
-    if (e.kind === "floor_plate") {
+    if (e.kind === "floor_plate" && e.sketch) {
+      $("prop-face-count").textContent = String(e.faceCount);
+      $("prop-area").textContent = fmtArea(e.area);
+    } else if (e.kind === "floor_plate") {
       guardAssign($("prop-thickness"), e.thickness.toFixed(2));
       guardAssign($("prop-thickness-slider"), String(e.thickness));
       $("prop-area").textContent = fmtArea(e.area);
@@ -1733,6 +2180,9 @@ async function main() {
     levels: () => JSON.parse(app.levels_json()),
     site: () => JSON.parse(app.site_json()),
     sketch: () => JSON.parse(app.sketch_json()),
+    editState: () => JSON.parse(app.edit_state_json()),
+    editProfile: () => JSON.parse(app.edit_profile_json()),
+    editHud: () => JSON.parse(app.edit_hud_json()),
     hud: () => JSON.parse(app.hud_json()),
     selected: () => JSON.parse(app.selected_json()),
     toasts: toastLog,

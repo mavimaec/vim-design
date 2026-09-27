@@ -23,6 +23,7 @@
 //!   scale.
 
 mod camera;
+mod edit;
 mod pick;
 mod walls;
 
@@ -45,6 +46,9 @@ use crate::gestures::Gestures;
 use crate::render::{LineLayer, MeshStyle, Renderer, RendererOptions};
 
 use camera::{Camera, ElevationFrame, ViewMode};
+use edit::{EditPointer, EditProfile, EditTool};
+use crate::authoring::edit::ProfileModel;
+use crate::authoring::edit::session::EditSession;
 use pick::PickScene;
 
 /// sRGB hex component -> linear.
@@ -202,6 +206,16 @@ pub struct AuthorApp {
     /// view), and the camera to return to when done.
     window_host: Option<EntityId>,
     prev_camera: Option<Camera>,
+    /// Edit Mode: the profile session, the active edit tool, and the
+    /// pointer state of a move drag.
+    edit: Option<EditSession<EditProfile>>,
+    edit_tool: EditTool,
+    edit_pointer: EditPointer,
+    /// The sketch entity being edited (kept when undone away, so redo
+    /// finds it again), and the element the session started on (`None`
+    /// for a new plate).
+    edit_sketch: Option<EntityId>,
+    edit_entry_element: Option<EntityId>,
     snap_enabled: bool,
     snap_step: f64,
     plate_thickness: f64,
@@ -262,6 +276,11 @@ impl AuthorApp {
             wall_flip: false,
             window_host: None,
             prev_camera: None,
+            edit: None,
+            edit_tool: EditTool::Select,
+            edit_pointer: EditPointer::default(),
+            edit_sketch: None,
+            edit_entry_element: None,
             snap_enabled: true,
             snap_step: 0.25,
             plate_thickness: 0.3,
@@ -475,7 +494,6 @@ impl AuthorApp {
         self.tool = tool;
         self.sketch = match (tool, self.active_level) {
             (Tool::Plate, Some(level)) => Some(Sketch::new(SketchTool::Plate, self.shape, level)),
-            (Tool::Hole, Some(level)) => Some(Sketch::new(SketchTool::Hole, self.shape, level)),
             (Tool::Wall, Some(level)) => Some(Sketch::new(SketchTool::Wall, self.wall_shape, level)),
             _ => None,
         };
@@ -583,6 +601,9 @@ impl AuthorApp {
         };
         let outcome = sketch.place();
         match outcome {
+            PlaceOutcome::Added if sketch.tool == SketchTool::Split && sketch.points.len() >= 2 => {
+                self.finish_sketch(false)
+            }
             PlaceOutcome::Added => {
                 let status = self.sketch_status();
                 let reason = status.and_then(|s| s.reason).map(|r| r.message());
@@ -1034,6 +1055,9 @@ impl AuthorApp {
     // -- Undo / redo --------------------------------------------------------
 
     pub fn undo(&mut self) -> bool {
+        if self.edit.is_some() {
+            return self.edit_undo();
+        }
         if self.gestures.undo(&mut self.doc) {
             self.sync("undo");
             true
@@ -1043,6 +1067,9 @@ impl AuthorApp {
     }
 
     pub fn redo(&mut self) -> bool {
+        if self.edit.is_some() {
+            return self.edit_redo();
+        }
         if self.gestures.redo(&mut self.doc) {
             self.sync("redo");
             true
@@ -1051,6 +1078,7 @@ impl AuthorApp {
         }
     }
 
+    /// Inside Edit Mode these are bounded by the session's transaction.
     pub fn can_undo(&self) -> bool {
         self.gestures.can_undo()
     }
@@ -1079,9 +1107,11 @@ impl AuthorApp {
             .iter()
             .map(|(id, msg)| format!("#{}: {}", id.0, msg))
             .collect();
-        let plates_on_level = self
-            .active_level
-            .map_or(0, |l| self.plate_outlines(l).len());
+        let plates_on_level = self.model.iter().filter(|e| match e {
+            ElementModel::Plate(p) => Some(p.plane_level) == self.active_level,
+            ElementModel::SketchPlate(p) => Some(p.plane_level) == self.active_level,
+            _ => false,
+        }).count();
         serde_json::json!({
             "backend": self.renderer.backend_name(),
             "msaa": self.renderer.sample_count(),
@@ -1110,6 +1140,7 @@ impl AuthorApp {
             "wallsOnLevel": self.model.iter().filter(|e| matches!(e,
                 ElementModel::Wall(w) if Some(w.plane_level) == self.active_level)).count(),
             "windowHost": self.window_host.map(|id| id.0 as f64),
+            "editing": self.edit.is_some(),
             "wall": {
                 "height": self.wall_height,
                 "thickness": self.wall_thickness,
@@ -1285,6 +1316,20 @@ impl AuthorApp {
                 step: self.snap_step,
                 ..SnapSources::default()
             },
+            SketchTool::Profile | SketchTool::Split => {
+                let view = self.edit.as_ref().map(|s| s.model.view()).unwrap_or_default();
+                let edges = view
+                    .edges()
+                    .iter()
+                    .filter_map(|e| Some((view.point(e.0)?, view.point(e.1)?)))
+                    .collect();
+                SnapSources {
+                    vertices: view.points.iter().map(|p| p.uv).collect(),
+                    edges,
+                    align: Vec::new(),
+                    step: self.snap_step,
+                }
+            }
             SketchTool::Plate | SketchTool::Wall => SnapSources {
                 vertices: self.level_vertices(sk.level),
                 edges: self.level_edges(sk.level),
@@ -1345,10 +1390,25 @@ impl AuthorApp {
                     out.push(w.start);
                     out.push(w.end);
                 }
+                ElementModel::SketchPlate(p) if p.plane_level == level && !self.is_edited(p.element) => {
+                    out.extend(p.sketch.points.iter().map(|q| q.uv));
+                }
                 _ => {}
             }
         }
         out
+    }
+
+    /// The element Edit Mode is working on (its own points snap through
+    /// the session, not as "other" geometry).
+    fn is_edited(&self, element: EntityId) -> bool {
+        self.edit.as_ref().and_then(|s| s.element) == Some(element)
+    }
+
+    fn is_plate(&self, element: EntityId) -> bool {
+        self.model.iter().any(|e| {
+            e.element() == element && matches!(e, ElementModel::Plate(_) | ElementModel::SketchPlate(_))
+        })
     }
 
     /// Snap edges on `level`'s plane: plate outlines and wall base lines
@@ -1364,6 +1424,13 @@ impl AuthorApp {
                 ElementModel::Wall(w) if w.plane_level == level && w.base_w.abs() < 1e-9 => {
                     out.push((w.start, w.end));
                 }
+                ElementModel::SketchPlate(p) if p.plane_level == level && !self.is_edited(p.element) => {
+                    for e in vim_design_lib::sketch::edges(&p.sketch) {
+                        if let (Ok(a), Ok(b)) = (p.sketch.uv(e.a), p.sketch.uv(e.b)) {
+                            out.push((a, b));
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -1373,7 +1440,9 @@ impl AuthorApp {
     fn sketch_status(&self) -> Option<sketch::SketchStatus> {
         let sk = self.sketch.as_ref()?;
         Some(match sk.tool {
-            SketchTool::Plate => sketch::status(sk, &SketchContext::Plate),
+            SketchTool::Plate | SketchTool::Profile | SketchTool::Split => {
+                sketch::status(sk, &SketchContext::Plate)
+            }
             SketchTool::Hole => {
                 let plates = self.plate_outlines(sk.level);
                 sketch::status(sk, &SketchContext::Hole(&plates))
@@ -1417,6 +1486,9 @@ impl AuthorApp {
             }
             Vec::new()
         };
+        if matches!(sketch.tool, SketchTool::Profile | SketchTool::Split) {
+            return self.finish_edit_sketch(sketch.tool, sketch.outline());
+        }
         let outline = sketch.outline();
         let depth = self.doc.undo_depth();
         let result: Result<(String, Option<EntityId>, &str), String> = match sketch.tool {
@@ -1463,6 +1535,7 @@ impl AuthorApp {
                 }
                 None => Err("the wall no longer exists".to_owned()),
             },
+            SketchTool::Profile | SketchTool::Split => Err("not a document sketch".to_owned()),
         };
         match result {
             Ok((notice, element, op)) => {
@@ -1530,6 +1603,36 @@ impl AuthorApp {
                 }
                 v
             }
+            ElementModel::SketchPlate(p) => {
+                let mut v = base;
+                let stats = self.pick.owner_stats(p.element);
+                let faces: Vec<serde_json::Value> = p
+                    .sketch
+                    .faces
+                    .iter()
+                    .map(|f| {
+                        let outline = vim_design_lib::sketch::face_polygon(&p.sketch, f.id).unwrap_or_default();
+                        match f.kind {
+                            vim_design_lib::sketch::SketchFaceKind::Solid { thickness } => serde_json::json!({
+                                "id": f.id, "kind": "solid", "thickness": thickness, "outline": outline,
+                            }),
+                            vim_design_lib::sketch::SketchFaceKind::Void { depth } => serde_json::json!({
+                                "id": f.id, "kind": "void", "depth": depth, "outline": outline,
+                            }),
+                        }
+                    })
+                    .collect();
+                if let Some(obj) = v.as_object_mut() {
+                    obj.insert("sketch".into(), true.into());
+                    obj.insert("faces".into(), faces.into());
+                    obj.insert("faceCount".into(), p.sketch.faces.len().into());
+                    obj.insert("area".into(), stats.map_or(0.0, |s| s.top_area).into());
+                    obj.insert("volume".into(), stats.map_or(0.0, |s| s.volume).into());
+                    obj.insert("triangles".into(), stats.map_or(0, |s| s.triangles).into());
+                    obj.insert("bbox".into(), stats.map_or(serde_json::Value::Null, |s| serde_json::json!(s.bbox)));
+                }
+                v
+            }
             ElementModel::Wall(w) => {
                 let mut v = base;
                 let windows: Vec<serde_json::Value> = w
@@ -1581,6 +1684,10 @@ impl AuthorApp {
         self.sketch = None;
         self.tool = Tool::Select;
         self.window_host = None;
+        self.edit = None;
+        self.edit_tool = EditTool::Select;
+        self.edit_sketch = None;
+        self.edit_entry_element = None;
         if let Some(c) = self.prev_camera.take() {
             self.camera = c;
         }
@@ -1662,7 +1769,7 @@ impl AuthorApp {
             self.pick.remove_instance(*id);
         }
         for mu in &updates.meshes {
-            let fallback = if self.plate(mu.id).is_some() {
+            let fallback = if self.is_plate(mu.id) {
                 rgb(CONCRETE)
             } else if self.wall(mu.id).is_some() {
                 rgb(WALL)
@@ -1796,7 +1903,7 @@ impl AuthorApp {
         for id in self.pick.owner_ids().collect::<Vec<_>>() {
             let element = self.model.iter().find(|e| e.element() == id);
             let level = element.and_then(|e| e.level());
-            let is_plate = matches!(element, Some(ElementModel::Plate(_)));
+            let is_plate = matches!(element, Some(ElementModel::Plate(_) | ElementModel::SketchPlate(_)));
             let is_wall = matches!(element, Some(ElementModel::Wall(_)));
             let depth_bias = if ortho && is_plate { PLATE_DEPTH_BIAS } else { 0.0 };
             // The plan cut exposes the inside of a wall: fill it flat.
@@ -1804,7 +1911,12 @@ impl AuthorApp {
             let other_level = self.camera.mode == ViewMode::Plan
                 && level.is_some()
                 && level != self.active_level;
-            let (tint, edge, unlit) = if Some(id) == self.selection {
+            let edited = self.edit.as_ref().and_then(|s| s.element) == Some(id);
+            let (tint, edge, unlit) = if edited {
+                // The profile overlay is the focus while editing; the
+                // live mesh stays readable under it.
+                ([cr, cg, cb, 0.3], rgba(EDGE, 0.3), 0.0)
+            } else if Some(id) == self.selection {
                 let a = if cut_wall { 0.85 } else { 0.34 };
                 (rgba(ACCENT, a), rgba(ACCENT, 1.0), if cut_wall { 1.0 } else { 0.0 })
             } else if Some(id) == self.window_host {

@@ -627,13 +627,11 @@ impl DemoApp {
             let [u0, v0] = state.points[0];
             if let Some((fx, fy)) =
                 self.project(Vec3::new(u0 as f32, v0 as f32, state.elevation as f32))
-            {
-                if (fx - px).hypot(fy - py) <= CLOSE_SNAP_PX {
+                && (fx - px).hypot(fy - py) <= CLOSE_SNAP_PX {
                     let n = state.points.len();
                     self.commit_draw();
                     return format!(r#"{{"result":"closed","points":{n}}}"#);
                 }
-            }
         }
         let elevation = state.elevation;
         let Some(uv) = self.unproject_to_plane(px, py, elevation) else {
@@ -1054,11 +1052,10 @@ impl DemoApp {
                 })
                 .map(|l| l.id)
         });
-        if let Some(active) = self.active_level {
-            if let Some(info) = levels.iter().find(|l| l.id == active) {
+        if let Some(active) = self.active_level
+            && let Some(info) = levels.iter().find(|l| l.id == active) {
                 self.active_elevation = info.elevation_m;
             }
-        }
 
         // Overlay quads, ascending elevation (back-to-front from the
         // usual above-the-scene camera). The active level is emphasized

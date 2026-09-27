@@ -164,13 +164,36 @@ the browser (`localStorage`, VIMD bytes as base64) and exports/imports as `.vimd
 drawing. Snapping, in priority order: the first vertex (closes the outline), existing
 corners, existing edges (plate outlines and wall base lines — tracing a plate edge is
 how walls go onto a plate), horizontal/vertical alignment with the previous and first
-vertex, the grid. Outlines the kernel would accept but that are wrong (self-crossing,
-zero area, holes or windows outside their host or touching each other) are rejected
+vertex, the grid. Outlines the kernel would accept but that are wrong (a self-crossing
+or zero-area face; windows outside their wall or touching each other) are rejected
 live in the UI.
 
-**Floor plates.** A horizontal profile face on the level plane, extruded downward by
-its thickness, so the top face sits at the level elevation. Holes are hole wires in the
-profile face; a new hole goes into the plate that strictly contains it.
+**Floor plates are sketches, authored in Edit Mode.** A floor plate is an element whose
+member is a `Sketch` (§9) hanging below its level. The Floor tool opens a new plate in
+Edit Mode; the pencil ("Edit shape") in a plate's properties opens an existing one; the
+Hole tool opens the tapped plate with the Void tool armed. Edit Mode is modal:
+
+- **Enter / leave.** ✓ keeps the changes as ONE undo step of the main history; ✗
+  reverts the document to its state at entry (byte-identical). Inside, Undo/Redo step
+  through single edits and never past the entry. A new plate is created with its first
+  face; ✓ with no faces leaves nothing (an existing plate left without faces is
+  deleted). Menu and level switching are unavailable while editing; autosave pauses
+  and saves when the session ends, so a closed tab comes back as it was before editing.
+- **Tools.** Selection mode Points | Edges | Faces; Solid face and Void face (polygon or
+  rectangle); Split line (two points; splits every face it crosses); Delete. The
+  thickness panel edits the selected faces — thickness for solids, depth or "Through"
+  for voids — or the defaults for new faces. Every edit is one `UpdateSketch`; slider
+  and typing gestures coalesce into one step, and the 3D mesh follows live.
+- **Gestures.** Tap selects (shift/ctrl adds on desktop), tap empty space clears; drag
+  on an item moves the selection (snapping to other points, alignment, grid; a move that
+  would cross a face snaps back); drag on empty space draws a selection box; hold on an
+  edge in Points mode inserts a point there; two fingers always navigate.
+- **Deletes.** A face takes its private points with it; an edge merges its two points
+  into the first one in loop order; a point is removed and its neighbours reconnect.
+- **Legacy plates** (extrusion + hole wires, from before sketches) still display, select,
+  and delete. The pencil converts one in place (same element, name, and level; outline →
+  solid face with its thickness, each hole → through void; the old construction chain
+  is deleted) inside the Edit Mode session, so ✗ undoes the conversion too.
 
 **Walls.** The drawn line is one face of the wall; the thickness grows to the left of
 the drawing direction (to the right with "flip side"). A closed loop is normalized
@@ -186,12 +209,12 @@ thickness; at a reflex corner the previous segment's end is extended by it.
 facing the wall's profile face, with a wall-local grid: `u` along the wall from its
 start (the drawn direction), `v` up from the level (world up) — a basis from stable
 inputs only, so it never flips. A window is a hole wire in the wall's profile face — the
-same face-with-holes construction as plate holes, no booleans. It must stay 5 cm inside
+same face-with-holes construction as the legacy plate holes, no booleans. It must stay 5 cm inside
 the face and must not touch other windows.
 
-**Attachment.** Every point of plates, walls, and windows is attached to the level it
-was drawn on, so a level elevation edit moves everything on it as a transform only
-(no re-evaluation, no re-tessellation).
+**Attachment.** Sketches live on their level, and every point of walls and windows is
+attached to the level it was drawn on, so a level elevation edit moves everything on it
+as a transform only (no re-evaluation, no re-tessellation).
 
 **Known limitations.**
 - Butt joins are exact only at 90°; at other angles the corner blocks overlap or leave
