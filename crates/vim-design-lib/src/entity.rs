@@ -13,6 +13,7 @@ use crate::selection::{PredicateAst, SelectionScope};
 use crate::status::VimStatus;
 use crate::sketch::{Sketch, SketchDirection};
 use crate::subref::{EdgeTarget, FaceTarget};
+use crate::wall_run::{Opening, RunPoint, SegmentProfile};
 
 /// The closed set of entity kinds (docs/ARCHITECTURE.md §3.1).
 #[derive(
@@ -49,6 +50,9 @@ pub enum EntityKind {
     /// A wall: a reference line on a construction plane and an editable
     /// elevation profile, optionally height-constrained by a top plane.
     Wall,
+    /// A wall as a thickened polyline with exact joins at any angle,
+    /// rectangular openings, and optional per-segment profiles.
+    WallRun,
 }
 
 /// Per-kind parameters — a closed serde enum with one variant per
@@ -197,6 +201,20 @@ pub enum Params {
         profile: Sketch,
         top_points: Vec<u32>,
     },
+    /// A wall run on its base plane (see [`crate::wall_run`]): the
+    /// reference polyline in the base plane's (u, v), material
+    /// `thickness_m` to its left; `height_m` is the top reference unless
+    /// the top slot is wired (then the top plane raised by
+    /// `top_offset_m`).
+    WallRun {
+        points: Vec<RunPoint>,
+        closed: bool,
+        thickness_m: f64,
+        height_m: f64,
+        top_offset_m: f64,
+        openings: Vec<Opening>,
+        profiles: Vec<SegmentProfile>,
+    },
 }
 
 impl Params {
@@ -225,6 +243,7 @@ impl Params {
             Params::Sketch { .. } => EntityKind::Sketch,
             Params::Workplane { .. } => EntityKind::Workplane,
             Params::Wall { .. } => EntityKind::Wall,
+            Params::WallRun { .. } => EntityKind::WallRun,
         }
     }
 }
@@ -312,6 +331,8 @@ pub mod slot {
     pub const WORKPLANE_PARENT: usize = 0;
     pub const WALL_BASE: usize = 0;
     pub const WALL_TOP: usize = 1;
+    pub const WALL_RUN_BASE: usize = 0;
+    pub const WALL_RUN_TOP: usize = 1;
 }
 
 const NO_SLOTS: &[SlotDecl] = &[];
@@ -515,6 +536,21 @@ const CHAMFER_SLOTS: &[SlotDecl] = &[
     },
 ];
 
+const WALL_RUN_SLOTS: &[SlotDecl] = &[
+    SlotDecl {
+        name: "base",
+        accepted: CONSTRUCTION_PLANES,
+        required: true,
+        multi: false,
+    },
+    SlotDecl {
+        name: "top",
+        accepted: CONSTRUCTION_PLANES,
+        required: false,
+        multi: false,
+    },
+];
+
 const ELEMENT_SLOTS: &[SlotDecl] = &[
     SlotDecl {
         name: "members",
@@ -525,6 +561,7 @@ const ELEMENT_SLOTS: &[SlotDecl] = &[
             EntityKind::Chamfer,
             EntityKind::Sketch,
             EntityKind::Wall,
+            EntityKind::WallRun,
         ],
         required: true,
         multi: true,
@@ -575,6 +612,7 @@ const ANY_KIND: &[EntityKind] = &[
     EntityKind::Sketch,
     EntityKind::Workplane,
     EntityKind::Wall,
+    EntityKind::WallRun,
 ];
 
 // Mirror of the explicit scope ids in `Params::Selection::scope`
@@ -616,6 +654,7 @@ pub fn slots(kind: EntityKind) -> &'static [SlotDecl] {
         EntityKind::Sketch => SKETCH_SLOTS,
         EntityKind::Workplane => WORKPLANE_SLOTS,
         EntityKind::Wall => WALL_SLOTS,
+        EntityKind::WallRun => WALL_RUN_SLOTS,
         EntityKind::ControlPoint => CONTROL_POINT_SLOTS,
         EntityKind::Circle => CIRCLE_SLOTS,
         EntityKind::Line => LINE_SLOTS,
@@ -722,6 +761,7 @@ mod tests {
         EntityKind::Sketch,
         EntityKind::Workplane,
         EntityKind::Wall,
+        EntityKind::WallRun,
     ];
 
     #[test]

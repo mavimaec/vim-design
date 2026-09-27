@@ -25,6 +25,9 @@ monstertruck-meshing = "=0.4.0"
 # Robust 2D polygon booleans for sketch profiles (pure Rust, no default
 # features: no rayon).
 i_overlay = { version = "9.0", default-features = false }
+# Polygon-with-holes triangulation for planar meshes (same integer core
+# as i_overlay; no default features).
+i_triangle = { version = "0.49", default-features = false }
 
 # Serialization (docs/ARCHITECTURE.md §10).
 serde = { version = "1", features = ["derive"] }

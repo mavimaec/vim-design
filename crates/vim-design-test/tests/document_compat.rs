@@ -15,7 +15,14 @@
 //! `Sketch` (two solid faces, a through void, a pocket void) instead of
 //! an extrusion.
 //!
-//! `write_fixture` / `write_fixture_v2` are the generators. They only
+//! `fixtures/authoring_project_v3.vimd` was saved by the library as it
+//! was before the `WallRun` entity kind existed: the Site, levels, a
+//! ceiling workplane, the Sketch floor plate, and `Wall` entities —
+//! fixed height, up to Level 2, and up to the workplane — with windows
+//! and a door.
+//!
+//! `write_fixture` / `write_fixture_v2` / `write_fixture_v3` are the
+//! generators. They only
 //! write when the environment variable `VIMD_WRITE_COMPAT_FIXTURE` is
 //! set; regenerate a fixture only on an intentional, announced format
 //! break.
@@ -32,6 +39,10 @@ const FIXTURE: &str = concat!(
 const FIXTURE_V2: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/fixtures/authoring_project_v2.vimd"
+);
+const FIXTURE_V3: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/fixtures/authoring_project_v3.vimd"
 );
 
 fn one(doc: &mut Document, cmd: Command) -> EntityId {
@@ -134,9 +145,88 @@ fn build_project() -> Document {
     doc
 }
 
+/// The Sketch-plate project with `Wall` entities and a workplane.
+fn build_project_v3() -> Document {
+    use vim_design_lib::wall::{default_profile, ops as wall_ops};
+    let (mut doc, ground) = seed();
+    let second = doc
+        .entities()
+        .find(|(_, r)| matches!(&r.params, Params::Level { name, .. } if name == "Level 2"))
+        .map(|(id, _)| *id)
+        .expect("Level 2");
+    let ceiling = one(
+        &mut doc,
+        Command::CreateWorkplane {
+            parent: ground,
+            name: "Ceiling".to_owned(),
+            offset_m: 2.6,
+            color: [0.5, 0.5, 0.5, 0.25],
+            extent_m: 10.0,
+        },
+    );
+    sketch_plate(&mut doc, ground);
+    // A closed CCW run on the plate edge, material inward (left).
+    let corners: [[f64; 2]; 4] = [[0.0, 0.0], [8.0, 0.0], [8.0, 6.0], [0.0, 6.0]];
+    let window = [[2.0, 0.9], [3.2, 0.9], [3.2, 1.9], [2.0, 1.9]];
+    let door = [[1.0, -0.5], [1.9, -0.5], [1.9, 2.1], [1.0, 2.1]];
+    // (top plane, top offset, fixed height, H for editing, void)
+    type WallSpec = (Option<EntityId>, f64, f64, f64, Option<[[f64; 2]; 4]>);
+    let walls: [WallSpec; 4] = [
+        (None, 0.0, 2.7, 2.7, Some(window)),
+        (None, 0.0, 2.7, 2.7, None),
+        (Some(second), -0.3, 2.7, 2.7, Some(door)),
+        (Some(ceiling), 0.0, 2.7, 2.6, Some(window)),
+    ];
+    for (i, (top, top_offset, height, h, void)) in walls.into_iter().enumerate() {
+        let a = corners[i];
+        let b = corners[(i + 1) % 4];
+        let length = ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2)).sqrt();
+        let (mut profile, mut top_points) = default_profile(length, 0.2);
+        if let Some(outline) = void {
+            (profile, top_points) = wall_ops::add_face(
+                &profile,
+                &top_points,
+                h,
+                &outline,
+                SketchFaceKind::Void { depth: None },
+            )
+            .expect("add_face");
+        }
+        let wall = one(
+            &mut doc,
+            Command::CreateWall {
+                base: ground,
+                top,
+                start: a,
+                end: b,
+                height_m: height,
+                top_offset_m: top_offset,
+                profile,
+                top_points,
+            },
+        );
+        one(
+            &mut doc,
+            Command::CreateElement {
+                name: format!("Wall {}", i + 1),
+                members: vec![wall],
+                level: ground,
+            },
+        );
+    }
+    doc
+}
+
 /// The same project with the floor plate authored as a `Sketch`.
 fn build_project_v2() -> Document {
     let (mut doc, ground) = seed();
+    sketch_plate(&mut doc, ground);
+    walls_with_windows(&mut doc, ground);
+    doc
+}
+
+/// A Sketch floor plate: two solid faces, a through void, a pocket.
+fn sketch_plate(doc: &mut Document, ground: EntityId) {
     let mut plate = Sketch::default();
     for (outline, kind) in [
         (
@@ -159,7 +249,7 @@ fn build_project_v2() -> Document {
         plate = ops::add_face(&plate, &outline, kind).expect("add_face");
     }
     let sketch = one(
-        &mut doc,
+        doc,
         Command::CreateSketch {
             plane: ground,
             sketch: plate,
@@ -167,15 +257,13 @@ fn build_project_v2() -> Document {
         },
     );
     one(
-        &mut doc,
+        doc,
         Command::CreateElement {
             name: "Floor plate 1".to_owned(),
             members: vec![sketch],
             level: ground,
         },
     );
-    walls_with_windows(&mut doc, ground);
-    doc
 }
 
 /// Site and the two default levels; returns (document, Ground).
@@ -349,6 +437,35 @@ fn write_fixture_v2() {
 }
 
 #[test]
+#[ignore = "generator: writes the fixture only when VIMD_WRITE_COMPAT_FIXTURE is set"]
+fn write_fixture_v3() {
+    if std::env::var_os("VIMD_WRITE_COMPAT_FIXTURE").is_none() {
+        return;
+    }
+    let bytes = build_project_v3().save().expect("save");
+    std::fs::write(FIXTURE_V3, bytes).expect("write fixture");
+}
+
+#[test]
+fn saved_wall_project_loads_evaluates_and_resaves_identically() {
+    let bytes = std::fs::read(FIXTURE_V3).expect("read fixture");
+    let mut doc = Document::load(&bytes).expect("a saved project must still load");
+    doc.debug_validate().expect("loaded graph is consistent");
+    assert_eq!(doc.save().expect("save"), bytes, "load -> save must reproduce the saved bytes");
+    let count = |kind: EntityKind| doc.entities().filter(|(_, r)| r.kind() == kind).count();
+    assert_eq!(count(EntityKind::Workplane), 1);
+    assert_eq!(count(EntityKind::Sketch), 1);
+    assert_eq!(count(EntityKind::Wall), 4);
+    assert_eq!(count(EntityKind::Element), 5);
+    let mut engine = Engine::new();
+    engine.evaluate_pending(&mut doc);
+    let updates = engine.poll_updates(&doc);
+    assert!(updates.errors.is_empty(), "{:?}", updates.errors);
+    assert_eq!(updates.meshes.len(), 5);
+    assert_eq!(build_project_v3().save().expect("save"), bytes, "generator reproduces it");
+}
+
+#[test]
 fn saved_sketch_project_loads_evaluates_and_resaves_identically() {
     let bytes = std::fs::read(FIXTURE_V2).expect("read fixture");
     let mut doc = Document::load(&bytes).expect("a saved project must still load");
@@ -439,4 +556,45 @@ fn the_generator_still_reproduces_the_fixture() {
     // the app submits compile to the same entities as before.
     let bytes = std::fs::read(FIXTURE).expect("read fixture");
     assert_eq!(build_project().save().expect("save"), bytes);
+}
+
+/// The saved walls convert into a wall run where they share their
+/// planes, and the run round-trips through save and load.
+#[test]
+fn saved_walls_convert_into_a_wall_run() {
+    let bytes = std::fs::read(FIXTURE_V3).expect("read fixture");
+    let mut doc = Document::load(&bytes).expect("load");
+    let mut walls: Vec<EntityId> = doc
+        .entities()
+        .filter(|(_, r)| r.kind() == EntityKind::Wall)
+        .map(|(id, _)| *id)
+        .collect();
+    walls.sort_unstable();
+    assert!(matches!(
+        vim_design_lib::wall_run::from_walls(&doc, &walls),
+        Err(vim_design_lib::wall_run::FromWallsError::MixedPlanes(_))
+    ));
+    let (run, base, top) = vim_design_lib::wall_run::from_walls(&doc, &walls[..2]).expect("convert");
+    assert_eq!((run.points.len(), run.openings.len(), run.closed), (3, 1, false));
+    let id = one(
+        &mut doc,
+        Command::CreateWallRun {
+            base,
+            top,
+            points: run.points.clone(),
+            closed: run.closed,
+            thickness_m: run.thickness_m,
+            height_m: run.height_m,
+            top_offset_m: run.top_offset_m,
+            openings: run.openings.clone(),
+            profiles: run.profiles.clone(),
+        },
+    );
+    let mut engine = Engine::new();
+    engine.evaluate_pending(&mut doc);
+    assert!(engine.poll_updates(&doc).errors.is_empty());
+    let saved = doc.save().expect("save");
+    let reloaded = Document::load(&saved).expect("load");
+    assert_eq!(reloaded.save().expect("save"), saved);
+    assert!(matches!(reloaded.entity(id).map(|r| &r.params), Some(Params::WallRun { .. })));
 }

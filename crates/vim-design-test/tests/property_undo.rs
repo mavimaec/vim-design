@@ -6,6 +6,10 @@
 use proptest::prelude::*;
 use vim_design_lib::sketch::{Sketch, SketchDirection, SketchFaceKind, ops};
 use vim_design_lib::wall::{self, ops as wall_ops};
+use vim_design_lib::wall_run::{
+    self, Opening, OpeningKind, RunPoint, WallRunData,
+    ops::{self as run_ops, RunEnd},
+};
 use vim_design_lib::{Command, Document, EntityId, EntityKind, Params};
 
 /// Abstract operations; indexes are resolved against the entities that
@@ -43,6 +47,12 @@ enum Op {
     UpdateLevelElevation { pick: usize, elevation: i16, coalesce: bool },
     AttachCp { cp: usize, level: usize, detach: bool },
     DeleteLevelCascade(usize),
+    // Wall runs: creation (open or closed, with or without a top), random
+    // edits through the pure run operations, and the workplane cascade
+    // (which disconnects topped runs and walls).
+    CreateWallRun { base: usize, top: Option<usize>, corners: u8, closed: bool },
+    EditWallRun { pick: usize, op: u8, a: usize, x: i8, coalesce: bool },
+    DeleteWorkplaneCascade(usize),
 }
 
 fn op_strategy() -> impl Strategy<Value = Op> {
@@ -86,6 +96,11 @@ fn op_strategy() -> impl Strategy<Value = Op> {
             .prop_map(|(base, top, len)| Op::CreateWall { base, top, len }),
         3 => (any::<usize>(), 0u8..6, any::<usize>(), any::<i8>(), any::<bool>())
             .prop_map(|(pick, op, a, x, coalesce)| Op::EditWall { pick, op, a, x, coalesce }),
+        2 => (any::<usize>(), prop::option::of(any::<usize>()), 2u8..6, any::<bool>())
+            .prop_map(|(base, top, corners, closed)| Op::CreateWallRun { base, top, corners, closed }),
+        4 => (any::<usize>(), 0u8..10, any::<usize>(), any::<i8>(), any::<bool>())
+            .prop_map(|(pick, op, a, x, coalesce)| Op::EditWallRun { pick, op, a, x, coalesce }),
+        1 => any::<usize>().prop_map(Op::DeleteWorkplaneCascade),
     ]
 }
 
@@ -148,6 +163,65 @@ fn edit_wall(doc: &Document, id: EntityId, op: u8, a: usize, x: i8, coalesce: bo
         top_offset_m: None,
         profile: Some(profile),
         top_points: Some(top_points),
+        coalesce,
+    })
+}
+
+/// One random wall-run edit through `wall_run::ops`, or `None` when it
+/// does not apply (an invalid result is an op error, not a command).
+fn edit_wall_run(doc: &Document, id: EntityId, op: u8, a: usize, x: i8, coalesce: bool) -> Option<Command> {
+    let run = WallRunData::from_params(&doc.entity(id)?.params)?;
+    let height = wall_run::run_top_height(doc, id)?;
+    let d = f64::from(x) * 0.02;
+    let point = run.points.get(a % run.points.len().max(1))?.id;
+    let segments = run.segments();
+    let segment = *segments.get(a % segments.len().max(1))?;
+    let opening = run.openings.get(a % run.openings.len().max(1)).map(|o| o.id);
+    let edited = match op {
+        0 => run_ops::move_points(&run, &[point], [d, -d]),
+        1 => run_ops::move_edges(&run, &[segment], [d, d]),
+        2 => {
+            let length = run.segment_length(segment)?;
+            run_ops::insert_point(&run, segment, length * 0.5, height).map(|(r, _)| r)
+        }
+        3 => run_ops::delete_points(&run, &[point]),
+        4 => run_ops::delete_edges(&run, &[segment]),
+        5 => run_ops::extend(&run, if a.is_multiple_of(2) { RunEnd::Start } else { RunEnd::End }, [d * 50.0, 3.0])
+            .map(|(r, _)| r),
+        6 => run_ops::set_closed(&run, !run.closed),
+        7 => {
+            let (lo, hi) = wall_run::segment_clear_span(&run, segment).ok()?;
+            let width = ((hi - lo) * 0.4).min(1.0);
+            run_ops::add_opening(
+                &run,
+                Opening {
+                    id: 0,
+                    segment,
+                    offset_m: lo + (hi - lo - width) * 0.5,
+                    sill_m: 0.9,
+                    width_m: width,
+                    height_m: 1.0,
+                    kind: if x < 0 { OpeningKind::Door } else { OpeningKind::Window },
+                    depth_m: if a.is_multiple_of(3) { Some(0.05) } else { None },
+                },
+            )
+            .map(|(r, _)| r)
+        }
+        8 => run_ops::move_opening(&run, opening?, [d, d]),
+        _ => run_ops::delete_opening(&run, opening?),
+    };
+    let run = edited.ok()?;
+    Some(Command::UpdateWallRun {
+        id,
+        base: None,
+        top: None,
+        points: Some(run.points),
+        closed: Some(run.closed),
+        thickness_m: None,
+        height_m: None,
+        top_offset_m: None,
+        openings: Some(run.openings),
+        profiles: Some(run.profiles),
         coalesce,
     })
 }
@@ -296,6 +370,7 @@ fn run_op(doc: &mut Document, op: &Op) {
                     Some(EntityKind::Extrusion) => Command::DeleteExtrusion { id },
                     Some(EntityKind::Sketch) => Command::DeleteSketch { id },
                     Some(EntityKind::Wall) => Command::DeleteWall { id },
+                    Some(EntityKind::WallRun) => Command::DeleteWallRun { id },
                     Some(EntityKind::Workplane) => Command::DeleteWorkplane { id },
                     _ => fallback,
                 },
@@ -354,6 +429,7 @@ fn run_op(doc: &mut Document, op: &Op) {
             producers.extend(ids_of_kind(doc, EntityKind::Revolve));
             producers.extend(ids_of_kind(doc, EntityKind::Sketch));
             producers.extend(ids_of_kind(doc, EntityKind::Wall));
+            producers.extend(ids_of_kind(doc, EntityKind::WallRun));
             producers.sort_unstable();
             let levels = ids_of_kind(doc, EntityKind::Level);
             match (pick(&producers, *member), pick(&levels, *level)) {
@@ -443,6 +519,49 @@ fn run_op(doc: &mut Document, op: &Op) {
             pick(&walls, *p)
                 .and_then(|id| edit_wall(doc, id, *op, *a, *x, *coalesce))
                 .unwrap_or(fallback)
+        }
+        Op::CreateWallRun { base, top, corners, closed } => {
+            let all = planes(doc);
+            let n = usize::from(*corners).max(2);
+            let closed = *closed && n >= 3;
+            let points: Vec<RunPoint> = (0..n)
+                .map(|i| {
+                    let angle = std::f64::consts::TAU * i as f64 / n as f64;
+                    let uv = if closed {
+                        [3.0 * angle.cos(), 3.0 * angle.sin()]
+                    } else {
+                        [4.0 * i as f64, if i % 2 == 0 { 0.0 } else { 2.0 }]
+                    };
+                    RunPoint { id: i as u32, uv }
+                })
+                .collect();
+            match pick(&all, *base) {
+                Some(base) => Command::CreateWallRun {
+                    base,
+                    top: top.and_then(|t| pick(&all, t)),
+                    points,
+                    closed,
+                    thickness_m: 0.2,
+                    height_m: 2.7,
+                    top_offset_m: 0.0,
+                    openings: vec![],
+                    profiles: vec![],
+                },
+                None => fallback,
+            }
+        }
+        Op::EditWallRun { pick: p, op, a, x, coalesce } => {
+            let runs = ids_of_kind(doc, EntityKind::WallRun);
+            pick(&runs, *p)
+                .and_then(|id| edit_wall_run(doc, id, *op, *a, *x, *coalesce))
+                .unwrap_or(fallback)
+        }
+        Op::DeleteWorkplaneCascade(i) => {
+            let workplanes = ids_of_kind(doc, EntityKind::Workplane);
+            match pick(&workplanes, *i) {
+                Some(id) => Command::DeleteWorkplaneCascade { id },
+                None => fallback,
+            }
         }
         Op::DeleteElement { pick: p, sweep } => {
             let elements = ids_of_kind(doc, EntityKind::Element);

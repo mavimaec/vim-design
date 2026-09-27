@@ -20,7 +20,7 @@
 //! Output slivers under the tolerance area are dropped.
 
 use i_overlay::core::fill_rule::FillRule;
-use i_overlay::core::overlay_rule::OverlayRule;
+pub(crate) use i_overlay::core::overlay_rule::OverlayRule;
 use i_overlay::core::solver::Solver;
 use i_overlay::float::overlay::{FloatOverlay, OverlayOptions};
 
@@ -145,6 +145,17 @@ fn breakpoints(faces: &[FaceData]) -> Vec<f64> {
 }
 
 fn overlay(subject: &[Vec<P2>], clip: &[Vec<P2>]) -> Result<Vec<Vec<Vec<P2>>>, LayerError> {
+    boolean(subject, clip, OverlayRule::Difference)
+}
+
+/// A 2D boolean of two ring sets (non-zero fill), keeping collinear
+/// vertices, dropping slivers under the tolerance area. Output shapes are
+/// an outer ring (counter-clockwise) followed by hole rings (clockwise).
+pub(crate) fn boolean(
+    subject: &[Vec<P2>],
+    clip: &[Vec<P2>],
+    rule: OverlayRule,
+) -> Result<Vec<Vec<Vec<P2>>>, LayerError> {
     let run = || {
         let mut options: OverlayOptions<f64, i64> = OverlayOptions::default();
         // Keep collinear vertices: every output edge must lie on ONE
@@ -161,7 +172,7 @@ fn overlay(subject: &[Vec<P2>], clip: &[Vec<P2>]) -> Result<Vec<Vec<Vec<P2>>>, L
             options,
             Solver::default(),
         );
-        engine.overlay(OverlayRule::Difference, FillRule::NonZero)
+        engine.overlay(rule, FillRule::NonZero)
     };
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)).map_err(|payload| {
         let msg = payload

@@ -118,6 +118,20 @@ Plus two kinds from the authoring-tool direction (2026-08-23, see
   the line, v up, material to the left). Structural problems reject (`InvalidWall`);
   a non-positive top reference or a self-crossing effective profile is a per-entity
   evaluation error. See AUTHORING.md §10.
+- **`WallRun`** — a wall as a thickened polyline: run points (run-local id + (u, v) on
+  the base plane), `closed`, one `thickness_m` (material to the left of the direction of
+  travel), `height_m` / `top_offset_m` as for `Wall`, rectangular `openings` (window or
+  door, through or niche) and optional per-segment elevation `profiles` (a `Sketch` per
+  segment, for a gable). Slots: 0 `base` (required), 1 `top` (optional), both
+  construction planes. Segments meet in exact miters at any angle (a bevel on the
+  outside of a turn sharper than the miter limit); a segment is named by its start point
+  id, and faces by `RunFace { segment, part }` (§3.4). Structural problems reject
+  (`InvalidWallRun`); geometric ones (a self-crossing line, a fold-back join, an opening
+  in a join zone, overlapping material) are per-entity evaluation errors, and
+  `wall_run::validate` checks them up front. Deleting a construction plane that is only
+  the TOP of a `Wall` or `WallRun` disconnects it (it keeps its current height as a
+  fixed height, in the same undo step); deleting its base deletes it. See AUTHORING.md
+  §11.
 
 > Note: `Element`/`Instance` commands (`CreateElement`, `CreateInstance`, …) extend the
 > command list in the requirements; they fall out of the performance requirement (§8 of
@@ -174,6 +188,10 @@ the wrong face. The rule here, mandatory from the first evaluator onward:
   the provenance of the input faces that produced each output face.
 - Operations **propagate** provenance through their outputs (a chamfer's blend face is
   named by the edge it blends; a cut face by the cutting plane).
+- A wall run's faces are `RunFace { segment, part }`: the segment's start point id and
+  the part (`Reference`, `Opposite`, `Top`, `Bottom`, `Start`, `End`,
+  `Opening { opening }`, `NicheBack { depth_um }`, `ProfileVoid { face }`). A face split
+  by an opening or built from several pieces keeps one name.
 - Commands and slots reference subelements **only via `SubRef`** (or its set-valued
   sibling `SubRefSet`, a provenance *query* — §3.5), **never by index**.
 
@@ -429,6 +447,15 @@ The caller-facing output contract:
 - Buffers returned by a poll are owned by the library and remain valid until the next
   poll on that handle (double-buffered internally); the caller copies or uploads to GPU
   within the frame.
+- **Direct planar meshing.** Solids built from 2D data with straight edges (sketch
+  prisms, walls, wall runs) skip kernel tessellation: the faces of all such solids of
+  one element member are meshed together by `planar_mesh`. Coplanar faces with the same
+  name merge, coincident opposite faces cancel (stacked layers and adjacent wall-run
+  pieces leave no internal faces), shared boundaries get the same vertices (no
+  T-junctions), and each face is one constrained triangulation (`i_triangle`, on the
+  `i_overlay` integer core) with a flat normal: `n + 2h - 2` triangles for a face with
+  `n` boundary vertices and `h` holes, 12 for a rectangle plate. The BREP stays the
+  provenance and query model.
 - Tessellation quality: chordal deviation tolerance, default **1 mm** (0.001 m), and
   angular tolerance default ~20°; both configurable per document. Quality is a
   *presentation policy*, never a modeling parameter: it lives in document settings (a

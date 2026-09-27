@@ -667,12 +667,88 @@ fn deleting_the_element_sweeps_the_wall_and_cascades_take_it() {
     doc.undo().expect("undo");
     assert_eq!(save(&doc), before);
 
-    // The TOP level's cascade also takes the wall (it is a dependent).
-    ok(&mut doc, Command::DeleteLevel { id: second, cascade: true });
+    // The BASE level's cascade takes the wall.
+    ok(&mut doc, Command::DeleteLevel { id: ground, cascade: true });
     assert!(doc.entity(placed.wall).is_none());
     assert!(doc.entity(placed.element).is_none());
-    assert!(doc.entity(ground).is_some());
     doc.undo().expect("undo cascade");
     assert_eq!(save(&doc), before);
     vim_design_test::assert_save_load_roundtrip(&doc);
+}
+
+fn wall_top(doc: &Document, wall: EntityId) -> Option<EntityId> {
+    doc.entity(wall)
+        .and_then(|r| r.inputs.get(vim_design_lib::entity::slot::WALL_TOP))
+        .and_then(|s| s.referenced().next())
+}
+
+fn wall_height_param(doc: &Document, wall: EntityId) -> Option<f64> {
+    match doc.entity(wall).map(|r| &r.params) {
+        Some(vim_design_lib::Params::Wall { height_m, .. }) => Some(*height_m),
+        _ => None,
+    }
+}
+
+#[test]
+fn deleting_the_top_level_disconnects_walls_that_reach_it() {
+    let mut doc = Document::new();
+    let mut engine = Engine::new();
+    let ground = level(&mut doc, "Ground", 0.0);
+    let second = level(&mut doc, "Level 2", 3.0);
+    let placed = place_wall(&mut doc, ground, ground, Some(second), 4.0, 9.9, -0.3, unchanged);
+    let mesh_before = element_mesh(&mut doc, &mut engine, placed.element);
+    let before = save(&doc);
+    let depth = doc.undo_depth();
+
+    ok(&mut doc, Command::DeleteLevel { id: second, cascade: true });
+    assert_eq!(doc.undo_depth(), depth + 1, "one undo step");
+    assert!(doc.entity(second).is_none());
+    assert!(doc.entity(placed.wall).is_some(), "the wall survives");
+    assert_eq!(wall_top(&doc, placed.wall), None, "top unwired");
+    assert_eq!(wall_height_param(&doc, placed.wall), Some((3.0 - 0.0) + -0.3), "keeps its height");
+    // Same geometry as before the delete.
+    let mesh_after = element_mesh(&mut doc, &mut engine, placed.element);
+    assert_near(mesh_volume(&mesh_after), mesh_volume(&mesh_before));
+
+    doc.undo().expect("undo");
+    assert_eq!(save(&doc), before, "byte-exact undo");
+    assert_eq!(wall_top(&doc, placed.wall), Some(second));
+    doc.redo().expect("redo");
+    assert_eq!(wall_top(&doc, placed.wall), None);
+}
+
+#[test]
+fn deleting_a_workplane_cascade_disconnects_topped_walls_and_takes_the_rest() {
+    let mut doc = Document::new();
+    let ground = level(&mut doc, "Ground", 0.0);
+    let ceiling = workplane_under(&mut doc, ground, 2.4);
+    let nested = workplane_under(&mut doc, ceiling, 0.3);
+    // Up to the nested plane (2.7 m): disconnected. On the ceiling: deleted.
+    let topped = place_wall(&mut doc, ground, ground, Some(nested), 4.0, 1.0, 0.0, unchanged);
+    let on_it = place_wall(&mut doc, ground, ceiling, None, 2.0, 0.5, 0.0, unchanged);
+    let before = save(&doc);
+
+    ok(&mut doc, Command::DeleteWorkplaneCascade { id: ceiling });
+    assert!(doc.entity(ceiling).is_none() && doc.entity(nested).is_none());
+    assert!(doc.entity(on_it.wall).is_none() && doc.entity(on_it.element).is_none());
+    assert!(doc.entity(topped.wall).is_some());
+    assert_eq!(wall_top(&doc, topped.wall), None);
+    assert_eq!(wall_height_param(&doc, topped.wall), Some(2.4 + 0.3));
+    doc.debug_validate().expect("consistent");
+    doc.undo().expect("undo");
+    assert_eq!(save(&doc), before, "byte-exact undo");
+
+    // A wall whose top reference sits at or below its base keeps the
+    // minimum height when disconnected.
+    let low = workplane_under(&mut doc, ground, -1.0);
+    let sunk = place_wall(&mut doc, ground, ground, Some(low), 4.0, 1.0, 0.0, unchanged);
+    ok(&mut doc, Command::DeleteWorkplaneCascade { id: low });
+    assert_eq!(
+        wall_height_param(&doc, sunk.wall),
+        Some(vim_design_lib::command::MIN_DISCONNECTED_WALL_HEIGHT_M)
+    );
+    assert_eq!(
+        doc.submit(Command::DeleteWorkplaneCascade { id: ground }).err(),
+        Some(VimStatus::WrongEntityKind)
+    );
 }

@@ -22,6 +22,7 @@ use crate::selection::{PredicateAst, SelectionScope};
 use crate::status::VimStatus;
 use crate::sketch::{Sketch, SketchDirection};
 use crate::subref::{EdgeTarget, FaceTarget, SubRef, SubRefSet};
+use crate::wall_run::{Opening, RunPoint, SegmentProfile, WallRunData};
 
 /// The closed set of user-level commands — the full requirements list
 /// (docs/PROJECT_REQUIREMENTS.md) plus the composite cylinder commands.
@@ -525,6 +526,51 @@ pub enum Command {
     DeleteWall {
         id: EntityId,
     },
+    /// Delete a workplane with everything on it, as one undo step: nested
+    /// workplanes, what is drawn or attached on any of them, and the
+    /// elements that own it (with the orphan sweep). Walls that only
+    /// reach up to a deleted plane keep their current height and lose
+    /// their top constraint instead of being deleted.
+    DeleteWorkplaneCascade {
+        id: EntityId,
+    },
+    // -- Wall run ---------------------------------------------------------
+    /// Create a wall run on `base`, optionally height-constrained by
+    /// `top`. Rejected with `InvalidWallRun` when structurally invalid
+    /// (`wall_run::validate_structure`); geometric problems (a
+    /// self-crossing line, a fold-back join, an opening in a join zone)
+    /// are per-entity evaluation errors, and `wall_run::validate` checks
+    /// them up front.
+    CreateWallRun {
+        base: EntityId,
+        top: Option<EntityId>,
+        points: Vec<RunPoint>,
+        closed: bool,
+        thickness_m: f64,
+        height_m: f64,
+        top_offset_m: f64,
+        openings: Vec<Opening>,
+        profiles: Vec<SegmentProfile>,
+    },
+    /// Update a wall run: every field is optional; `top: Some(None)`
+    /// removes the top constraint. The merged result is validated like a
+    /// create. One undo step; coalesced updates merge a drag.
+    UpdateWallRun {
+        id: EntityId,
+        base: Option<EntityId>,
+        top: Option<Option<EntityId>>,
+        points: Option<Vec<RunPoint>>,
+        closed: Option<bool>,
+        thickness_m: Option<f64>,
+        height_m: Option<f64>,
+        top_offset_m: Option<f64>,
+        openings: Option<Vec<Opening>>,
+        profiles: Option<Vec<SegmentProfile>>,
+        coalesce: bool,
+    },
+    DeleteWallRun {
+        id: EntityId,
+    },
 }
 
 /// Serde default for `DeleteElement::sweep_orphans` — sweeping is the
@@ -619,6 +665,10 @@ impl Command {
             Command::CreateWall { .. } => "CreateWall",
             Command::UpdateWall { .. } => "UpdateWall",
             Command::DeleteWall { .. } => "DeleteWall",
+            Command::DeleteWorkplaneCascade { .. } => "DeleteWorkplaneCascade",
+            Command::CreateWallRun { .. } => "CreateWallRun",
+            Command::UpdateWallRun { .. } => "UpdateWallRun",
+            Command::DeleteWallRun { .. } => "DeleteWallRun",
         }
     }
 
@@ -649,6 +699,7 @@ impl Command {
             | Command::UpdateSketch { id, coalesce, .. }
             | Command::UpdateWorkplane { id, coalesce, .. }
             | Command::UpdateWall { id, coalesce, .. }
+            | Command::UpdateWallRun { id, coalesce, .. }
             | Command::UpdateLevel { id, coalesce, .. } => (*coalesce, *id),
             Command::UpdateCylinder {
                 extrusion, coalesce, ..
@@ -1707,7 +1758,89 @@ fn run(ctx: &mut Ctx<'_>, command: &Command) -> Result<(), VimStatus> {
             ctx.set_params(*id, params)
         }
         Command::DeleteWall { id } => ctx.delete(*id, EntityKind::Wall),
+        Command::DeleteWorkplaneCascade { id } => {
+            ctx.expect_kind(*id, EntityKind::Workplane)?;
+            delete_plane_cascade(ctx, *id)
+        }
+
+        // -- Wall run ------------------------------------------------------
+        Command::CreateWallRun {
+            base,
+            top,
+            points,
+            closed,
+            thickness_m,
+            height_m,
+            top_offset_m,
+            openings,
+            profiles,
+        } => {
+            let run = WallRunData {
+                points: points.clone(),
+                closed: *closed,
+                thickness_m: *thickness_m,
+                height_m: *height_m,
+                top_offset_m: *top_offset_m,
+                openings: openings.clone(),
+                profiles: canonical_run_profiles(profiles),
+            };
+            crate::wall_run::validate_structure(&run).map_err(|_| VimStatus::InvalidWallRun)?;
+            ctx.create(
+                run.into_params(),
+                vec![SlotValue::One(Some(*base)), SlotValue::One(*top)],
+            )?;
+            Ok(())
+        }
+        Command::UpdateWallRun {
+            id,
+            base,
+            top,
+            points,
+            closed,
+            thickness_m,
+            height_m,
+            top_offset_m,
+            openings,
+            profiles,
+            ..
+        } => {
+            let record = ctx.expect_kind(*id, EntityKind::WallRun)?;
+            let old = WallRunData::from_params(&record.params).ok_or(VimStatus::ParamsKindMismatch)?;
+            let run = WallRunData {
+                points: points.clone().unwrap_or(old.points),
+                closed: closed.unwrap_or(old.closed),
+                thickness_m: thickness_m.unwrap_or(old.thickness_m),
+                height_m: height_m.unwrap_or(old.height_m),
+                top_offset_m: top_offset_m.unwrap_or(old.top_offset_m),
+                openings: openings.clone().unwrap_or(old.openings),
+                profiles: profiles
+                    .as_ref()
+                    .map(|p| canonical_run_profiles(p))
+                    .unwrap_or(old.profiles),
+            };
+            crate::wall_run::validate_structure(&run).map_err(|_| VimStatus::InvalidWallRun)?;
+            if let Some(base) = base {
+                ctx.rewire(*id, slot::WALL_RUN_BASE, SlotValue::One(Some(*base)))?;
+            }
+            if let Some(top) = top {
+                ctx.rewire(*id, slot::WALL_RUN_TOP, SlotValue::One(*top))?;
+            }
+            ctx.set_params(*id, run.into_params())
+        }
+        Command::DeleteWallRun { id } => ctx.delete(*id, EntityKind::WallRun),
     }
+}
+
+/// Segment profiles with canonical (sorted, deduplicated) top anchors.
+fn canonical_run_profiles(profiles: &[SegmentProfile]) -> Vec<SegmentProfile> {
+    profiles
+        .iter()
+        .map(|p| SegmentProfile {
+            segment: p.segment,
+            profile: p.profile.clone(),
+            top_points: canonical_ids(&p.top_points),
+        })
+        .collect()
 }
 
 /// Canonicalize chamfer edge targets (SharedEdge operand order and
@@ -1833,6 +1966,7 @@ fn sweepable(kind: EntityKind) -> bool {
             | EntityKind::Chamfer
             | EntityKind::Sketch
             | EntityKind::Wall
+            | EntityKind::WallRun
     )
 }
 
@@ -2079,7 +2213,115 @@ fn update_cylinder(
 /// substrate bug and rejects cleanly.
 fn delete_level_cascade(ctx: &mut Ctx<'_>, level: EntityId) -> Result<(), VimStatus> {
     ctx.expect_kind(level, EntityKind::Level)?;
-    let mut remaining = ctx.doc.graph_ref().dirty_closure([level]);
+    delete_plane_cascade(ctx, level)
+}
+
+/// Smallest fixed height a disconnected wall keeps when its top
+/// reference was at or below its base (meters).
+pub const MIN_DISCONNECTED_WALL_HEIGHT_M: f64 = 0.1;
+
+/// The construction planes a cascade from `plane` deletes: the plane and
+/// every workplane nested under it.
+fn doomed_planes(ctx: &Ctx<'_>, plane: EntityId) -> std::collections::BTreeSet<EntityId> {
+    let graph = ctx.doc.graph_ref();
+    let mut planes = std::collections::BTreeSet::from([plane]);
+    let mut stack = vec![plane];
+    while let Some(current) = stack.pop() {
+        for dependent in graph.dependents(current) {
+            let nested = graph.get(dependent).is_some_and(|r| {
+                r.kind() == EntityKind::Workplane
+                    && r.inputs
+                        .get(slot::WORKPLANE_PARENT)
+                        .and_then(|s| s.referenced().next())
+                        == Some(current)
+            });
+            if nested && planes.insert(dependent) {
+                stack.push(dependent);
+            }
+        }
+    }
+    planes
+}
+
+/// Disconnect walls that only reach UP to a doomed plane: a wall whose
+/// top plane is deleted but whose base survives keeps its current
+/// height as a fixed height (never below
+/// [`MIN_DISCONNECTED_WALL_HEIGHT_M`]) and loses its top constraint, as a
+/// rewire plus a params change in the calling command group.
+fn disconnect_topped_walls(
+    ctx: &mut Ctx<'_>,
+    planes: &std::collections::BTreeSet<EntityId>,
+) -> Result<(), VimStatus> {
+    let graph = ctx.doc.graph_ref();
+    let plane_of = |record: &EntityRecord, index: usize| {
+        record.inputs.get(index).and_then(|s| s.referenced().next())
+    };
+    let mut topped: Vec<EntityId> = Vec::new();
+    for plane in planes {
+        for dependent in graph.dependents(*plane) {
+            let Some(record) = graph.get(dependent) else { continue };
+            let (base_slot, top_slot) = match record.kind() {
+                EntityKind::Wall => (slot::WALL_BASE, slot::WALL_TOP),
+                EntityKind::WallRun => (slot::WALL_RUN_BASE, slot::WALL_RUN_TOP),
+                _ => continue,
+            };
+            let top_doomed = plane_of(record, top_slot).is_some_and(|p| planes.contains(&p));
+            let base_doomed = plane_of(record, base_slot).is_some_and(|p| planes.contains(&p));
+            if top_doomed && !base_doomed && !topped.contains(&dependent) {
+                topped.push(dependent);
+            }
+        }
+    }
+    topped.sort_unstable();
+    for wall in topped {
+        let record = ctx.record(wall)?;
+        let current = match record.kind() {
+            EntityKind::WallRun => crate::wall_run::run_top_height(ctx.doc, wall),
+            _ => crate::wall::wall_top_height(ctx.doc, wall),
+        };
+        let height = current
+            .filter(|h| h.is_finite())
+            .unwrap_or(MIN_DISCONNECTED_WALL_HEIGHT_M)
+            .max(MIN_DISCONNECTED_WALL_HEIGHT_M);
+        if let Some(mut run) = WallRunData::from_params(&record.params) {
+            run.height_m = height;
+            ctx.rewire(wall, slot::WALL_RUN_TOP, SlotValue::One(None))?;
+            ctx.set_params(wall, run.into_params())?;
+            continue;
+        }
+        let params = match record.params {
+            Params::Wall {
+                start,
+                end,
+                top_offset_m,
+                profile,
+                top_points,
+                ..
+            } => Params::Wall {
+                start,
+                end,
+                height_m: height,
+                top_offset_m,
+                profile,
+                top_points,
+            },
+            _ => return Err(VimStatus::ParamsKindMismatch),
+        };
+        ctx.rewire(wall, slot::WALL_TOP, SlotValue::One(None))?;
+        ctx.set_params(wall, params)?;
+    }
+    Ok(())
+}
+
+/// Delete a construction plane with everything that depends on it,
+/// leaf-first, as one transaction: nested workplanes, what is drawn or
+/// attached on any of them, associated elements (with the orphan sweep).
+/// Walls that only reach up to a deleted plane are disconnected first
+/// and survive.
+fn delete_plane_cascade(ctx: &mut Ctx<'_>, plane: EntityId) -> Result<(), VimStatus> {
+    let planes = doomed_planes(ctx, plane);
+    disconnect_topped_walls(ctx, &planes)?;
+    let mut remaining = ctx.doc.graph_ref().dirty_closure([plane]);
     // Cascaded element deletions sweep too (2026-08-23): collect every
     // closure element's construction-input closure up front, so a level
     // cascade leaves zero orphaned geometry (association is mandatory,

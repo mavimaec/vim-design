@@ -56,6 +56,35 @@ pub enum ProvenancePath {
     /// below its level) and false for one that faces away. All caps at
     /// the same depth and facing share this name.
     SketchCap { depth_um: i64, toward_plane: bool },
+    /// A face of a wall run: which part of the segment that starts at
+    /// run point `segment` it bounds. Faces of one part share the name
+    /// (a reference face split by a window is one name).
+    RunFace { segment: u32, part: RunPart },
+}
+
+/// The part of a wall-run segment a face bounds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum RunPart {
+    /// The vertical face on the reference line.
+    Reference,
+    /// The vertical face one thickness to the left of the reference line.
+    Opposite,
+    /// The upper faces (a gable has several; they share the name).
+    Top,
+    /// The faces on the base plane.
+    Bottom,
+    /// The start end: the square end of an open run, or the join face.
+    Start,
+    /// The end end: the square end of an open run, or the join face.
+    End,
+    /// The reveal faces of opening `opening`.
+    Opening { opening: u32 },
+    /// The back of a niche `depth_um` micrometers from the reference
+    /// face.
+    NicheBack { depth_um: i64 },
+    /// The reveal faces of void face `face` of the segment's custom
+    /// profile.
+    ProfileVoid { face: u32 },
 }
 
 impl ProvenancePath {

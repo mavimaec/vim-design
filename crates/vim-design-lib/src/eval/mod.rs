@@ -252,6 +252,25 @@
 //! top reference at or below the base is a per-entity
 //! [`EvalErrorKind::Degenerate`] error.
 //!
+//! # Wall runs
+//!
+//! A `WallRun` evaluates to an [`Evaluated::SolidSet`] owned by the run:
+//! per segment, the join wedges (planar polyhedra over the footprint
+//! outside the clear span) and the middle (the segment profile over the
+//! clear span, with its openings, as layered prisms in the segment's
+//! vertical frame). Faces are named `RunFace { segment, part }`. Spaces
+//! and the top reference follow the wall rules. An invalid run (a
+//! self-crossing line, an opening in a join zone) is a per-entity
+//! [`EvalErrorKind::Degenerate`] error.
+//!
+//! # Meshing
+//!
+//! Solids built from planar 2D data (sketch prisms, walls, wall runs)
+//! are meshed directly: all such solids of one owner member together,
+//! with coincident opposite faces removed, shared boundary vertices,
+//! and one constrained triangulation per face. Other solids use kernel
+//! tessellation.
+//!
 //! # Chamfer
 //!
 //! A `Chamfer` blends edges of its `target` producer via

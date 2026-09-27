@@ -67,6 +67,11 @@ pub enum VimStatus {
     /// point that is not in the profile). `wall::validate_structure`
     /// names the exact problem.
     InvalidWall = 23,
+    /// A wall run fails structural validation (too few points, a
+    /// duplicate or unknown id, a non-finite value, a thickness or height
+    /// that is not positive, an invalid opening size, an invalid segment
+    /// profile). `wall_run::validate_structure` names the exact problem.
+    InvalidWallRun = 24,
 }
 
 impl VimStatus {

@@ -209,9 +209,29 @@ pub struct KernelSolid {
     solid: MtSolid,
     provenance: Vec<Option<ProvenancePath>>,
     model: Option<SweepModel>,
+    /// Built from planar 2D data with straight edges only: its mesh
+    /// comes from the direct planar mesher instead of kernel
+    /// tessellation.
+    direct_mesh: bool,
 }
 
 impl KernelSolid {
+    /// True when the solid's mesh comes from the direct planar mesher.
+    pub(crate) fn direct_mesh(&self) -> bool {
+        self.direct_mesh
+    }
+
+    /// Rename faces: `rename` maps each face's current name to its new
+    /// one.
+    pub(crate) fn rename_faces(
+        &mut self,
+        rename: impl Fn(Option<&ProvenancePath>) -> Option<ProvenancePath>,
+    ) {
+        for path in &mut self.provenance {
+            *path = rename(path.as_ref());
+        }
+    }
+
     /// Number of BREP faces.
     pub fn face_count(&self) -> usize {
         self.provenance.len()
@@ -650,6 +670,7 @@ pub fn extrude_solid(
             solid,
             provenance,
             model: Some(model),
+            direct_mesh: false,
         })
     })
 }
@@ -718,6 +739,7 @@ pub fn prism_solid(
             })
             .collect();
         solid.model = None;
+        solid.direct_mesh = true;
         Ok(solid)
     })
 }
@@ -801,6 +823,7 @@ pub fn revolve_solid(
             solid,
             provenance,
             model: Some(model),
+            direct_mesh: false,
         })
     })
 }
@@ -820,6 +843,7 @@ pub fn solid_from_faces(faces: &[KernelFace]) -> Result<KernelSolid, KernelError
                 provenance: vec![None; faces.len()],
                 solid,
                 model: None,
+                direct_mesh: false,
             }),
             Err(err) => Err(KernelError::Topology(err.to_string())),
         }
@@ -1184,6 +1208,142 @@ fn solid_faces(solid: &MtSolid) -> Vec<MtFace> {
         .iter()
         .flat_map(|shell| shell.face_iter().cloned())
         .collect()
+}
+
+/// One planar face as plain data: boundary loops of 3D points (the loop
+/// with the largest area is the outer boundary), the outward unit
+/// normal, and the face's provenance name.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PlanarFace {
+    pub loops: Vec<Vec<[f64; 3]>>,
+    pub normal: [f64; 3],
+    pub path: Option<ProvenancePath>,
+}
+
+/// Newell normal (unnormalized; its length is twice the loop area).
+fn newell(points: &[[f64; 3]]) -> [f64; 3] {
+    let n = points.len();
+    let mut acc = [0.0; 3];
+    for (i, a) in points.iter().enumerate() {
+        let Some(b) = points.get((i + 1) % n.max(1)) else { continue };
+        acc[0] += (a[1] - b[1]) * (a[2] + b[2]);
+        acc[1] += (a[2] - b[2]) * (a[0] + b[0]);
+        acc[2] += (a[0] - b[0]) * (a[1] + b[1]);
+    }
+    acc
+}
+
+/// The solid's faces as plain planar data, or `None` when any face is
+/// not planar with straight edges (then the caller tessellates with the
+/// kernel instead).
+pub(crate) fn planar_faces(solid: &KernelSolid, tol: f64) -> Option<Vec<PlanarFace>> {
+    let faces = solid_faces(&solid.solid);
+    let mut out = Vec::with_capacity(faces.len());
+    for (index, face) in faces.iter().enumerate() {
+        let mut loops: Vec<Vec<[f64; 3]>> = Vec::new();
+        for wire in face.boundaries() {
+            let mut points = Vec::new();
+            for edge in wire.edge_iter() {
+                let (front, back) = (edge.front().point(), edge.back().point());
+                let curve = edge.curve();
+                let (t0, t1) = curve.range_tuple();
+                let mid = curve.subs((t0 + t1) / 2.0);
+                let (a, b, m) = (
+                    [front.x, front.y, front.z],
+                    [back.x, back.y, back.z],
+                    [mid.x, mid.y, mid.z],
+                );
+                // Straight edges only: the midpoint lies on the chord.
+                let chord = sub(b, a);
+                let len = norm(chord);
+                if len <= tol || norm(cross(sub(m, a), chord)) / len > tol {
+                    return None;
+                }
+                points.push(a);
+            }
+            if points.len() >= 3 {
+                loops.push(points);
+            }
+        }
+        let outer = loops
+            .iter()
+            .max_by(|x, y| norm(newell(x)).total_cmp(&norm(newell(y))))?;
+        let normal = normalized(newell(outer), tol * tol)?;
+        let anchor = *outer.first()?;
+        let planar = loops
+            .iter()
+            .flatten()
+            .all(|p| dot(sub(*p, anchor), normal).abs() <= tol);
+        if !planar {
+            return None;
+        }
+        out.push(PlanarFace {
+            loops,
+            normal,
+            path: solid.provenance.get(index).cloned().flatten(),
+        });
+    }
+    Some(out)
+}
+
+/// Build a closed solid from planar polygon faces over shared vertices:
+/// `points` are the vertices, each face is a loop of vertex indices
+/// ordered counter-clockwise seen from outside, with its provenance
+/// name. Edges shared by two faces become one kernel edge, so the shell
+/// is watertight by construction; `Solid::try_new` validates it. The
+/// solid is direct-meshed.
+pub(crate) fn polyhedron_solid(
+    points: &[[f64; 3]],
+    faces: &[(Vec<usize>, Option<ProvenancePath>)],
+) -> Result<KernelSolid, KernelError> {
+    guard(|| {
+        let vertices: Vec<MtVertex> = points.iter().map(|p| builder::vertex(point3(*p))).collect();
+        let mut edges: std::collections::HashMap<(usize, usize), MtEdge> =
+            std::collections::HashMap::new();
+        let mut shell_faces: Vec<MtFace> = Vec::with_capacity(faces.len());
+        let mut provenance = Vec::with_capacity(faces.len());
+        for (ring, name) in faces {
+            let n = ring.len();
+            if n < 3 {
+                return Err(KernelError::Topology("a polyhedron face needs three vertices".to_owned()));
+            }
+            let mut wire_edges: Vec<MtEdge> = Vec::with_capacity(n);
+            for i in 0..n {
+                let (Some(&a), Some(&b)) = (ring.get(i), ring.get((i + 1) % n)) else {
+                    return Err(KernelError::Topology("polyhedron face index".to_owned()));
+                };
+                let edge = if let Some(e) = edges.get(&(a, b)) {
+                    e.clone()
+                } else if let Some(e) = edges.get(&(b, a)) {
+                    e.inverse()
+                } else {
+                    let (Some(va), Some(vb)) = (vertices.get(a), vertices.get(b)) else {
+                        return Err(KernelError::Topology("polyhedron vertex index".to_owned()));
+                    };
+                    let e: MtEdge = builder::line(va, vb);
+                    edges.insert((a, b), e.clone());
+                    e
+                };
+                wire_edges.push(edge);
+            }
+            let wire: MtWire = wire_edges.into();
+            let face: MtFace = builder::try_attach_plane(vec![wire]).map_err(|e| match e {
+                monstertruck_modeling::errors::Error::WireNotInOnePlane => KernelError::NotPlanar,
+                other => KernelError::Topology(other.to_string()),
+            })?;
+            shell_faces.push(face);
+            provenance.push(name.clone());
+        }
+        let shell: MtShell = shell_faces.into_iter().collect();
+        let solid = MtSolid::try_new(vec![shell])
+            .map_err(|e| KernelError::Topology(format!("polyhedron is not closed: {e}")))?;
+        Ok(KernelSolid {
+            solid,
+            provenance,
+            model: None,
+            direct_mesh: true,
+        })
+    })
 }
 
 /// Rebuild the face-provenance vector for `solid` from its sweep model.
@@ -1571,6 +1731,7 @@ pub fn chamfer_solid(
             solid,
             provenance,
             model: target.model.clone(),
+            direct_mesh: false,
         })
     })
 }

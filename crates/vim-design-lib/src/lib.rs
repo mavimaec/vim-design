@@ -18,12 +18,14 @@ pub mod eval;
 pub mod graph;
 pub mod id;
 pub mod kernel;
+mod planar_mesh;
 pub mod selection;
 pub mod serialization;
 pub mod sketch;
 pub mod status;
 pub mod subref;
 pub mod wall;
+pub mod wall_run;
 pub mod workplane;
 
 pub use command::{Command, CommandOutput};

@@ -181,6 +181,7 @@ pub(crate) fn compute_spaces(
                 | EntityKind::Chamfer
                 | EntityKind::Sketch
                 | EntityKind::Wall
+                | EntityKind::WallRun
         )
     };
 
@@ -201,6 +202,13 @@ pub(crate) fn compute_spaces(
                         Space::World
                     } else {
                         plane_space(graph, record, slot::WALL_BASE)
+                    }
+                }
+                EntityKind::WallRun => {
+                    if record.inputs.get(slot::WALL_RUN_TOP).is_some_and(|s| !s.is_empty()) {
+                        Space::World
+                    } else {
+                        plane_space(graph, record, slot::WALL_RUN_BASE)
                     }
                 }
                 // An explicit Plane input anchors the entity to world
@@ -1234,6 +1242,7 @@ pub(crate) fn evaluate_entity(
             }
         }
         EntityKind::Wall => evaluate_wall(record, lookup, own_space, tol),
+        EntityKind::WallRun => evaluate_wall_run(record, lookup, own_space, tol),
     }
 }
 
@@ -1449,6 +1458,143 @@ fn evaluate_wall(
     ];
     let effective = crate::wall::effective_profile(profile, top_points, height);
     profile_prisms(record.id, &effective, origin, along, base.z_axis, left, tol)
+}
+
+/// The top reference height of a wall-like entity above its base plane:
+/// the top plane's rise along the base normal plus `top_offset_m`, or
+/// the fixed `height_m`.
+fn top_reference(
+    record: &EntityRecord,
+    lookup: &Lookup<'_>,
+    base: &PlaneFrame,
+    top_slot: usize,
+    height_m: f64,
+    top_offset_m: f64,
+) -> Result<f64, EvalDiag> {
+    match single_id(record, top_slot) {
+        Some(top_id) => {
+            let top = plane_frame(lookup, Some(top_id), "top", Space::World)?;
+            let rise = [
+                top.world_origin[0] - base.world_origin[0],
+                top.world_origin[1] - base.world_origin[1],
+                top.world_origin[2] - base.world_origin[2],
+            ];
+            Ok(kernel::dot(rise, base.z_axis) + top_offset_m)
+        }
+        None => Ok(height_m),
+    }
+}
+
+/// Evaluate a wall run: per segment, the join wedges as planar
+/// polyhedra and the middle (the elevation profile over the clear span,
+/// with the openings) as profile prisms, all named by segment and part.
+fn evaluate_wall_run(
+    record: &EntityRecord,
+    lookup: &Lookup<'_>,
+    own_space: Space,
+    tol: f64,
+) -> Result<Evaluated, EvalDiag> {
+    use crate::subref::{ProvenancePath, RunPart};
+
+    let run = crate::wall_run::WallRunData::from_params(&record.params)
+        .ok_or_else(|| params_mismatch(record))?;
+    let base = plane_frame(lookup, single_id(record, slot::WALL_RUN_BASE), "base", own_space)?;
+    let height = top_reference(
+        record,
+        lookup,
+        &base,
+        slot::WALL_RUN_TOP,
+        run.height_m,
+        run.top_offset_m,
+    )?;
+    let plans = crate::wall_run::plan(&run, height)
+        .map_err(|err| diag(EvalErrorKind::Degenerate, format!("wall run: {err}")))?;
+    let in_plane = |uv: [f64; 2]| -> [f64; 3] {
+        [
+            uv[0] * base.x_axis[0] + uv[1] * base.y_axis[0],
+            uv[0] * base.x_axis[1] + uv[1] * base.y_axis[1],
+            uv[0] * base.x_axis[2] + uv[1] * base.y_axis[2],
+        ]
+    };
+    let z = base.z_axis;
+    let at = |uv: [f64; 2], h: f64| -> [f64; 3] {
+        let p = in_plane(uv);
+        [
+            base.origin[0] + p[0] + h * z[0],
+            base.origin[1] + p[1] + h * z[1],
+            base.origin[2] + p[2] + h * z[2],
+        ]
+    };
+    let depth_um = |depth: f64| (depth * 1.0e6).round() as i64;
+    let mut solids = Vec::new();
+    for plan in plans {
+        let name = |part: RunPart| {
+            Some(ProvenancePath::RunFace {
+                segment: plan.segment,
+                part,
+            })
+        };
+        for wedge in &plan.wedges {
+            let n = wedge.polygon.len();
+            let s_of = |p: [f64; 2]| {
+                (p[0] - plan.start[0]) * plan.dir[0] + (p[1] - plan.start[1]) * plan.dir[1]
+            };
+            let mut points: Vec<[f64; 3]> = wedge.polygon.iter().map(|p| at(*p, 0.0)).collect();
+            points.extend(
+                wedge
+                    .polygon
+                    .iter()
+                    .map(|p| at(*p, wedge.top.0 + wedge.top.1 * s_of(*p))),
+            );
+            let mut faces: Vec<(Vec<usize>, Option<ProvenancePath>)> = Vec::with_capacity(n + 2);
+            faces.push(((0..n).rev().collect(), name(RunPart::Bottom)));
+            faces.push(((n..2 * n).collect(), name(RunPart::Top)));
+            for (i, part) in wedge.sides.iter().enumerate() {
+                let j = (i + 1) % n;
+                faces.push((vec![i, j, n + j, n + i], name(*part)));
+            }
+            let solid = kernel::polyhedron_solid(&points, &faces).map_err(kernel_diag)?;
+            solids.push((record.id, solid, None));
+        }
+        let left = [-plan.dir[1], plan.dir[0]];
+        let prisms = profile_prisms(
+            record.id,
+            &plan.middle.profile,
+            at(plan.start, 0.0),
+            in_plane(plan.dir),
+            z,
+            in_plane(left),
+            tol,
+        )?;
+        let Evaluated::SolidSet(prisms) = prisms else {
+            continue;
+        };
+        let thickness_um = depth_um(plan.thickness);
+        for (owner, mut solid, material) in prisms {
+            solid.rename_faces(|path| match path {
+                Some(ProvenancePath::SketchSide { face, a, b }) => plan
+                    .middle
+                    .edges
+                    .get(&(*face, *a.min(b), *a.max(b)))
+                    .and_then(|part| name(*part)),
+                Some(ProvenancePath::SketchCap { depth_um, toward_plane }) => {
+                    if *depth_um == 0 && *toward_plane {
+                        name(RunPart::Reference)
+                    } else if *depth_um == thickness_um && !*toward_plane {
+                        name(RunPart::Opposite)
+                    } else if *toward_plane {
+                        name(RunPart::NicheBack { depth_um: *depth_um })
+                    } else {
+                        // Between two depth layers, inside the material.
+                        None
+                    }
+                }
+                other => other.cloned(),
+            });
+            solids.push((owner, solid, material));
+        }
+    }
+    Ok(Evaluated::SolidSet(solids))
 }
 
 fn params_mismatch(record: &EntityRecord) -> EvalDiag {

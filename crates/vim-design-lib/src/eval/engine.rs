@@ -456,7 +456,8 @@ impl Engine {
                 | EntityKind::Solid
                 | EntityKind::Chamfer
                 | EntityKind::Sketch
-                | EntityKind::Wall => !consumed.contains(id),
+                | EntityKind::Wall
+                | EntityKind::WallRun => !consumed.contains(id),
                 _ => false,
             })
             .map(|(id, _)| *id)
@@ -739,16 +740,35 @@ fn build_owner_mesh(
         ),
         // An empty set (no material) yields an empty mesh, which the
         // caller turns into a tombstone.
+        // Consecutive prisms of one member built from planar 2D data are
+        // meshed together by the direct planar mesher; everything else
+        // is tessellated per solid by the kernel.
         Evaluated::SolidSet(members) => {
-            members.iter().try_for_each(|(member, solid, material)| {
-                append_solid(
-                    &mut mesh,
-                    solid,
-                    *material,
-                    assignments.get(member),
-                    chordal_tolerance,
-                )
-            })
+            let mut outcome = Ok(());
+            let mut rest = members.as_slice();
+            while let Some((member, _, material)) = rest.first() {
+                let run = rest
+                    .iter()
+                    .take_while(|(m, s, _)| m == member && s.direct_mesh())
+                    .count();
+                let (group, tail) = rest.split_at(run.max(1));
+                rest = tail;
+                let solids: Vec<&KernelSolid> = group.iter().map(|(_, s, _)| s).collect();
+                let direct = (run > 0)
+                    .then(|| append_direct(&mut mesh, &solids, *material, assignments.get(member)))
+                    .flatten();
+                let result = match direct {
+                    Some(result) => result,
+                    None => group.iter().try_for_each(|(m, solid, mat)| {
+                        append_solid(&mut mesh, solid, *mat, assignments.get(m), chordal_tolerance)
+                    }),
+                };
+                if let Err(err) = result {
+                    outcome = Err(err);
+                    break;
+                }
+            }
+            outcome
         }
         _ => return None,
     };
@@ -785,39 +805,83 @@ fn append_solid(
 ) -> Result<(), EvalDiag> {
     let face_meshes: Vec<RawMesh> =
         kernel::tessellate_faces(solid, chordal_tolerance).map_err(tessellation_diag)?;
-    let paths = solid.face_paths();
+    let faces: Vec<(Option<crate::subref::ProvenancePath>, RawMesh)> = solid
+        .face_paths()
+        .iter()
+        .cloned()
+        .chain(std::iter::repeat(None))
+        .zip(face_meshes)
+        .collect();
+    append_faces(mesh, &faces, default_material, &matchers(assignments, &[solid]))
+}
 
-    // Pre-expand assignment targets against THIS solid's current
-    // topology: One(path) matches exactly; Set(query) matches whatever
-    // its live expansion covers right now (empty on a no-model solid or
-    // a non-matching filter — the liveness contract, §3.5). Assignments
-    // are sorted One-before-Set, so explicit paints take precedence.
-    let matchers: Vec<(Vec<crate::subref::ProvenancePath>, EntityId)> = assignments
+/// Mesh the solids of one member together with the direct planar
+/// mesher: faces merged across the member's solids, internal faces
+/// removed, shared boundaries conformed. `None` when a solid is not
+/// planar (the caller then tessellates with the kernel).
+fn append_direct(
+    mesh: &mut Mesh,
+    solids: &[&KernelSolid],
+    default_material: Option<EntityId>,
+    assignments: Option<&Assignments>,
+) -> Option<Result<(), EvalDiag>> {
+    let mut planar = Vec::new();
+    for solid in solids {
+        planar.extend(kernel::planar_faces(solid, 1e-7)?);
+    }
+    let faces = match crate::planar_mesh::mesh_planar_faces(&planar) {
+        Ok(faces) => faces,
+        Err(message) => {
+            return Some(Err(EvalDiag::new(EvalErrorKind::Tessellation, message)));
+        }
+    };
+    Some(append_faces(mesh, &faces, default_material, &matchers(assignments, solids)))
+}
+
+/// Pre-expand assignment targets against the solids' current topology:
+/// One(path) matches exactly; Set(query) matches whatever its live
+/// expansion covers right now (empty on a no-model solid or a
+/// non-matching filter). Assignments are sorted One-before-Set, so
+/// explicit paints take precedence.
+fn matchers(
+    assignments: Option<&Assignments>,
+    solids: &[&KernelSolid],
+) -> Vec<(Vec<crate::subref::ProvenancePath>, EntityId)> {
+    assignments
         .map(|assigns| {
             assigns
                 .iter()
                 .map(|(target, material)| {
                     let matched = match target {
                         crate::subref::FaceTarget::One(path) => vec![path.canonical()],
-                        crate::subref::FaceTarget::Set(query) => {
-                            kernel::expand_query(solid, query)
-                                .map(|e| e.face_paths)
-                                .unwrap_or_default()
-                        }
+                        crate::subref::FaceTarget::Set(query) => solids
+                            .iter()
+                            .flat_map(|solid| {
+                                kernel::expand_query(solid, query)
+                                    .map(|e| e.face_paths)
+                                    .unwrap_or_default()
+                            })
+                            .collect(),
                     };
                     (matched, *material)
                 })
                 .collect()
         })
-        .unwrap_or_default();
+        .unwrap_or_default()
+}
 
-    // Group face indices by their material, deterministically
-    // (None-material group first, then ascending material id).
+/// Append named face meshes, one submesh per material group
+/// (None-material group first, then ascending material id).
+fn append_faces(
+    mesh: &mut Mesh,
+    faces: &[(Option<crate::subref::ProvenancePath>, RawMesh)],
+    default_material: Option<EntityId>,
+    matchers: &[(Vec<crate::subref::ProvenancePath>, EntityId)],
+) -> Result<(), EvalDiag> {
     let mut groups: BTreeMap<Option<EntityId>, Vec<usize>> = BTreeMap::new();
-    for index in 0..face_meshes.len() {
-        let material = paths
-            .get(index)
-            .and_then(|p| p.as_ref())
+    for (index, (path, _)) in faces.iter().enumerate() {
+        let material = path
+            .as_ref()
             .and_then(|path| {
                 let canonical = path.canonical();
                 matchers
@@ -834,7 +898,7 @@ fn append_solid(
             .map_err(|_| range_diag("index"))?;
         let mut index_count: u32 = 0;
         for face_index in face_indices {
-            let Some(raw) = face_meshes.get(face_index) else {
+            let Some((_, raw)) = faces.get(face_index) else {
                 continue;
             };
             let base = u32::try_from(mesh.positions.len())
