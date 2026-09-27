@@ -24,6 +24,7 @@
 
 mod camera;
 mod pick;
+mod walls;
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -32,15 +33,18 @@ use vim_design_lib::eval::Engine;
 use vim_design_lib::{Command, Document, EntityId, EntityKind, Params, VimStatus};
 use wasm_bindgen::prelude::*;
 
-use crate::authoring::geom::{P2, dist, signed_area};
-use crate::authoring::model::{self, ElementModel, PlateModel};
+use crate::authoring::geom::{Invalid, P2, dist, signed_area};
+use crate::authoring::model::{self, ElementModel, PlateModel, WallModel};
 use crate::authoring::ops;
-use crate::authoring::sketch::{self, PlaceOutcome, PlateOutline, Shape, Sketch, SketchTool};
+use crate::authoring::sketch::{
+    self, PlaceOutcome, PlateOutline, Shape, Sketch, SketchContext, SketchTool,
+};
 use crate::authoring::snap::{self, SnapInput};
+use crate::authoring::walls as wall_geom;
 use crate::gestures::Gestures;
 use crate::render::{LineLayer, MeshStyle, Renderer, RendererOptions};
 
-use camera::{Camera, ViewMode};
+use camera::{Camera, ElevationFrame, ViewMode};
 use pick::PickScene;
 
 /// sRGB hex component -> linear.
@@ -60,7 +64,11 @@ fn rgba(hex: u32, a: f32) -> [f32; 4] {
 
 // Palette (sRGB hex; linearized at use). Calm light theme.
 const CLEAR: u32 = 0xeef0f3;
-const CONCRETE: u32 = 0xdcd7ce;
+const CONCRETE: u32 = 0xcfc9bf;
+/// Walls: warm off-white, lighter and warmer than the concrete plates.
+const WALL: u32 = 0xfbf7f0;
+/// Walls cut by the plan view: a flat, dark "poché" fill.
+const POCHE: u32 = 0x5b6270;
 const OTHER_ELEMENT: u32 = 0xc2c8d0;
 const EDGE: u32 = 0x2b3340;
 const ACCENT: u32 = 0x2f6fed;
@@ -72,6 +80,23 @@ const AXIS_Y: u32 = 0x2fa36b;
 /// visible on plate tops (which sit exactly on the plane).
 const GRID_LIFT_M: f32 = 0.002;
 const GRID_STEPS: [f64; 11] = [0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0];
+/// Snap step on a wall face (windows are placed more finely than plans).
+const WINDOW_SNAP_STEP_M: f64 = 0.1;
+/// Plates are pushed back this much (clip depth) in orthographic views,
+/// where the plan cut exposes wall bottoms coplanar with plate tops.
+const PLATE_DEPTH_BIAS: f32 = 2e-5;
+/// A tie between pick hits within this distance (meters) goes to the
+/// wall (walls stand on plates: their bottoms coincide with plate tops).
+const PICK_TIE_M: f32 = 0.005;
+/// Unlit mix for the wall faced in an elevation view.
+const ELEVATION_UNLIT: f32 = 0.7;
+/// Default wall height, thickness, and limits (meters).
+const DEFAULT_WALL_HEIGHT_M: f64 = 2.7;
+const DEFAULT_WALL_THICKNESS_M: f64 = 0.2;
+const MIN_WALL_HEIGHT_M: f64 = 0.1;
+const MAX_WALL_HEIGHT_M: f64 = 50.0;
+const MIN_WALL_THICKNESS_M: f64 = 0.02;
+const MAX_WALL_THICKNESS_M: f64 = 2.0;
 
 /// Cache key of the generated grid: (minor bits, major bits, x0, x1,
 /// y0, y1 in major units, plane z bits, plan flag).
@@ -82,6 +107,9 @@ enum Tool {
     Select,
     Plate,
     Hole,
+    Wall,
+    /// Tap a wall, then draw windows on its face in an elevation view.
+    Window,
 }
 
 impl Tool {
@@ -90,8 +118,42 @@ impl Tool {
             Tool::Select => "select",
             Tool::Plate => "plate",
             Tool::Hole => "hole",
+            Tool::Wall => "wall",
+            Tool::Window => "window",
         }
     }
+}
+
+/// The plane a sketch lives on: world = origin + u·p[0] + v·p[1].
+#[derive(Debug, Clone, Copy)]
+struct SketchFrame {
+    origin: Vec3,
+    u: Vec3,
+    v: Vec3,
+}
+
+impl SketchFrame {
+    fn world(&self, p: P2) -> Vec3 {
+        self.origin + self.u * p[0] as f32 + self.v * p[1] as f32
+    }
+
+    fn local(&self, w: Vec3) -> P2 {
+        let d = w - self.origin;
+        [f64::from(d.dot(self.u)), f64::from(d.dot(self.v))]
+    }
+
+    fn normal(&self) -> Vec3 {
+        self.u.cross(self.v)
+    }
+}
+
+/// What a sketch snaps to (see `snap::snap`).
+#[derive(Default)]
+struct SnapSources {
+    vertices: Vec<P2>,
+    edges: Vec<(P2, P2)>,
+    align: Vec<P2>,
+    step: f64,
 }
 
 fn now_ms() -> f64 {
@@ -127,8 +189,19 @@ pub struct AuthorApp {
     active_elevation: f64,
     selection: Option<EntityId>,
     tool: Tool,
+    /// Outline shape per drawing tool family.
     shape: Shape,
+    wall_shape: Shape,
+    window_shape: Shape,
     sketch: Option<Sketch>,
+    /// Settings for NEW walls.
+    wall_height: f64,
+    wall_thickness: f64,
+    wall_flip: bool,
+    /// Window tool: the wall whose face is being drawn on (elevation
+    /// view), and the camera to return to when done.
+    window_host: Option<EntityId>,
+    prev_camera: Option<Camera>,
     snap_enabled: bool,
     snap_step: f64,
     plate_thickness: f64,
@@ -181,7 +254,14 @@ impl AuthorApp {
             selection: None,
             tool: Tool::Select,
             shape: Shape::Polygon,
+            wall_shape: Shape::Polygon,
+            window_shape: Shape::Rect,
             sketch: None,
+            wall_height: DEFAULT_WALL_HEIGHT_M,
+            wall_thickness: DEFAULT_WALL_THICKNESS_M,
+            wall_flip: false,
+            window_host: None,
+            prev_camera: None,
             snap_enabled: true,
             snap_step: 0.25,
             plate_thickness: 0.3,
@@ -263,12 +343,18 @@ impl AuthorApp {
 
     // -- View ---------------------------------------------------------------
 
+    /// "plan" or "3d". Leaving an elevation view (window drawing) this way
+    /// ends it first.
     pub fn set_view_mode(&mut self, mode: &str) {
+        if self.window_host.is_some() {
+            self.end_window();
+        }
         let mode = if mode == "3d" { ViewMode::Orbit } else { ViewMode::Plan };
         self.camera.set_mode(mode);
         self.refresh_styles();
     }
 
+    /// "plan", "3d", or "elevation".
     pub fn view_mode(&self) -> String {
         self.camera.mode.name().to_owned()
     }
@@ -277,13 +363,10 @@ impl AuthorApp {
         self.camera.orbit(dx, dy);
     }
 
-    /// Pan so the plane point under (x0, y0) moves under (x1, y1).
+    /// Pan so the view-plane point under (x0, y0) moves under (x1, y1).
     pub fn pan(&mut self, x0: f32, y0: f32, x1: f32, y1: f32) {
-        let z = self.active_elevation as f32;
-        let (w, h) = self.size_f();
-        let a = self.camera.unproject_to_plane(x0, y0, w, h, z);
-        let b = self.camera.unproject_to_plane(x1, y1, w, h, z);
-        match (a, b) {
+        let (_, h) = self.size_f();
+        match (self.view_plane_hit(x0, y0), self.view_plane_hit(x1, y1)) {
             (Some(a), Some(b)) if (a - b).length() < 1_000.0 => self.camera.pan_plane(a, b),
             _ => self.camera.pan_pixels(x1 - x0, y1 - y0, h),
         }
@@ -291,17 +374,19 @@ impl AuthorApp {
 
     /// Zoom by `factor` (< 1 zooms in) toward the canvas point.
     pub fn zoom_at(&mut self, factor: f32, px: f32, py: f32) {
-        let (w, h) = self.size_f();
-        let anchor = self
-            .camera
-            .unproject_to_plane(px, py, w, h, self.active_elevation as f32);
+        let anchor = self.view_plane_hit(px, py);
         self.camera.zoom(factor.clamp(0.2, 5.0), anchor);
     }
 
-    /// Frame all geometry (or the active level's square when empty).
+    /// Frame all geometry (or the active level's square when empty); in
+    /// an elevation view, frame the wall.
     pub fn zoom_fit(&mut self) {
         let (w, h) = self.size_f();
         let aspect = w / h;
+        if let Some((frame, length, height)) = self.host_elevation_frame() {
+            self.camera.enter_elevation(frame, length, height, aspect);
+            return;
+        }
         match self.renderer.scene_bbox() {
             Some((min, max)) => {
                 let v = |a: [f64; 3]| Vec3::new(a[0] as f32, a[1] as f32, a[2] as f32);
@@ -317,7 +402,8 @@ impl AuthorApp {
 
     /// Camera state for session persistence (JSON).
     pub fn camera_json(&self) -> String {
-        let c = &self.camera;
+        // During window drawing, persist the view to return to.
+        let c = self.prev_camera.as_ref().unwrap_or(&self.camera);
         serde_json::json!({
             "mode": c.mode.name(),
             "tx": c.target.x, "ty": c.target.y,
@@ -368,28 +454,35 @@ impl AuthorApp {
 
     // -- Tools --------------------------------------------------------------
 
-    /// Activate a tool: "select", "plate", or "hole". Drawing tools need
-    /// an active level (`can_author`). Returns false when refused.
+    /// Activate a tool: "select", "plate", "hole", "wall", or "window".
+    /// Drawing tools need an active level (`can_author`). The window tool
+    /// starts without a sketch: the user first taps a wall
+    /// ([`AuthorApp::begin_window`]). Returns false when refused.
     pub fn set_tool(&mut self, tool: &str) -> bool {
         let tool = match tool {
             "plate" => Tool::Plate,
             "hole" => Tool::Hole,
+            "wall" => Tool::Wall,
+            "window" => Tool::Window,
             _ => Tool::Select,
         };
-        let sketch_tool = match tool {
-            Tool::Select => {
-                self.tool = Tool::Select;
-                self.sketch = None;
-                return true;
-            }
-            Tool::Plate => SketchTool::Plate,
-            Tool::Hole => SketchTool::Hole,
-        };
-        let Some(level) = self.active_level.filter(|_| self.can_author()) else {
+        if tool != Tool::Select && !self.can_author() {
             return false;
-        };
+        }
+        if self.window_host.is_some() {
+            self.end_window();
+        }
         self.tool = tool;
-        self.sketch = Some(Sketch::new(sketch_tool, self.shape, level));
+        self.sketch = match (tool, self.active_level) {
+            (Tool::Plate, Some(level)) => Some(Sketch::new(SketchTool::Plate, self.shape, level)),
+            (Tool::Hole, Some(level)) => Some(Sketch::new(SketchTool::Hole, self.shape, level)),
+            (Tool::Wall, Some(level)) => Some(Sketch::new(SketchTool::Wall, self.wall_shape, level)),
+            _ => None,
+        };
+        if tool != Tool::Select {
+            self.selection = None;
+        }
+        self.refresh_styles();
         true
     }
 
@@ -397,16 +490,23 @@ impl AuthorApp {
         self.tool.name().to_owned()
     }
 
-    /// Outline shape: "polygon" or "rect" (clears placed points).
+    /// Outline shape of the current tool: "polygon" or "rect" (clears
+    /// placed points). Walls: polyline or rectangular room; windows
+    /// default to rectangles.
     pub fn set_shape(&mut self, shape: &str) {
-        self.shape = if shape == "rect" { Shape::Rect } else { Shape::Polygon };
+        let shape = if shape == "rect" { Shape::Rect } else { Shape::Polygon };
+        match self.tool {
+            Tool::Wall => self.wall_shape = shape,
+            Tool::Window => self.window_shape = shape,
+            _ => self.shape = shape,
+        }
         if let Some(s) = self.sketch.as_mut() {
-            s.set_shape(self.shape);
+            s.set_shape(shape);
         }
     }
 
     pub fn shape(&self) -> String {
-        self.shape.name().to_owned()
+        self.current_shape().name().to_owned()
     }
 
     pub fn set_snap(&mut self, enabled: bool, step: f64) {
@@ -433,17 +533,17 @@ impl AuthorApp {
     /// passes a larger one for touch).
     pub fn sketch_hover(&mut self, px: f32, py: f32, tol_px: f32) {
         let Some(sketch) = &self.sketch else { return };
-        let z = self.active_elevation as f32;
+        let Some(frame) = self.sketch_frame() else { return };
         let (w, h) = self.size_f();
-        let Some(hit) = self.camera.unproject_to_plane(px, py, w, h, z) else {
+        let Some(hit) = self.camera.unproject_to(px, py, w, h, frame.origin, frame.normal()) else {
             if let Some(s) = self.sketch.as_mut() {
                 s.cursor = None;
             }
             return;
         };
-        let raw: P2 = [f64::from(hit.x), f64::from(hit.y)];
-        let ppm = self.px_per_m_at(hit);
-        let vertices = self.level_vertices(sketch.level);
+        let raw = frame.local(hit);
+        let ppm = self.px_per_m_at(hit, &frame);
+        let sources = self.snap_sources(sketch);
         // Axis anchors apply to polygons only: aligning a rectangle's
         // second corner with its first would collapse it to zero area.
         let polygon = sketch.shape == Shape::Polygon;
@@ -452,12 +552,14 @@ impl AuthorApp {
         let result = snap::snap(&SnapInput {
             raw,
             enabled: self.snap_enabled,
-            step: self.snap_step,
+            step: sources.step,
             tolerance: f64::from(tol_px / ppm.max(1e-3)),
             close_target: sketch.close_target(),
             prev,
             first,
-            vertices: &vertices,
+            vertices: &sources.vertices,
+            edges: &sources.edges,
+            align: &sources.align,
         });
         if let Some(s) = self.sketch.as_mut() {
             s.cursor = Some(result);
@@ -473,7 +575,8 @@ impl AuthorApp {
 
     /// Place a vertex at the current cursor. Returns JSON
     /// `{"result": "added"|"duplicate"|"none"|"committed"|"rejected",
-    ///   "reason": ..., "count": n, "name": ...}`.
+    ///   "reason": ..., "count": n, "name": ...}`. Tapping the first
+    /// vertex closes the outline (a wall run becomes a closed loop).
     pub fn sketch_place(&mut self) -> String {
         let Some(sketch) = self.sketch.as_mut() else {
             return r#"{"result":"none","count":0}"#.to_owned();
@@ -496,9 +599,9 @@ impl AuthorApp {
             PlaceOutcome::NoCursor => {
                 serde_json::json!({"result": "none", "count": self.sketch_count()}).to_string()
             }
-            PlaceOutcome::CloseRequested => self.sketch_finish(),
+            PlaceOutcome::CloseRequested => self.finish_sketch(true),
             PlaceOutcome::RectComplete => {
-                let out = self.sketch_finish();
+                let out = self.finish_sketch(true);
                 // A rejected rectangle keeps its first corner so the user
                 // can simply try the second corner again.
                 if let Some(s) = self.sketch.as_mut() {
@@ -513,73 +616,11 @@ impl AuthorApp {
         self.sketch.as_mut().is_some_and(|s| s.undo_point())
     }
 
-    /// Commit the outline if valid. Returns JSON like `sketch_place`.
+    /// Commit the outline if valid (Finish button / Enter). A wall
+    /// polyline is committed as an OPEN run. Returns JSON like
+    /// `sketch_place`.
     pub fn sketch_finish(&mut self) -> String {
-        let Some(sketch) = self.sketch.clone() else {
-            return r#"{"result":"none","count":0}"#.to_owned();
-        };
-        let status = self.sketch_status();
-        if let Some(st) = status.filter(|s| !s.can_finish) {
-            let reason = st
-                .reason
-                .unwrap_or(crate::authoring::geom::Invalid::TooFewPoints);
-            return serde_json::json!({
-                "result": "rejected",
-                "reason": reason.message(),
-                "code": reason.code(),
-                "count": sketch.points.len(),
-            })
-            .to_string();
-        }
-        let outline = sketch.outline();
-        let depth = self.doc.undo_depth();
-        let result = match sketch.tool {
-            SketchTool::Plate => {
-                let name = ops::next_element_name(&self.doc, "Floor plate");
-                ops::commit_plate(&mut self.doc, sketch.level, &outline, self.plate_thickness, &name)
-                    .map(|ids| (name, Some(ids.element)))
-            }
-            SketchTool::Hole => {
-                let plates = self.plate_outlines(sketch.level);
-                match sketch::validate_hole(&outline, &plates) {
-                    Ok(index) => {
-                        let face = plates[index].face;
-                        let element = self.plate_by_face(face).map(|p| p.element);
-                        let name = self
-                            .plate_by_face(face)
-                            .map_or_else(String::new, |p| p.name.clone());
-                        ops::commit_hole(&mut self.doc, sketch.level, face, &outline)
-                            .map(|_| (format!("Hole in {name}"), element))
-                    }
-                    Err(invalid) => Err(invalid.message().to_owned()),
-                }
-            }
-        };
-        match result {
-            Ok((name, element)) => {
-                self.gestures.one_shot(depth);
-                if let Some(s) = self.sketch.as_mut() {
-                    s.points.clear();
-                }
-                let op = if sketch.tool == SketchTool::Plate { "draw plate" } else { "add hole" };
-                self.sync(op);
-                self.notice = Some(format!("{name} created"));
-                serde_json::json!({
-                    "result": "committed",
-                    "name": name,
-                    "element": element.map(|e| e.0 as f64),
-                    "count": 0,
-                })
-                .to_string()
-            }
-            Err(e) => {
-                ops::rollback_to(&mut self.doc, depth);
-                self.gestures.invalidate_redo();
-                self.sync("commit failed");
-                serde_json::json!({"result": "rejected", "reason": e, "count": sketch.points.len()})
-                    .to_string()
-            }
-        }
+        self.finish_sketch(false)
     }
 
     /// Discard the in-progress outline (the tool stays active). Returns
@@ -594,27 +635,26 @@ impl AuthorApp {
 
     /// Screen-space sketch overlay for the page's 2D HUD canvas (device
     /// pixels): placed points, preview outline, cursor + snap kind,
-    /// guides, live segment length, validity.
+    /// guides, live segment length, wall footprints, validity.
     pub fn hud_json(&self) -> String {
-        let Some(sk) = &self.sketch else {
+        let (Some(sk), Some(frame)) = (&self.sketch, self.sketch_frame()) else {
             return r#"{"active":false}"#.to_owned();
         };
-        let z = self.active_elevation as f32;
         let (w, h) = self.size_f();
         let proj = |p: P2| -> Option<[f32; 2]> {
-            self.camera
-                .project(Vec3::new(p[0] as f32, p[1] as f32, z), w, h)
-                .map(|(x, y)| [x, y])
+            self.camera.project(frame.world(p), w, h).map(|(x, y)| [x, y])
         };
         let points: Vec<[f32; 2]> = sk.points.iter().filter_map(|p| proj(*p)).collect();
         let preview_uv = sk.preview();
         let preview: Vec<[f32; 2]> = preview_uv.iter().filter_map(|p| proj(*p)).collect();
+        let window = sk.tool == SketchTool::Window;
+        let (lu, lv) = if window { ("u", "v") } else { ("x", "y") };
         let cursor = sk.cursor.as_ref().and_then(|c| {
             proj(c.point).map(|[x, y]| {
                 serde_json::json!({
                     "x": x, "y": y, "u": c.point[0], "v": c.point[1],
                     "kind": c.kind.name(),
-                    "label": format!("x {} · y {}", fmt_m(c.point[0]), fmt_m(c.point[1])),
+                    "label": format!("{lu} {} · {lv} {}", fmt_m(c.point[0]), fmt_m(c.point[1])),
                 })
             })
         });
@@ -648,6 +688,25 @@ impl AuthorApp {
             }
             _ => None,
         };
+        // Wall footprints of the preview run: shows which side the
+        // thickness grows on.
+        let bands: Vec<Vec<[f32; 2]>> = if sk.tool == SketchTool::Wall {
+            let closing = sk.cursor.as_ref().is_some_and(|c| c.kind == snap::SnapKind::First);
+            let (run, closed) = match sk.shape {
+                Shape::Rect => (preview_uv.clone(), true),
+                Shape::Polygon if closing => (sk.points.clone(), true),
+                Shape::Polygon => (preview_uv.clone(), false),
+            };
+            wall_geom::wall_segments(&run, closed, self.wall_thickness, self.wall_flip)
+                .map(|segs| {
+                    segs.iter()
+                        .map(|s| s.footprint(self.wall_thickness).iter().filter_map(|p| proj(*p)).collect())
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let status = self.sketch_status();
         let first = sk.close_target().and_then(proj);
         serde_json::json!({
@@ -658,6 +717,9 @@ impl AuthorApp {
             "points": points,
             "preview": preview,
             "closed": sk.shape == Shape::Rect || preview_uv.len() >= 3,
+            "fill": sk.tool != SketchTool::Wall,
+            "closeHint": sk.tool != SketchTool::Wall,
+            "bands": bands,
             "cursor": cursor,
             "guides": guides,
             "seg": seg,
@@ -695,10 +757,15 @@ impl AuthorApp {
         let Some((origin, dir)) = self.camera.ray(px, py, w, h) else {
             return -1.0;
         };
-        match self.pick.pick(origin, dir) {
-            Some((id, _)) => id.0 as f64,
-            None => -1.0,
-        }
+        let hits = self.pick.pick_all(origin, dir);
+        let Some(&(nearest, d0)) = hits.first() else {
+            return -1.0;
+        };
+        hits.iter()
+            .take_while(|(_, d)| *d <= d0 + PICK_TIE_M)
+            .find(|(id, _)| self.wall(*id).is_some())
+            .map_or(nearest, |(id, _)| *id)
+            .0 as f64
     }
 
     /// Select an element (-1 clears). Session state: no document change.
@@ -764,11 +831,14 @@ impl AuthorApp {
 
     /// Remove a hole from a plate and sweep its construction geometry.
     pub fn delete_hole(&mut self, element: f64, wire: f64) -> bool {
-        let Some(plate) = self.plate(eid(element)).cloned() else {
-            return false;
+        let element = eid(element);
+        let face = match (self.plate(element), self.wall(element)) {
+            (Some(p), _) => p.face,
+            (None, Some(w)) => w.face,
+            (None, None) => return false,
         };
         let depth = self.doc.undo_depth();
-        match ops::delete_hole(&mut self.doc, plate.face, eid(wire)) {
+        match ops::delete_hole(&mut self.doc, face, eid(wire)) {
             Ok(()) => {
                 self.gestures.one_shot(depth);
                 self.sync("delete hole");
@@ -863,6 +933,9 @@ impl AuthorApp {
         let id = eid(id);
         if !matches!(self.doc.entity(id).map(|e| e.kind()), Some(EntityKind::Level)) {
             return false;
+        }
+        if self.window_host.is_some() {
+            self.end_window();
         }
         self.active_level = Some(id);
         self.refresh_session_and_overlays();
@@ -1026,13 +1099,22 @@ impl AuthorApp {
             "canRedo": self.can_redo(),
             "wireframe": self.renderer.wireframe,
             "tool": self.tool.name(),
-            "shape": self.shape.name(),
+            "shape": self.current_shape().name(),
             "view": self.camera.mode.name(),
             "selection": self.selection.map(|id| id.0 as f64),
             "revision": self.revision,
             "elements": self.model.len(),
             "plates": self.model.iter().filter(|e| matches!(e, ElementModel::Plate(_))).count(),
             "platesOnLevel": plates_on_level,
+            "walls": self.model.iter().filter(|e| matches!(e, ElementModel::Wall(_))).count(),
+            "wallsOnLevel": self.model.iter().filter(|e| matches!(e,
+                ElementModel::Wall(w) if Some(w.plane_level) == self.active_level)).count(),
+            "windowHost": self.window_host.map(|id| id.0 as f64),
+            "wall": {
+                "height": self.wall_height,
+                "thickness": self.wall_thickness,
+                "flip": self.wall_flip,
+            },
             "snap": { "enabled": self.snap_enabled, "step": self.snap_step },
             "errors": errors,
         })
@@ -1093,18 +1175,123 @@ impl AuthorApp {
         (w as f32, h as f32)
     }
 
-    /// Screen pixels per meter around a plane point.
-    fn px_per_m_at(&self, p: Vec3) -> f32 {
+    /// Screen pixels per meter around a point of a sketch plane.
+    fn px_per_m_at(&self, p: Vec3, frame: &SketchFrame) -> f32 {
         let (w, h) = self.size_f();
-        let a = self.camera.project(p - Vec3::X * 0.5, w, h);
-        let b = self.camera.project(p + Vec3::X * 0.5, w, h);
-        let c = self.camera.project(p - Vec3::Y * 0.5, w, h);
-        let d = self.camera.project(p + Vec3::Y * 0.5, w, h);
-        let len = |a: Option<(f32, f32)>, b: Option<(f32, f32)>| match (a, b) {
+        let len = |axis: Vec3| match (
+            self.camera.project(p - axis * 0.5, w, h),
+            self.camera.project(p + axis * 0.5, w, h),
+        ) {
             (Some(a), Some(b)) => (a.0 - b.0).hypot(a.1 - b.1),
             _ => 0.0,
         };
-        len(a, b).max(len(c, d)).max(1e-3)
+        len(frame.u).max(len(frame.v)).max(1e-3)
+    }
+
+    fn current_shape(&self) -> Shape {
+        match self.tool {
+            Tool::Wall => self.wall_shape,
+            Tool::Window => self.window_shape,
+            _ => self.shape,
+        }
+    }
+
+    /// Elevation of a level (0 when it does not exist).
+    fn level_elevation(&self, id: EntityId) -> f64 {
+        match self.doc.entity(id).map(|e| &e.params) {
+            Some(Params::Level { elevation_m, .. }) => *elevation_m,
+            _ => 0.0,
+        }
+    }
+
+    fn wall(&self, element: EntityId) -> Option<&WallModel> {
+        self.model.iter().find_map(|e| match e {
+            ElementModel::Wall(w) if w.element == element => Some(w),
+            _ => None,
+        })
+    }
+
+    fn host_wall(&self) -> Option<&WallModel> {
+        self.window_host.and_then(|id| self.wall(id))
+    }
+
+    /// The elevation frame facing a wall, with its length and height.
+    fn elevation_frame(&self, wall: &WallModel) -> (ElevationFrame, f32, f32) {
+        let d = wall.dir();
+        let u = Vec3::new(d[0] as f32, d[1] as f32, 0.0);
+        // n = up × u: looking along n puts u on the screen's right.
+        let n = Vec3::Z.cross(u);
+        let side = wall.normal[0] * f64::from(n.x) + wall.normal[1] * f64::from(n.y);
+        let z = self.level_elevation(wall.plane_level) + wall.base_w;
+        let frame = ElevationFrame {
+            origin: Vec3::new(wall.start[0] as f32, wall.start[1] as f32, z as f32),
+            u,
+            n,
+            near_offset: (wall.thickness * side).min(0.0) as f32,
+            depth: wall.thickness as f32,
+        };
+        (frame, wall.length() as f32, wall.height as f32)
+    }
+
+    fn host_elevation_frame(&self) -> Option<(ElevationFrame, f32, f32)> {
+        self.host_wall().map(|w| self.elevation_frame(w))
+    }
+
+    /// The plane the current sketch lives on.
+    fn sketch_frame(&self) -> Option<SketchFrame> {
+        let sk = self.sketch.as_ref()?;
+        if sk.tool == SketchTool::Window {
+            let (f, _, _) = self.host_elevation_frame()?;
+            return Some(SketchFrame { origin: f.origin, u: f.u, v: Vec3::Z });
+        }
+        Some(SketchFrame {
+            origin: Vec3::new(0.0, 0.0, self.level_elevation(sk.level) as f32),
+            u: Vec3::X,
+            v: Vec3::Y,
+        })
+    }
+
+    /// The point under a canvas pixel on the plane the view navigates:
+    /// the faced wall in an elevation view, the active level otherwise.
+    fn view_plane_hit(&self, px: f32, py: f32) -> Option<Vec3> {
+        let (w, h) = self.size_f();
+        match (self.camera.mode, self.camera.elevation) {
+            (ViewMode::Elevation, Some(f)) => {
+                self.camera.unproject_to(px, py, w, h, self.camera.target, f.n)
+            }
+            _ => self.camera.unproject_to_plane(px, py, w, h, self.active_elevation as f32),
+        }
+    }
+
+    /// Snap targets for a sketch: what to capture and at which grid step.
+    fn snap_sources(&self, sk: &Sketch) -> SnapSources {
+        match sk.tool {
+            SketchTool::Window => {
+                let Some(wall) = self.host_wall() else {
+                    return SnapSources::default();
+                };
+                let corners: Vec<P2> = wall.windows.iter().flat_map(|w| w.outline.clone()).collect();
+                let mut vertices = wall.profile.clone();
+                vertices.extend_from_slice(&corners);
+                // Edges would pull windows onto the wall edge or another
+                // window (both invalid); aligning with other windows'
+                // corners lines up sills and heads instead.
+                SnapSources { vertices, edges: Vec::new(), align: corners, step: WINDOW_SNAP_STEP_M }
+            }
+            // Snapping onto a plate or hole edge would make a hole touch
+            // it (invalid), so holes snap to corners only.
+            SketchTool::Hole => SnapSources {
+                vertices: self.level_vertices(sk.level),
+                step: self.snap_step,
+                ..SnapSources::default()
+            },
+            SketchTool::Plate | SketchTool::Wall => SnapSources {
+                vertices: self.level_vertices(sk.level),
+                edges: self.level_edges(sk.level),
+                align: Vec::new(),
+                step: self.snap_step,
+            },
+        }
     }
 
     fn sketch_count(&self) -> usize {
@@ -1142,17 +1329,42 @@ impl AuthorApp {
             .collect()
     }
 
-    /// Snap vertices: plate + hole corners on `level`'s plane.
+    /// Snap vertices on `level`'s plane: plate + hole corners and wall
+    /// base-line ends.
     fn level_vertices(&self, level: EntityId) -> Vec<P2> {
         let mut out = Vec::new();
         for e in &self.model {
-            if let ElementModel::Plate(p) = e {
-                if p.plane_level == level && p.top_w.abs() < 1e-9 {
+            match e {
+                ElementModel::Plate(p) if p.plane_level == level && p.top_w.abs() < 1e-9 => {
                     out.extend_from_slice(&p.outline);
                     for h in &p.holes {
                         out.extend_from_slice(&h.outline);
                     }
                 }
+                ElementModel::Wall(w) if w.plane_level == level && w.base_w.abs() < 1e-9 => {
+                    out.push(w.start);
+                    out.push(w.end);
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// Snap edges on `level`'s plane: plate outlines and wall base lines
+    /// (tracing a plate edge is how a wall is laid onto a plate).
+    fn level_edges(&self, level: EntityId) -> Vec<(P2, P2)> {
+        let mut out = Vec::new();
+        for e in &self.model {
+            match e {
+                ElementModel::Plate(p) if p.plane_level == level && p.top_w.abs() < 1e-9 => {
+                    let n = p.outline.len();
+                    out.extend((0..n).map(|i| (p.outline[i], p.outline[(i + 1) % n])));
+                }
+                ElementModel::Wall(w) if w.plane_level == level && w.base_w.abs() < 1e-9 => {
+                    out.push((w.start, w.end));
+                }
+                _ => {}
             }
         }
         out
@@ -1160,8 +1372,122 @@ impl AuthorApp {
 
     fn sketch_status(&self) -> Option<sketch::SketchStatus> {
         let sk = self.sketch.as_ref()?;
-        let plates = self.plate_outlines(sk.level);
-        Some(sketch::status(sk, &plates))
+        Some(match sk.tool {
+            SketchTool::Plate => sketch::status(sk, &SketchContext::Plate),
+            SketchTool::Hole => {
+                let plates = self.plate_outlines(sk.level);
+                sketch::status(sk, &SketchContext::Hole(&plates))
+            }
+            SketchTool::Wall => sketch::status(
+                sk,
+                &SketchContext::Wall { thickness: self.wall_thickness, flip: self.wall_flip },
+            ),
+            SketchTool::Window => {
+                let wall = self.host_wall()?;
+                let windows = wall.windows.iter().map(|w| w.outline.as_slice()).collect();
+                sketch::status(sk, &SketchContext::Window { profile: &wall.profile, windows })
+            }
+        })
+    }
+
+    /// Validate and commit the sketch as ONE gesture. `closing`: the
+    /// first vertex was tapped (a wall polyline becomes a closed loop).
+    fn finish_sketch(&mut self, closing: bool) -> String {
+        let Some(sketch) = self.sketch.clone() else {
+            return r#"{"result":"none","count":0}"#.to_owned();
+        };
+        let rejected = |reason: Invalid, count: usize| {
+            serde_json::json!({
+                "result": "rejected",
+                "reason": reason.message(),
+                "code": reason.code(),
+                "count": count,
+            })
+            .to_string()
+        };
+        let segments = if sketch.tool == SketchTool::Wall {
+            let (run, closed) = sketch::wall_run(&sketch, closing);
+            match wall_geom::wall_segments(&run, closed, self.wall_thickness, self.wall_flip) {
+                Ok(segs) => segs,
+                Err(e) => return rejected(e, sketch.points.len()),
+            }
+        } else {
+            if let Some(st) = self.sketch_status().filter(|s| !s.can_finish) {
+                return rejected(st.reason.unwrap_or(Invalid::TooFewPoints), sketch.points.len());
+            }
+            Vec::new()
+        };
+        let outline = sketch.outline();
+        let depth = self.doc.undo_depth();
+        let result: Result<(String, Option<EntityId>, &str), String> = match sketch.tool {
+            SketchTool::Plate => {
+                let name = ops::next_element_name(&self.doc, "Floor plate");
+                ops::commit_plate(&mut self.doc, sketch.level, &outline, self.plate_thickness, &name)
+                    .map(|ids| (format!("{name} created"), Some(ids.element), "draw plate"))
+            }
+            SketchTool::Hole => {
+                let plates = self.plate_outlines(sketch.level);
+                match sketch::validate_hole(&outline, &plates) {
+                    Ok(index) => {
+                        let face = plates[index].face;
+                        let (element, name) = self
+                            .plate_by_face(face)
+                            .map_or((None, String::new()), |p| (Some(p.element), p.name.clone()));
+                        ops::commit_hole(&mut self.doc, sketch.level, face, &outline)
+                            .map(|_| (format!("Hole in {name} created"), element, "add hole"))
+                    }
+                    Err(invalid) => Err(invalid.message().to_owned()),
+                }
+            }
+            SketchTool::Wall => ops::commit_walls(
+                &mut self.doc,
+                sketch.level,
+                &segments,
+                self.wall_height,
+                self.wall_thickness,
+            )
+            .map(|ids| {
+                let msg = if ids.len() == 1 {
+                    "Wall created".to_owned()
+                } else {
+                    format!("{} walls created", ids.len())
+                };
+                (msg, ids.first().copied(), "draw walls")
+            }),
+            SketchTool::Window => match self.host_wall().cloned() {
+                Some(wall) => {
+                    let pts: Vec<[f64; 3]> = outline.iter().map(|p| wall.to_level(*p)).collect();
+                    ops::commit_window(&mut self.doc, wall.plane_level, wall.face, &pts).map(|_| {
+                        (format!("Window in {} created", wall.name), Some(wall.element), "add window")
+                    })
+                }
+                None => Err("the wall no longer exists".to_owned()),
+            },
+        };
+        match result {
+            Ok((notice, element, op)) => {
+                self.gestures.one_shot(depth);
+                if let Some(s) = self.sketch.as_mut() {
+                    s.points.clear();
+                }
+                self.sync(op);
+                self.notice = Some(notice.clone());
+                serde_json::json!({
+                    "result": "committed",
+                    "name": notice,
+                    "element": element.map(|e| e.0 as f64),
+                    "count": 0,
+                })
+                .to_string()
+            }
+            Err(e) => {
+                ops::rollback_to(&mut self.doc, depth);
+                self.gestures.invalidate_redo();
+                self.sync("commit failed");
+                serde_json::json!({"result": "rejected", "reason": e, "count": sketch.points.len()})
+                    .to_string()
+            }
+        }
     }
 
     fn level_name(&self, id: Option<EntityId>) -> Option<String> {
@@ -1204,6 +1530,35 @@ impl AuthorApp {
                 }
                 v
             }
+            ElementModel::Wall(w) => {
+                let mut v = base;
+                let windows: Vec<serde_json::Value> = w
+                    .windows
+                    .iter()
+                    .enumerate()
+                    .map(|(i, h)| {
+                        serde_json::json!({
+                            "wire": h.wire.0 as f64,
+                            "index": i + 1,
+                            "area": signed_area(&h.outline).abs(),
+                            "outline": h.outline,
+                        })
+                    })
+                    .collect();
+                if let Some(obj) = v.as_object_mut() {
+                    obj.insert("height".into(), w.height.into());
+                    obj.insert("thickness".into(), w.thickness.into());
+                    obj.insert("length".into(), w.length().into());
+                    obj.insert("start".into(), serde_json::json!(w.start));
+                    obj.insert("end".into(), serde_json::json!(w.end));
+                    obj.insert("normal".into(), serde_json::json!(w.normal));
+                    obj.insert("baseW".into(), w.base_w.into());
+                    obj.insert("profile".into(), serde_json::json!(w.profile));
+                    obj.insert("minHeight".into(), self.min_wall_height(w).into());
+                    obj.insert("windows".into(), windows.into());
+                }
+                v
+            }
             ElementModel::Other(_) => base,
         }
     }
@@ -1225,6 +1580,10 @@ impl AuthorApp {
         self.selection = None;
         self.sketch = None;
         self.tool = Tool::Select;
+        self.window_host = None;
+        if let Some(c) = self.prev_camera.take() {
+            self.camera = c;
+        }
         self.active_level = None;
         self.active_elevation = 0.0;
         self.last_committed = 0;
@@ -1303,7 +1662,13 @@ impl AuthorApp {
             self.pick.remove_instance(*id);
         }
         for mu in &updates.meshes {
-            let fallback = if self.plate(mu.id).is_some() { rgb(CONCRETE) } else { rgb(OTHER_ELEMENT) };
+            let fallback = if self.plate(mu.id).is_some() {
+                rgb(CONCRETE)
+            } else if self.wall(mu.id).is_some() {
+                rgb(WALL)
+            } else {
+                rgb(OTHER_ELEMENT)
+            };
             let colors: Vec<[f32; 3]> = mu
                 .mesh
                 .submeshes
@@ -1377,8 +1742,14 @@ impl AuthorApp {
         }
         // The camera orbits / looks down onto the active plane.
         self.camera.plane_z = self.active_elevation as f32;
-        // The sketch lives on the active plane.
-        match (self.active_level, self.sketch.as_ref().map(|s| s.level)) {
+        // A window sketch lives on its wall; it ends when the wall is gone
+        // (undo, level cascade).
+        if self.window_host.is_some() && self.host_wall().is_none() {
+            self.end_window();
+        }
+        // Every other sketch lives on the active plane.
+        let plane_sketch = self.sketch.as_ref().filter(|s| s.tool != SketchTool::Window);
+        match (self.active_level, plane_sketch.map(|s| s.level)) {
             (Some(active), Some(level)) if active != level => {
                 if let Some(s) = self.sketch.as_mut() {
                     s.level = active;
@@ -1414,37 +1785,70 @@ impl AuthorApp {
     }
 
     /// Per-owner styles: selection accent, plan-view dimming of other
-    /// levels, crisp feature edges everywhere.
+    /// levels, the faced wall outlined in an elevation view, crisp
+    /// feature edges everywhere.
     fn refresh_styles(&mut self) {
         let edge = rgba(EDGE, 0.5);
-        self.renderer.set_default_style(MeshStyle { tint: [0.0; 4], edge });
+        self.renderer.set_default_style(MeshStyle { tint: [0.0; 4], edge, depth_bias: 0.0, unlit: 0.0 });
         let mut styles: HashMap<EntityId, MeshStyle> = HashMap::new();
         let [cr, cg, cb] = rgb(CLEAR);
+        let ortho = self.camera.mode != ViewMode::Orbit;
         for id in self.pick.owner_ids().collect::<Vec<_>>() {
-            let level = self.model.iter().find(|e| e.element() == id).and_then(|e| e.level());
-            let style = if Some(id) == self.selection {
-                MeshStyle { tint: rgba(ACCENT, 0.34), edge: rgba(ACCENT, 1.0) }
-            } else if self.camera.mode == ViewMode::Plan
+            let element = self.model.iter().find(|e| e.element() == id);
+            let level = element.and_then(|e| e.level());
+            let is_plate = matches!(element, Some(ElementModel::Plate(_)));
+            let is_wall = matches!(element, Some(ElementModel::Wall(_)));
+            let depth_bias = if ortho && is_plate { PLATE_DEPTH_BIAS } else { 0.0 };
+            // The plan cut exposes the inside of a wall: fill it flat.
+            let cut_wall = is_wall && self.camera.mode == ViewMode::Plan;
+            let other_level = self.camera.mode == ViewMode::Plan
                 && level.is_some()
-                && level != self.active_level
-            {
-                MeshStyle { tint: [cr, cg, cb, 0.6], edge: rgba(EDGE, 0.15) }
+                && level != self.active_level;
+            let (tint, edge, unlit) = if Some(id) == self.selection {
+                let a = if cut_wall { 0.85 } else { 0.34 };
+                (rgba(ACCENT, a), rgba(ACCENT, 1.0), if cut_wall { 1.0 } else { 0.0 })
+            } else if Some(id) == self.window_host {
+                // The faced wall shows its true color head-on.
+                ([0.0; 4], rgba(ACCENT, 1.0), ELEVATION_UNLIT)
+            } else if other_level {
+                ([cr, cg, cb, 0.6], rgba(EDGE, 0.15), 0.0)
+            } else if cut_wall {
+                (rgba(POCHE, 0.8), edge, 1.0)
             } else {
-                MeshStyle { tint: [0.0; 4], edge }
+                ([0.0; 4], edge, 0.0)
             };
-            styles.insert(id, style);
+            styles.insert(id, MeshStyle { tint, edge, depth_bias, unlit });
         }
         self.renderer.set_styles(styles);
     }
 
-    /// Rebuild the grid on the active plane when the view changes enough
-    /// (density follows zoom; extent covers the view).
+    /// The plane the grid is drawn on: the active level (lifted so it
+    /// shows on plate tops), or the faced wall in an elevation view
+    /// (just in front of the face, wall-local u along / v up).
+    fn grid_frame(&self) -> SketchFrame {
+        match (self.camera.mode, self.host_elevation_frame()) {
+            (ViewMode::Elevation, Some((f, _, _))) => SketchFrame {
+                origin: f.origin + f.n * (f.near_offset - GRID_LIFT_M * 2.0),
+                u: f.u,
+                v: Vec3::Z,
+            },
+            _ => SketchFrame {
+                origin: Vec3::new(0.0, 0.0, self.active_elevation as f32 + GRID_LIFT_M),
+                u: Vec3::X,
+                v: Vec3::Y,
+            },
+        }
+    }
+
+    /// Rebuild the grid when the view changes enough (density follows
+    /// zoom; extent covers the view).
     fn update_grid(&mut self) {
         let (w, h) = self.size_f();
         let ppm = f64::from(self.camera.px_per_m(h));
+        let mode = self.camera.mode;
         // Sparser in 3D: perspective compresses distant lines.
-        let min_px = if self.camera.mode == ViewMode::Plan { 9.0 } else { 16.0 };
-        let mut minor = self.snap_step;
+        let min_px = if mode == ViewMode::Orbit { 16.0 } else { 9.0 };
+        let mut minor = if mode == ViewMode::Elevation { WINDOW_SNAP_STEP_M } else { self.snap_step };
         for s in GRID_STEPS {
             if minor * ppm >= min_px {
                 break;
@@ -1454,10 +1858,15 @@ impl AuthorApp {
             }
         }
         let major = if minor < 1.0 { 1.0 } else { minor * 5.0 };
-        let target = self.camera.target;
-        let (half_x, half_y, fade) = match self.camera.mode {
+        let frame = self.grid_frame();
+        let center = frame.local(self.camera.target);
+        let (half_x, half_y, fade) = match mode {
             ViewMode::Plan => {
                 let hh = f64::from(self.camera.plan_half_h) * 1.15;
+                (hh * f64::from(w / h), hh, 0.0f32)
+            }
+            ViewMode::Elevation => {
+                let hh = f64::from(self.camera.elevation_half_h) * 1.15;
                 (hh * f64::from(w / h), hh, 0.0f32)
             }
             ViewMode::Orbit => {
@@ -1471,20 +1880,22 @@ impl AuthorApp {
         }
         let major = major.max(minor);
         let snapq = |v: f64| (v / major).floor() as i64;
-        let cx = f64::from(target.x);
-        let cy = f64::from(target.y);
         let key = (
             minor.to_bits(),
             major.to_bits(),
-            snapq(cx - half_x),
-            snapq(cx + half_x) + 1,
-            snapq(cy - half_y),
-            snapq(cy + half_y) + 1,
-            (self.active_elevation as f32).to_bits(),
-            u8::from(self.camera.mode == ViewMode::Plan),
+            snapq(center[0] - half_x),
+            snapq(center[0] + half_x) + 1,
+            snapq(center[1] - half_y),
+            snapq(center[1] + half_y) + 1,
+            (frame.origin.x + frame.origin.y * 7.0 + frame.origin.z * 13.0).to_bits(),
+            match mode {
+                ViewMode::Plan => 0,
+                ViewMode::Orbit => 1,
+                ViewMode::Elevation => 2,
+            },
         );
-        let z = self.active_elevation as f32 + GRID_LIFT_M;
-        self.renderer.set_fade([target.x, target.y, z], fade);
+        let target = self.camera.target;
+        self.renderer.set_fade([target.x, target.y, frame.origin.z], fade);
         if self.grid_key == Some(key) {
             return;
         }
@@ -1496,10 +1907,10 @@ impl AuthorApp {
         let axis_x = rgba(AXIS_X, 0.75);
         let axis_y = rgba(AXIS_Y, 0.75);
         let mut verts: Vec<f32> = Vec::new();
-        let mut line = |a: [f64; 2], b: [f64; 2], c: [f32; 4]| {
-            verts.extend_from_slice(&[a[0] as f32, a[1] as f32, z]);
+        let mut line = |a: P2, b: P2, c: [f32; 4]| {
+            verts.extend_from_slice(&frame.world(a).to_array());
             verts.extend_from_slice(&c);
-            verts.extend_from_slice(&[b[0] as f32, b[1] as f32, z]);
+            verts.extend_from_slice(&frame.world(b).to_array());
             verts.extend_from_slice(&c);
         };
         let is_multiple = |v: f64, step: f64| ((v / step).round() * step - v).abs() < 1e-6;
@@ -1507,7 +1918,7 @@ impl AuthorApp {
         for i in i0..=i1 {
             let x = i as f64 * minor;
             if x.abs() < 1e-9 {
-                continue; // the Y axis is drawn below, on top
+                continue; // the axis is drawn below, on top
             }
             let c = if is_multiple(x, major) { major_c } else { minor_c };
             line([x, y0], [x, y1], c);

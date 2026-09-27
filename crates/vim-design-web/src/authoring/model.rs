@@ -9,9 +9,14 @@
 //!   (a horizontal profile), and whose path is a vertical line attached
 //!   to the same level. Its holes are the face's hole wires (same
 //!   rules). Thickness = the path's `w` extent.
+//! - **Wall** = the same Element -> Extrusion -> Face chain, but the
+//!   profile is VERTICAL: all points attached to one level, lying in one
+//!   vertical plane, spanning a `w` range; the path is a horizontal line
+//!   across that plane (the thickness). The wall axis (`u`) is the
+//!   drawn direction, read from the profile's first edge along the base;
+//!   `v` is world up. Its windows are the face's hole wires.
 //! - Anything else is listed as a generic element (name + level +
-//!   delete). Walls (vertical profiles) join the recognized kinds in
-//!   Milestone 2.
+//!   delete).
 
 use vim_design_lib::entity::slot;
 use vim_design_lib::{Document, EntityId, EntityKind, Params};
@@ -51,6 +56,67 @@ pub struct PlateModel {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct WallModel {
+    pub element: EntityId,
+    pub name: String,
+    /// Association (data): the element's level slot.
+    pub level: EntityId,
+    /// Attachment (geometry): the level the profile points live on.
+    pub plane_level: EntityId,
+    pub extrusion: EntityId,
+    pub face: EntityId,
+    pub path_start: EntityId,
+    pub path_end: EntityId,
+    /// Base line on the level (u, v), in the drawn direction.
+    pub start: P2,
+    pub end: P2,
+    /// `w` of the base line on the plane level (0 for app-drawn walls).
+    pub base_w: f64,
+    pub height: f64,
+    pub thickness: f64,
+    /// Unit horizontal vector from the reference face into the body.
+    pub normal: P2,
+    /// Profile control points on the top edge (moved by height edits).
+    pub top_cps: Vec<EntityId>,
+    /// Profile outline in wall-local coordinates (u along, v up).
+    pub profile: Vec<P2>,
+    /// Windows (face holes), outlines in wall-local coordinates.
+    pub windows: Vec<HoleModel>,
+}
+
+impl WallModel {
+    pub fn length(&self) -> f64 {
+        super::geom::dist(self.start, self.end)
+    }
+
+    /// Unit drawn direction (the wall-local `u` axis).
+    pub fn dir(&self) -> P2 {
+        let l = self.length().max(1e-12);
+        [(self.end[0] - self.start[0]) / l, (self.end[1] - self.start[1]) / l]
+    }
+
+    /// Wall-local (u, v) -> level-frame (u, v, w).
+    pub fn to_level(&self, p: P2) -> [f64; 3] {
+        let d = self.dir();
+        [self.start[0] + d[0] * p[0], self.start[1] + d[1] * p[0], self.base_w + p[1]]
+    }
+
+    /// Level-frame point -> wall-local (u, v) (projected onto the face).
+    pub fn to_local(&self, p: [f64; 3]) -> P2 {
+        let d = self.dir();
+        [(p[0] - self.start[0]) * d[0] + (p[1] - self.start[1]) * d[1], p[2] - self.base_w]
+    }
+
+    /// Top of the highest window above the base (0 without windows).
+    pub fn highest_window_top(&self) -> f64 {
+        self.windows
+            .iter()
+            .flat_map(|w| w.outline.iter().map(|p| p[1]))
+            .fold(0.0, f64::max)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct OtherModel {
     pub element: EntityId,
     pub name: String,
@@ -60,6 +126,7 @@ pub struct OtherModel {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ElementModel {
     Plate(PlateModel),
+    Wall(WallModel),
     Other(OtherModel),
 }
 
@@ -67,6 +134,7 @@ impl ElementModel {
     pub fn element(&self) -> EntityId {
         match self {
             ElementModel::Plate(p) => p.element,
+            ElementModel::Wall(w) => w.element,
             ElementModel::Other(o) => o.element,
         }
     }
@@ -74,6 +142,7 @@ impl ElementModel {
     pub fn name(&self) -> &str {
         match self {
             ElementModel::Plate(p) => &p.name,
+            ElementModel::Wall(w) => &w.name,
             ElementModel::Other(o) => &o.name,
         }
     }
@@ -81,6 +150,7 @@ impl ElementModel {
     pub fn level(&self) -> Option<EntityId> {
         match self {
             ElementModel::Plate(p) => Some(p.level),
+            ElementModel::Wall(w) => Some(w.level),
             ElementModel::Other(o) => o.level,
         }
     }
@@ -88,6 +158,7 @@ impl ElementModel {
     pub fn kind_name(&self) -> &'static str {
         match self {
             ElementModel::Plate(_) => "floor_plate",
+            ElementModel::Wall(_) => "wall",
             ElementModel::Other(_) => "element",
         }
     }
@@ -237,6 +308,123 @@ fn derive_plate(doc: &Document, element: EntityId, name: &str, level: EntityId) 
     })
 }
 
+/// A wire's control points with their level-frame coordinates; every
+/// point must be attached to the same level.
+/// A loop's level and its (control point, level-frame coordinates).
+type AttachedLoop = (EntityId, Vec<(EntityId, [f64; 3])>);
+
+fn attached_loop(doc: &Document, wire: EntityId) -> Option<AttachedLoop> {
+    let cps = wire_loop(doc, wire)?;
+    let mut level = None;
+    let mut out = Vec::with_capacity(cps.len());
+    for cp in cps {
+        let (plane, pos) = control_point(doc, cp)?;
+        let plane = plane?;
+        if *level.get_or_insert(plane) != plane {
+            return None;
+        }
+        out.push((cp, pos));
+    }
+    Some((level?, out))
+}
+
+fn derive_wall(doc: &Document, element: EntityId, name: &str, level: EntityId) -> Option<WallModel> {
+    let extrusion = first_input(doc, element, slot::ELEMENT_MEMBERS)?;
+    if kind_of(doc, extrusion)? != EntityKind::Extrusion {
+        return None;
+    }
+    let face = first_input(doc, extrusion, slot::EXTRUSION_PROFILE)?;
+    let path = first_input(doc, extrusion, slot::EXTRUSION_PATH)?;
+    let outer = first_input(doc, face, slot::FACE_OUTER)?;
+    let (plane_level, pts) = attached_loop(doc, outer)?;
+    let base_w = pts.iter().map(|(_, p)| p[2]).fold(f64::INFINITY, f64::min);
+    let top_w = pts.iter().map(|(_, p)| p[2]).fold(f64::NEG_INFINITY, f64::max);
+    if top_w - base_w < 1e-6 {
+        return None; // horizontal profile: not a wall
+    }
+    // Wall axis: the first edge, when it runs along the base; otherwise
+    // the first two base points in loop order.
+    let first_edge = input_of(doc, outer, slot::WIRE_EDGES).first().copied();
+    let from_edge = first_edge
+        .and_then(|e| first_input(doc, e, slot::EDGE_CURVE))
+        .and_then(|c| line_points(doc, c))
+        .and_then(|(a, b)| Some((control_point(doc, a)?.1, control_point(doc, b)?.1)))
+        .filter(|(a, b)| (a[2] - base_w).abs() < 1e-9 && (b[2] - base_w).abs() < 1e-9);
+    let (a, b) = match from_edge {
+        Some(ab) => ab,
+        None => {
+            let mut base = pts.iter().map(|(_, p)| *p).filter(|p| (p[2] - base_w).abs() < 1e-9);
+            (base.next()?, base.next()?)
+        }
+    };
+    let (start, end) = ([a[0], a[1]], [b[0], b[1]]);
+    let len = super::geom::dist(start, end);
+    if len < 1e-6 {
+        return None;
+    }
+    let d = [(end[0] - start[0]) / len, (end[1] - start[1]) / len];
+    // Vertical plane: every point projects onto the base line.
+    let off_plane = |p: &[f64; 3]| ((p[0] - start[0]) * d[1] - (p[1] - start[1]) * d[0]).abs();
+    if pts.iter().any(|(_, p)| off_plane(p) > 1e-6) {
+        return None;
+    }
+    let (path_start, path_end) = line_points(doc, path)?;
+    let (sp, s) = control_point(doc, path_start)?;
+    let (ep, e) = control_point(doc, path_end)?;
+    if sp != Some(plane_level) || ep != Some(plane_level) || (s[2] - e[2]).abs() > 1e-9 {
+        return None;
+    }
+    let v = [e[0] - s[0], e[1] - s[1]];
+    let thickness = v[0].hypot(v[1]);
+    if thickness < 1e-6 {
+        return None;
+    }
+    let normal = [v[0] / thickness, v[1] / thickness];
+    if (normal[0] * d[0] + normal[1] * d[1]).abs() > 1e-6 {
+        return None; // thickness not across the wall
+    }
+    let local = |p: &[f64; 3]| -> P2 {
+        [(p[0] - start[0]) * d[0] + (p[1] - start[1]) * d[1], p[2] - base_w]
+    };
+    let profile: Vec<P2> = pts.iter().map(|(_, p)| local(p)).collect();
+    let top_cps = pts
+        .iter()
+        .filter(|(_, p)| (p[2] - top_w).abs() < 1e-9)
+        .map(|(cp, _)| *cp)
+        .collect();
+    let windows = input_of(doc, face, slot::FACE_HOLES)
+        .into_iter()
+        .map(|wire| {
+            let outline = match attached_loop(doc, wire) {
+                Some((l, hole)) if l == plane_level && hole.iter().all(|(_, p)| off_plane(p) < 1e-6) => {
+                    hole.iter().map(|(_, p)| local(p)).collect()
+                }
+                _ => Vec::new(),
+            };
+            HoleModel { wire, outline }
+        })
+        .collect();
+    Some(WallModel {
+        element,
+        name: name.to_owned(),
+        level,
+        plane_level,
+        extrusion,
+        face,
+        path_start,
+        path_end,
+        start,
+        end,
+        base_w,
+        height: top_w - base_w,
+        thickness,
+        normal,
+        top_cps,
+        profile,
+        windows,
+    })
+}
+
 /// Derive the element list from the document, ordered by element id
 /// (creation order).
 pub fn derive(doc: &Document) -> Vec<ElementModel> {
@@ -244,15 +432,14 @@ pub fn derive(doc: &Document) -> Vec<ElementModel> {
         .filter_map(|(id, record)| match &record.params {
             Params::Element { name } => {
                 let level = first_input(doc, *id, slot::ELEMENT_LEVEL);
-                let plate = level.and_then(|l| derive_plate(doc, *id, name, l));
-                Some(match plate {
-                    Some(p) => ElementModel::Plate(p),
-                    None => ElementModel::Other(OtherModel {
-                        element: *id,
-                        name: name.clone(),
-                        level,
-                    }),
-                })
+                let recognized = level.and_then(|l| {
+                    derive_plate(doc, *id, name, l)
+                        .map(ElementModel::Plate)
+                        .or_else(|| derive_wall(doc, *id, name, l).map(ElementModel::Wall))
+                });
+                Some(recognized.unwrap_or_else(|| {
+                    ElementModel::Other(OtherModel { element: *id, name: name.clone(), level })
+                }))
             }
             _ => None,
         })
@@ -339,5 +526,77 @@ mod tests {
         assert!(drag.meshes.is_empty(), "no re-tessellation");
         assert_eq!(drag.base_transforms.len(), 1);
         assert_eq!(drag.base_transforms[0].transform[11], 1.5);
+    }
+
+    #[test]
+    fn walls_and_windows_round_trip_through_the_document() {
+        use crate::authoring::walls;
+        use vim_design_lib::Command;
+        use vim_design_lib::eval::Engine;
+        let mut doc = Document::new();
+        let ground = ops::seed_new_project(&mut doc).expect("seed");
+        let square = [[0.0, 0.0], [4.0, 0.0], [4.0, 3.0], [0.0, 3.0]];
+        let segs = walls::wall_segments(&square, true, 0.2, false).expect("segments");
+        let ids = ops::commit_walls(&mut doc, ground, &segs, 2.7, 0.2).expect("walls");
+        assert_eq!(ids.len(), 4);
+        let model = derive(&doc);
+        let walls: Vec<&WallModel> = model
+            .iter()
+            .filter_map(|e| if let ElementModel::Wall(w) = e { Some(w) } else { None })
+            .collect();
+        assert_eq!(walls.len(), 4);
+        let names: Vec<&str> = walls.iter().map(|w| w.name.as_str()).collect();
+        assert_eq!(names, ["Wall 1", "Wall 2", "Wall 3", "Wall 4"]);
+        let bottom = walls.iter().find(|w| w.start[1] == 0.0 && w.end[1] == 0.0).expect("bottom");
+        assert!((bottom.height - 2.7).abs() < 1e-12 && (bottom.thickness - 0.2).abs() < 1e-12);
+        assert_eq!(bottom.normal, [0.0, 1.0], "inward");
+        assert_eq!(bottom.top_cps.len(), 2);
+        assert!((bottom.length() - 3.8).abs() < 1e-9);
+        // A window in the bottom wall's face.
+        let win = [[1.0, 0.9], [2.0, 0.9], [2.0, 2.0], [1.0, 2.0]];
+        let pts: Vec<[f64; 3]> = win.iter().map(|p| bottom.to_level(*p)).collect();
+        let (face, element) = (bottom.face, bottom.element);
+        let wire = ops::commit_window(&mut doc, ground, face, &pts).expect("window");
+        let wall = derive(&doc)
+            .into_iter()
+            .find_map(|e| match e {
+                ElementModel::Wall(w) if w.element == element => Some(w),
+                _ => None,
+            })
+            .expect("wall");
+        assert_eq!(wall.windows.len(), 1);
+        assert_eq!(wall.windows[0].wire, wire);
+        for (a, b) in wall.windows[0].outline.iter().zip(win.iter()) {
+            assert!((a[0] - b[0]).abs() < 1e-9 && (a[1] - b[1]).abs() < 1e-9);
+        }
+        assert!((wall.highest_window_top() - 2.0).abs() < 1e-9);
+        // The kernel builds the walls (and the window hole) without errors,
+        // and an elevation edit is transform-only.
+        let mut engine = Engine::new();
+        engine.set_translation_factoring(true);
+        engine.evaluate_pending(&mut doc);
+        let first = engine.poll_updates(&doc);
+        assert_eq!(first.meshes.len(), 4);
+        assert!(first.errors.is_empty(), "{:?}", first.errors);
+        doc.submit(Command::UpdateLevel {
+            id: ground,
+            name: None,
+            elevation_m: Some(0.5),
+            is_building_story: None,
+            color: None,
+            extent_m: None,
+            coalesce: false,
+        })
+        .expect("elevation edit");
+        engine.evaluate_pending(&mut doc);
+        let drag = engine.poll_updates(&doc);
+        assert!(drag.meshes.is_empty());
+        assert_eq!(drag.base_transforms.len(), 4);
+        // Reload keeps the model; deleting the window sweeps its geometry.
+        let loaded = Document::load(&doc.save().expect("save")).expect("load");
+        assert_eq!(derive(&loaded), derive(&doc));
+        let before = doc.entity_count();
+        ops::delete_hole(&mut doc, face, wire).expect("delete window");
+        assert_eq!(doc.entity_count(), before - 13);
     }
 }

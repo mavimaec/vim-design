@@ -1,6 +1,7 @@
 //! The authoring app's camera: a top-down orthographic PLAN view onto
-//! the active level, and a perspective 3D ORBIT view. Right-handed,
-//! Z-up. Camera state is session state: never in the document, never
+//! the active level, a perspective 3D ORBIT view, and an orthographic
+//! ELEVATION view facing one wall (window drawing). Right-handed, Z-up.
+//! Camera state is session state: never in the document, never
 //! undoable.
 
 use glam::{Mat4, Vec3, Vec4};
@@ -9,6 +10,7 @@ use glam::{Mat4, Vec3, Vec4};
 pub enum ViewMode {
     Plan,
     Orbit,
+    Elevation,
 }
 
 impl ViewMode {
@@ -16,6 +18,7 @@ impl ViewMode {
         match self {
             ViewMode::Plan => "plan",
             ViewMode::Orbit => "3d",
+            ViewMode::Elevation => "elevation",
         }
     }
 }
@@ -32,6 +35,30 @@ const MIN_DISTANCE: f32 = 1.0;
 const MAX_DISTANCE: f32 = 600.0;
 const MIN_HALF_H: f32 = 0.5;
 const MAX_HALF_H: f32 = 400.0;
+/// Elevation view: the eye sits this far in front of the wall face it
+/// looks at, so everything nearer the viewer is clipped away.
+const ELEVATION_EYE_GAP_M: f32 = 0.02;
+/// Elevation view: depth kept behind the faced wall's back face.
+/// Everything farther is clipped, so window openings show the
+/// background instead of the walls behind them.
+const ELEVATION_BACK_M: f32 = 0.05;
+
+/// The wall an elevation view faces. The basis comes from stable inputs
+/// only: `u` = the wall's drawn direction, `v` = world up, and the view
+/// direction `n = up × u` (so `u` always points to the screen's right).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ElevationFrame {
+    /// World point of the wall's base-line start (u = 0, v = 0).
+    pub origin: Vec3,
+    pub u: Vec3,
+    /// View direction (horizontal).
+    pub n: Vec3,
+    /// Offset along `n` from the reference face to the wall face nearest
+    /// the viewer (≤ 0).
+    pub near_offset: f32,
+    /// Wall thickness (the depth of the view volume behind the face).
+    pub depth: f32,
+}
 
 #[derive(Debug, Clone)]
 pub struct Camera {
@@ -45,6 +72,9 @@ pub struct Camera {
     pub plan_half_h: f32,
     /// Elevation of the active construction plane.
     pub plane_z: f32,
+    /// Elevation view: the faced wall, and half the visible height.
+    pub elevation: Option<ElevationFrame>,
+    pub elevation_half_h: f32,
 }
 
 impl Default for Camera {
@@ -57,6 +87,8 @@ impl Default for Camera {
             distance: 28.0,
             plan_half_h: 9.0,
             plane_z: 0.0,
+            elevation: None,
+            elevation_half_h: 3.0,
         }
     }
 }
@@ -78,6 +110,15 @@ impl Camera {
     }
 
     pub fn view_proj(&self, aspect: f32) -> Mat4 {
+        if let (ViewMode::Elevation, Some(f)) = (self.mode, self.elevation) {
+            let eye = self.target + f.n * (f.near_offset - ELEVATION_EYE_GAP_M);
+            let view = glam::camera::rh::view::look_at_mat4(eye, eye + f.n, Vec3::Z);
+            let hh = self.elevation_half_h;
+            let hw = hh * aspect;
+            let far = ELEVATION_EYE_GAP_M + f.depth + ELEVATION_BACK_M;
+            return glam::camera::rh::proj::directx::orthographic(-hw, hw, -hh, hh, 0.0, far)
+                * view;
+        }
         match self.mode {
             ViewMode::Orbit => {
                 let target = self.orbit_target();
@@ -89,7 +130,7 @@ impl Camera {
                 let far = self.distance * 40.0 + 200.0;
                 glam::camera::rh::proj::directx::perspective(FOV_Y, aspect, near, far) * view
             }
-            ViewMode::Plan => {
+            ViewMode::Plan | ViewMode::Elevation => {
                 let eye = Vec3::new(self.target.x, self.target.y, self.plane_z + PLAN_CUT_M);
                 let view = glam::camera::rh::view::look_at_mat4(eye, eye - Vec3::Z, Vec3::Y);
                 let hh = self.plan_half_h;
@@ -103,7 +144,8 @@ impl Camera {
     /// Screen pixels per meter at the target (for grid density).
     pub fn px_per_m(&self, height_px: f32) -> f32 {
         let half_h = match self.mode {
-            ViewMode::Plan => self.plan_half_h,
+            ViewMode::Elevation if self.elevation.is_some() => self.elevation_half_h,
+            ViewMode::Plan | ViewMode::Elevation => self.plan_half_h,
             ViewMode::Orbit => self.distance * (FOV_Y / 2.0).tan(),
         };
         height_px / (2.0 * half_h.max(1e-3))
@@ -111,10 +153,14 @@ impl Camera {
 
     /// Feature-edge nudge anchor and fraction (see the renderer).
     pub fn edge_nudge(&self) -> ([f32; 3], f32) {
+        if let (ViewMode::Elevation, Some(f)) = (self.mode, self.elevation) {
+            // A far point behind the viewer: 1000 m * 5e-6 = 5 mm pull.
+            return ((self.target - f.n * 1000.0).to_array(), 5e-6);
+        }
         match self.mode {
             ViewMode::Orbit => (self.eye().to_array(), 0.0015),
             // A far point straight above: 1000 m * 5e-6 = 5 mm pull.
-            ViewMode::Plan => (
+            ViewMode::Plan | ViewMode::Elevation => (
                 [self.target.x, self.target.y, self.plane_z + 1000.0],
                 5e-6,
             ),
@@ -132,8 +178,17 @@ impl Camera {
     /// Zoom by `factor` (< 1 = in) keeping the plane point `anchor`
     /// fixed on screen (zoom toward the cursor).
     pub fn zoom(&mut self, factor: f32, anchor: Option<Vec3>) {
+        if self.mode == ViewMode::Elevation && self.elevation.is_some() {
+            let old = self.elevation_half_h;
+            let new = (old * factor).clamp(MIN_HALF_H, MAX_HALF_H);
+            if let Some(a) = anchor {
+                self.target = a + (self.target - a) * (new / old);
+            }
+            self.elevation_half_h = new;
+            return;
+        }
         match self.mode {
-            ViewMode::Plan => {
+            ViewMode::Plan | ViewMode::Elevation => {
                 let old = self.plan_half_h;
                 let new = (old * factor).clamp(MIN_HALF_H, MAX_HALF_H);
                 if let Some(a) = anchor {
@@ -162,12 +217,16 @@ impl Camera {
         let d = from - to;
         self.target.x += d.x;
         self.target.y += d.y;
+        if self.mode == ViewMode::Elevation {
+            self.target.z += d.z; // the elevation plane is vertical
+        }
     }
 
     /// Screen-space pan fallback (the pointer is off the plane).
     pub fn pan_pixels(&mut self, dx: f32, dy: f32, height_px: f32) {
         let m_per_px = 1.0 / self.px_per_m(height_px);
         let (right, up) = match self.mode {
+            ViewMode::Elevation => (self.elevation.map_or(Vec3::X, |f| f.u), Vec3::Z),
             ViewMode::Plan => (Vec3::X, Vec3::Y),
             ViewMode::Orbit => {
                 let fwd = -self.orbit_dir();
@@ -211,8 +270,39 @@ impl Camera {
                 self.plan_half_h =
                     (self.distance * (FOV_Y / 2.0).tan()).clamp(MIN_HALF_H, MAX_HALF_H);
             }
+            ViewMode::Elevation => {}
         }
         self.mode = mode;
+    }
+
+    /// Face a wall: orthographic view along `frame.n`, framing the
+    /// `length` × `height` face with some margin.
+    pub fn enter_elevation(&mut self, frame: ElevationFrame, length: f32, height: f32, aspect: f32) {
+        self.mode = ViewMode::Elevation;
+        self.elevation = Some(frame);
+        self.target = frame.origin + frame.u * (length / 2.0) + Vec3::Z * (height / 2.0);
+        let half_h = (height / 2.0).max(length / 2.0 / aspect.max(0.1));
+        self.elevation_half_h = (half_h * 1.3 + 0.3).clamp(MIN_HALF_H, MAX_HALF_H);
+    }
+
+    /// Ray intersection with an arbitrary plane (point + normal).
+    pub fn unproject_to(
+        &self,
+        px: f32,
+        py: f32,
+        w: f32,
+        h: f32,
+        origin: Vec3,
+        normal: Vec3,
+    ) -> Option<Vec3> {
+        let (o, d) = self.ray(px, py, w, h)?;
+        let denom = d.dot(normal);
+        if denom.abs() <= 1e-6 {
+            return None;
+        }
+        let t = (origin - o).dot(normal) / denom;
+        let hit = o + d * t;
+        (t >= 0.0 && (hit - o).length() < 5_000.0).then_some(hit)
     }
 
     /// Canvas pixel -> world ray (origin, unit direction).

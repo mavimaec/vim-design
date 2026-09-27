@@ -14,6 +14,7 @@ use vim_design_lib::entity::slot;
 use vim_design_lib::{Command, Document, EntityId, EntityKind, Params, VimStatus};
 
 use super::geom::{P2, normalized_ccw};
+use super::walls::WallSeg;
 
 /// Site defaults: downtown Montreal. The default lives in the app, not
 /// in the library.
@@ -113,16 +114,23 @@ pub fn build_attached_outline(
     level: EntityId,
     points: &[P2],
 ) -> Result<EntityId, String> {
+    let pts: Vec<[f64; 3]> = points.iter().map(|[u, v]| [*u, *v, 0.0]).collect();
+    build_attached_loop(doc, level, &pts)
+}
+
+/// Build a level-attached closed loop from level-frame (u, v, w)
+/// points: control points (attached) -> lines -> edges -> wire.
+pub fn build_attached_loop(
+    doc: &mut Document,
+    level: EntityId,
+    points: &[[f64; 3]],
+) -> Result<EntityId, String> {
     let mut cps = Vec::with_capacity(points.len());
-    for [u, v] in points {
-        let cp = one(doc, Command::CreateControlPoint { position: [*u, *v, 0.0] })?;
+    for p in points {
+        let cp = one(doc, Command::CreateControlPoint { position: *p })?;
         ok(
             doc,
-            Command::UpdateControlPointPlane {
-                id: cp,
-                plane: Some(level),
-                position: None, // stored coords ARE the (u, v, w)
-            },
+            Command::UpdateControlPointPlane { id: cp, plane: Some(level), position: None },
         )?;
         cps.push(cp);
     }
@@ -130,14 +138,81 @@ pub fn build_attached_outline(
     for i in 0..cps.len() {
         let line = one(
             doc,
-            Command::CreateLine {
-                start: cps[i],
-                end: cps[(i + 1) % cps.len()],
-            },
+            Command::CreateLine { start: cps[i], end: cps[(i + 1) % cps.len()] },
         )?;
         edges.push(one(doc, Command::CreateEdge { curve: line })?);
     }
     one(doc, Command::CreateWire { edges })
+}
+
+/// Commit a wall run: one element per segment, each a vertical profile
+/// rectangle (base line at `w = 0`, top at `w = height`) extruded along
+/// the segment normal by `thickness`. Every point is attached to
+/// `level`; every element is associated with it. Returns the element
+/// ids in run order.
+pub fn commit_walls(
+    doc: &mut Document,
+    level: EntityId,
+    segments: &[WallSeg],
+    height: f64,
+    thickness: f64,
+) -> Result<Vec<EntityId>, String> {
+    let mut elements = Vec::with_capacity(segments.len());
+    for seg in segments {
+        let [sx, sy] = seg.start;
+        let [ex, ey] = seg.end;
+        // Wire order A -> B -> C -> D: the first edge runs along the base
+        // in the drawn direction (the model reads the wall axis from it).
+        let profile = [[sx, sy, 0.0], [ex, ey, 0.0], [ex, ey, height], [sx, sy, height]];
+        let wire = build_attached_loop(doc, level, &profile)?;
+        let face = one(doc, Command::CreateFace { outer: wire, holes: vec![], plane: None })?;
+        let start_cp = one(doc, Command::CreateControlPoint { position: [sx, sy, 0.0] })?;
+        let end_cp = one(
+            doc,
+            Command::CreateControlPoint {
+                position: [sx + seg.normal[0] * thickness, sy + seg.normal[1] * thickness, 0.0],
+            },
+        )?;
+        let path = one(doc, Command::CreateLine { start: start_cp, end: end_cp })?;
+        let extrusion = one(doc, Command::CreateExtrusion { profile: face, path })?;
+        attach_all(doc, level, &[start_cp, end_cp])?;
+        let name = next_element_name(doc, "Wall");
+        let element = one(
+            doc,
+            Command::CreateElement { name, members: vec![extrusion], level },
+        )?;
+        one(
+            doc,
+            Command::CreateInstance {
+                element,
+                transform: [
+                    1.0, 0.0, 0.0, 0.0, //
+                    0.0, 1.0, 0.0, 0.0, //
+                    0.0, 0.0, 1.0, 0.0,
+                ],
+            },
+        )?;
+        elements.push(element);
+    }
+    Ok(elements)
+}
+
+/// Append a window (hole wire from level-frame (u, v, w) points) to a
+/// wall's profile face. Returns the new wire id.
+pub fn commit_window(
+    doc: &mut Document,
+    level: EntityId,
+    face: EntityId,
+    points: &[[f64; 3]],
+) -> Result<EntityId, String> {
+    let wire = build_attached_loop(doc, level, points)?;
+    let mut holes = face_holes(doc, face);
+    holes.push(wire);
+    ok(
+        doc,
+        Command::UpdateFace { id: face, outer: None, holes: Some(holes), plane: None, coalesce: false },
+    )?;
+    Ok(wire)
 }
 
 /// Ids of a committed floor plate.

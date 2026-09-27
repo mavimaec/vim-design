@@ -1,6 +1,6 @@
 //! wgpu renderer shared by the demo and the authoring app (wasm only).
 //!
-//! Right-handed, Z-up (docs/ARCHITECTURE.md §7). Prefers the browser's
+//! Right-handed, Z-up. Prefers the browser's
 //! WebGPU backend and falls back to WebGL2 (wgpu `webgl` feature) when no
 //! WebGPU adapter is available — the chosen path is reported by
 //! [`Renderer::backend_name`]. The projection is the caller's business
@@ -40,8 +40,8 @@ const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth24Plus;
 /// Dynamic-offset stride for per-draw uniforms (WebGL2 requires
 /// 256-byte alignment).
 const MODEL_STRIDE: u64 = 256;
-/// Per-draw uniform payload: model matrix + tint + edge color.
-const MODEL_SIZE: u64 = 96;
+/// Per-draw uniform payload: model matrix + tint + edge color + params.
+const MODEL_SIZE: u64 = 112;
 const GLOBALS_SIZE: u64 = 128;
 /// Dihedral angle above which a mesh edge is a feature edge.
 const FEATURE_ANGLE_COS: f32 = 0.866; // 30°
@@ -76,6 +76,10 @@ struct Model {
     tint: vec4<f32>,
     // Feature-edge color (a = 0: no edges drawn).
     edge: vec4<f32>,
+    // x: clip-space depth bias (positive pushes the surface back), so
+    // coplanar faces of different elements resolve deterministically.
+    // y: unlit mix (0 = fully shaded, 1 = flat base color).
+    params: vec4<f32>,
 };
 @group(1) @binding(0) var<uniform> model: Model;
 
@@ -89,6 +93,7 @@ fn transform(p: vec3<f32>, n: vec3<f32>, c: vec3<f32>) -> VsOut {
     var out: VsOut;
     let world = model.m * vec4<f32>(p, 1.0);
     out.pos = globals.view_proj * world;
+    out.pos.z = out.pos.z + model.params.x * out.pos.w;
     out.normal = (model.m * vec4<f32>(n, 0.0)).xyz;
     out.color = c;
     return out;
@@ -130,6 +135,7 @@ fn vs_edge(
     let eye = globals.eye.xyz;
     let pulled = eye + (world - eye) * (1.0 - globals.eye.w);
     out.pos = globals.view_proj * vec4<f32>(pulled, 1.0);
+    out.pos.z = out.pos.z + model.params.x * out.pos.w;
     out.normal = n;
     out.color = c;
     return out;
@@ -144,7 +150,8 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let fill = 0.25 * max(dot(n, fill_dir), 0.0);
     let shade = 0.24 + 0.72 * key + fill;
     let base = mix(in.color, model.tint.rgb, model.tint.a);
-    return vec4<f32>(encode(base * min(shade, 1.15)), 1.0);
+    let lit = mix(base * min(shade, 1.15), base, model.params.y);
+    return vec4<f32>(encode(lit), 1.0);
 }
 
 @fragment
@@ -227,6 +234,10 @@ pub struct MeshStyle {
     pub tint: [f32; 4],
     /// Feature-edge color; `a == 0` draws no edges.
     pub edge: [f32; 4],
+    /// Clip-space depth bias (positive pushes the element back).
+    pub depth_bias: f32,
+    /// 0 = fully shaded; 1 = flat base color (a face shown head-on).
+    pub unlit: f32,
 }
 
 /// Which overlay line layer to replace.
@@ -1075,10 +1086,12 @@ impl Renderer {
         for (i, (id, m)) in draws.iter().enumerate() {
             let style = self.styles.get(id).copied().unwrap_or(self.default_style);
             any_edges |= style.edge[3] > 0.0;
-            let mut data = [0f32; 24];
+            let mut data = [0f32; 28];
             data[..16].copy_from_slice(&m.to_cols_array());
             data[16..20].copy_from_slice(&style.tint);
             data[20..24].copy_from_slice(&style.edge);
+            data[24] = style.depth_bias;
+            data[25] = style.unlit;
             self.queue.write_buffer(
                 &self.model_buf,
                 i as u64 * MODEL_STRIDE,

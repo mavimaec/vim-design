@@ -9,3 +9,4 @@ pub mod model;
 pub mod ops;
 pub mod sketch;
 pub mod snap;
+pub mod walls;

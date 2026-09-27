@@ -83,10 +83,12 @@ impl PickScene {
         if placed.is_empty() { vec![base] } else { placed }
     }
 
-    /// Nearest hit along the ray: (owner id, world distance).
-    pub fn pick(&self, origin: Vec3, dir: Vec3) -> Option<(EntityId, f32)> {
-        let mut best: Option<(EntityId, f32)> = None;
+    /// Every owner the ray hits, nearest hit per owner, sorted by world
+    /// distance (the caller breaks ties, e.g. wall over plate).
+    pub fn pick_all(&self, origin: Vec3, dir: Vec3) -> Vec<(EntityId, f32)> {
+        let mut hits: Vec<(EntityId, f32)> = Vec::new();
         for (id, mesh) in &self.meshes {
+            let mut best: Option<f32> = None;
             for world in self.placements(*id, mesh.base) {
                 let inv = world.inverse();
                 let o = inv.transform_point3(origin);
@@ -106,14 +108,18 @@ impl PickScene {
                         // `t` is in local units; compare in world units.
                         let hit_world = world.transform_point3(o + d * t);
                         let dist = (hit_world - origin).length();
-                        if best.is_none_or(|(_, bd)| dist < bd) {
-                            best = Some((*id, dist));
+                        if best.is_none_or(|bd| dist < bd) {
+                            best = Some(dist);
                         }
                     }
                 }
             }
+            if let Some(d) = best {
+                hits.push((*id, d));
+            }
         }
-        best
+        hits.sort_by(|a, b| a.1.total_cmp(&b.1));
+        hits
     }
 }
 

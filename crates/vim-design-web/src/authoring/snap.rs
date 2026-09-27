@@ -26,6 +26,8 @@ pub enum SnapKind {
     Axis,
     /// An existing vertex of another element.
     Vertex,
+    /// A point on an existing edge (plate outline, wall face line).
+    Edge,
     /// The sketch's first vertex — placing here closes the loop.
     First,
 }
@@ -37,6 +39,7 @@ impl SnapKind {
             SnapKind::Grid => "grid",
             SnapKind::Axis => "axis",
             SnapKind::Vertex => "vertex",
+            SnapKind::Edge => "edge",
             SnapKind::First => "first",
         }
     }
@@ -57,6 +60,11 @@ pub struct SnapInput<'a> {
     pub first: Option<P2>,
     /// Existing element vertices on the active plane.
     pub vertices: &'a [P2],
+    /// Existing edges to snap onto (after vertices, before axis locks).
+    pub edges: &'a [(P2, P2)],
+    /// Extra axis anchors after `prev`/`first` (e.g. other windows'
+    /// corners, so sills and heads line up).
+    pub align: &'a [P2],
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -77,6 +85,33 @@ pub fn grid_round(v: f64, step: f64) -> f64 {
     if r == 0.0 { 0.0 } else { r }
 }
 
+/// Nearest point on an edge within the tolerance. On an axis-aligned
+/// edge the along-edge coordinate still snaps to the grid (clamped to
+/// the edge), so tracing a plate edge gives round lengths.
+fn snap_to_edges(raw: P2, input: &SnapInput) -> Option<P2> {
+    let mut best: Option<(f64, P2)> = None;
+    for (a, b) in input.edges {
+        let ab = [b[0] - a[0], b[1] - a[1]];
+        let len2 = ab[0] * ab[0] + ab[1] * ab[1];
+        if len2 <= 1e-12 {
+            continue;
+        }
+        let t = (((raw[0] - a[0]) * ab[0] + (raw[1] - a[1]) * ab[1]) / len2).clamp(0.0, 1.0);
+        let mut p = [a[0] + ab[0] * t, a[1] + ab[1] * t];
+        let d = dist(raw, p);
+        if d > input.tolerance || best.is_some_and(|(bd, _)| bd <= d) {
+            continue;
+        }
+        if ab[1].abs() < 1e-9 {
+            p[0] = grid_round(raw[0], input.step).clamp(a[0].min(b[0]), a[0].max(b[0]));
+        } else if ab[0].abs() < 1e-9 {
+            p[1] = grid_round(raw[1], input.step).clamp(a[1].min(b[1]), a[1].max(b[1]));
+        }
+        best = Some((d, p));
+    }
+    best.map(|(_, p)| p)
+}
+
 pub fn snap(input: &SnapInput) -> SnapResult {
     let raw = input.raw;
     if let Some(first) = input.close_target {
@@ -95,13 +130,20 @@ pub fn snap(input: &SnapInput) -> SnapResult {
     {
         return SnapResult { point: *v, kind: SnapKind::Vertex, guides: vec![] };
     }
+    if let Some(p) = snap_to_edges(raw, input) {
+        return SnapResult { point: p, kind: SnapKind::Edge, guides: vec![] };
+    }
 
     let grid = [grid_round(raw[0], input.step), grid_round(raw[1], input.step)];
     // Candidate locks: (coordinate index fixed, value, anchor, deviation).
     let mut lock_x: Option<(f64, P2, f64)> = None; // vertical line x = anchor.x
     let mut lock_y: Option<(f64, P2, f64)> = None; // horizontal line y = anchor.y
     let mut anchors: Vec<P2> = Vec::with_capacity(2);
-    for a in [input.prev, input.first].into_iter().flatten() {
+    for a in [input.prev, input.first]
+        .into_iter()
+        .flatten()
+        .chain(input.align.iter().copied())
+    {
         if anchors.iter().all(|b| dist(*b, a) > 1e-9) {
             anchors.push(a);
         }
@@ -156,6 +198,8 @@ mod tests {
             prev: None,
             first: None,
             vertices: &[],
+            edges: &[],
+            align: &[],
         }
     }
 
@@ -204,5 +248,29 @@ mod tests {
         assert_eq!(snap(&i).point, [1.26, 0.74]);
         i.close_target = Some([1.3, 0.7]);
         assert_eq!(snap(&i).kind, SnapKind::First);
+    }
+
+    #[test]
+    fn edges_capture_with_grid_along_axis_aligned_edges() {
+        let edges = [([0.0, 0.0], [6.0, 0.0]), ([6.0, 0.0], [6.0, 4.0])];
+        let mut i = input([2.37, 0.12]);
+        i.edges = &edges;
+        let r = snap(&i);
+        assert_eq!((r.kind, r.point), (SnapKind::Edge, [2.5, 0.0]));
+        let slanted = [([0.0, 0.0], [4.0, 4.0])];
+        i.edges = &slanted;
+        i.raw = [2.1, 1.9];
+        let r = snap(&i);
+        assert_eq!(r.kind, SnapKind::Edge);
+        assert!((r.point[0] - 2.0).abs() < 1e-9 && (r.point[1] - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn align_anchors_lock_like_prev() {
+        let align = [[5.0, 0.9]];
+        let mut i = input([1.07, 0.97]);
+        i.align = &align;
+        let r = snap(&i);
+        assert_eq!((r.kind, r.point), (SnapKind::Axis, [1.0, 0.9]));
     }
 }

@@ -27,6 +27,15 @@ const SESSION_SAVE_DEBOUNCE_MS = 400;
 const STARTUP_TOAST_DELAY_MS = 400;
 const ERROR_TOAST_MS = 6000;
 const LONG_ERROR_TOAST_MS = 7000;
+// Walls are thin in plan: a tap this close to one (CSS px) still picks it.
+const WALL_PICK_PX = { mouse: 12, pen: 16, touch: 28 };
+// Stepper increments (meters).
+const PLATE_THICKNESS_STEP_M = 0.05;
+const WALL_HEIGHT_STEP_M = 0.1;
+const WALL_THICKNESS_STEP_M = 0.05;
+// Double tap/click on empty space = zoom to fit.
+const DOUBLE_TAP_MS = 330;
+const DOUBLE_TAP_PX = 30;
 const COARSE = matchMedia("(pointer: coarse)").matches;
 
 const $ = (id) => document.getElementById(id);
@@ -229,6 +238,7 @@ async function main() {
           wireframe: app.wireframe(),
           thickness: app.plate_thickness_setting(),
           shape: app.shape(),
+          wall: JSON.parse(app.wall_settings_json()),
           camera: app.camera_json(),
         }));
       }, SESSION_SAVE_DEBOUNCE_MS);
@@ -240,6 +250,10 @@ async function main() {
   app.set_snap(snapEnabled, snapStep);
   if (typeof session.thickness === "number") app.set_plate_thickness_setting(session.thickness);
   if (session.shape === "rect") app.set_shape("rect");
+  if (session.wall && typeof session.wall === "object") {
+    const w = session.wall;
+    app.set_wall_settings(Number(w.height), Number(w.thickness), w.flip === true);
+  }
   if (session.wireframe === true) app.set_wireframe(true);
 
   // -- restore the persisted document ------------------------------------------
@@ -373,7 +387,10 @@ async function main() {
     return [(e.clientX - r.left) * (canvas.width / r.width), (e.clientY - r.top) * (canvas.height / r.height)];
   };
   const tolPx = (type) => (SNAP_CAPTURE_PX[type] ?? SNAP_CAPTURE_PX.touch) * dpr;
-  const isDrawing = () => stats.tool === "plate" || stats.tool === "hole";
+  const wallPickPx = (type) => (WALL_PICK_PX[type] ?? WALL_PICK_PX.touch) * dpr;
+  const inElevation = () => stats.windowHost != null;
+  const isDrawing = () =>
+    stats.tool === "plate" || stats.tool === "hole" || stats.tool === "wall" || inElevation();
 
   const pointers = new Map(); // id -> {x, y, type} (client px)
   let mode = "none"; // none | press | nav | pan | place | pinch | pinch-rest
@@ -548,8 +565,17 @@ async function main() {
 
   function handleTap(p) {
     const now = performance.now();
-    const id = app.pick(p.dev[0], p.dev[1]);
-    const isDouble = lastTap && now - lastTap.t < 330 && Math.hypot(p.x - lastTap.x, p.y - lastTap.y) < 30;
+    if (stats.tool === "window") {
+      // Window tool, no wall yet: the tap picks the wall to draw on.
+      const wall = app.pick_wall(p.dev[0], p.dev[1], wallPickPx(p.type));
+      if (wall >= 0) beginWindow(wall);
+      else toast("Tap a wall to add windows to it", { ms: 1800 });
+      return;
+    }
+    let id = app.pick(p.dev[0], p.dev[1]);
+    if (id < 0) id = app.pick_wall(p.dev[0], p.dev[1], wallPickPx(p.type));
+    const isDouble = lastTap && now - lastTap.t < DOUBLE_TAP_MS &&
+      Math.hypot(p.x - lastTap.x, p.y - lastTap.y) < DOUBLE_TAP_PX;
     if (id < 0 && isDouble && lastTap.empty) {
       app.zoom_fit();
       lastTap = null;
@@ -634,8 +660,20 @@ async function main() {
     const ok = h.previewOk;
     const color = ok ? HUD.accent : HUD.bad;
     const P = h.preview;
+    // Wall footprints: where the thickness goes.
+    for (const band of h.bands ?? []) {
+      if (band.length < 3) continue;
+      ctx.beginPath();
+      band.forEach(([x, y], i) => (i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)));
+      ctx.closePath();
+      ctx.fillStyle = ok ? "rgba(47,111,237,0.22)" : "rgba(217,45,32,0.2)";
+      ctx.fill();
+      ctx.strokeStyle = ok ? "rgba(47,111,237,0.55)" : "rgba(217,45,32,0.5)";
+      ctx.lineWidth = 1 * dpr;
+      ctx.stroke();
+    }
     // Fill.
-    if (P.length >= 3) {
+    if (h.fill && P.length >= 3) {
       ctx.beginPath();
       P.forEach(([x, y], i) => (i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)));
       ctx.closePath();
@@ -653,7 +691,7 @@ async function main() {
       P.forEach(([x, y], i) => (i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)));
       if (h.shape === "rect") ctx.closePath();
       ctx.stroke();
-      if (h.shape === "polygon" && P.length >= 3) {
+      if (h.closeHint && h.shape === "polygon" && P.length >= 3) {
         ctx.setLineDash([6 * dpr, 6 * dpr]);
         ctx.lineWidth = 1.5 * dpr;
         ctx.globalAlpha = 0.55;
@@ -758,7 +796,7 @@ async function main() {
           ctx.fill();
       }
       // Readout bubble: above the finger (touch) / beside the cursor.
-      const kindText = { first: "Close shape", vertex: "Corner", axis: "Aligned" }[c.kind];
+      const kindText = { first: "Close shape", vertex: "Corner", axis: "Aligned", edge: "On edge" }[c.kind];
       const text = kindText ? `${kindText} · ${c.label}` : c.label;
       if (touchPlacing) {
         pill(ctx, c.x, c.y - TOUCH_READOUT_OFFSET_PX * dpr, text, { bg: "rgba(28,34,48,0.92)", fg: "#fff", border: "rgba(0,0,0,0)" });
@@ -785,14 +823,25 @@ async function main() {
 
   function hintText() {
     if (!stats.canAuthor) return "Add a level to start drawing (Menu → Levels)";
+    const tap = COARSE ? "Tap" : "Click";
+    if (stats.tool === "window" && !inElevation()) {
+      return stats.walls === 0 ? "Draw some walls first — windows go into walls" : `${tap} a wall to add windows to it`;
+    }
     if (!isDrawing()) return "";
     const h = lastHud.active ? lastHud : JSON.parse(app.hud_json());
     const n = h.count ?? 0;
-    const tap = COARSE ? "Tap" : "Click";
     if (stats.tool === "hole" && stats.platesOnLevel === 0) return "Draw a floor plate on this level first";
-    const what = stats.tool === "hole" ? "hole" : "floor plate";
+    if (stats.tool === "wall") {
+      if (stats.shape === "rect") {
+        return n === 0 ? `Drag, or ${tap.toLowerCase()} two opposite corners of the room` : `${tap} the opposite corner`;
+      }
+      if (n === 0) return `${tap} where the wall starts — thickness grows to the left`;
+      if (n < 3) return `${tap} the next corner, or Finish`;
+      return `${tap} the first point to close the loop, or Finish`;
+    }
+    const what = { hole: "hole", window: "window" }[stats.tool] ?? "floor plate";
     if (stats.shape === "rect") {
-      return n === 0 ? `${COARSE ? "Drag" : "Drag"}, or ${tap.toLowerCase()} two opposite corners of the ${what}` : `${tap} the opposite corner`;
+      return n === 0 ? `Drag, or ${tap.toLowerCase()} two opposite corners of the ${what}` : `${tap} the opposite corner`;
     }
     if (n === 0) return `${tap} to place the first corner of the ${what}`;
     if (n < 3) return `${tap} to place the next corner`;
@@ -823,7 +872,22 @@ async function main() {
       for (const b of document.querySelectorAll("#shape-toggle button")) {
         b.classList.toggle("on", b.dataset.shape === stats.shape);
       }
+      const wall = stats.tool === "wall";
+      const polyLabel = { wall: "Polyline", window: "Polygon" }[stats.tool] ?? "Polygon";
+      const rectLabel = wall ? "Room" : "Rectangle";
+      for (const b of document.querySelectorAll("#shape-toggle button")) {
+        const label = b.dataset.shape === "rect" ? rectLabel : polyLabel;
+        if (b.lastChild.textContent !== label) b.lastChild.textContent = label;
+      }
       $("thickness-stepper").hidden = stats.tool !== "plate";
+      $("flip-toggle").hidden = !wall;
+      $("flip-toggle").classList.toggle("on", stats.wall.flip);
+      $("flip-toggle").setAttribute("aria-pressed", String(stats.wall.flip));
+      $("window-done").hidden = !inElevation();
+      $("wall-settings").hidden = !wall;
+      for (const [id, v] of [["wall-height-input", stats.wall.height], ["wall-thickness-input", stats.wall.thickness]]) {
+        if (document.activeElement !== $(id)) $(id).value = v.toFixed(2);
+      }
       const ti = $("thickness-input");
       if (document.activeElement !== ti) ti.value = app.plate_thickness_setting().toFixed(2);
       $("finish-draw").disabled = !h.canFinish;
@@ -913,6 +977,9 @@ async function main() {
     if (tool === "hole" && stats.platesOnLevel === 0) {
       toast("Draw a floor plate on this level first — holes are cut into plates", { ms: 3200 });
     }
+    if (tool === "window" && stats.walls === 0) {
+      toast("Draw some walls first — windows are cut into walls", { ms: 3200 });
+    }
     renderChrome();
     requestRender();
     return true;
@@ -953,7 +1020,8 @@ async function main() {
   $("finish-draw").addEventListener("click", () => handlePlaced(app.sketch_finish()));
   function cancelDraw() {
     const discarded = app.sketch_cancel();
-    if (discarded === 0) setTool("select");
+    if (discarded === 0 && inElevation()) endWindow();
+    else if (discarded === 0) setTool("select");
     renderChrome();
     requestRender();
   }
@@ -966,10 +1034,55 @@ async function main() {
   for (const b of document.querySelectorAll("#thickness-stepper button")) {
     b.addEventListener("click", (e) => {
       e.preventDefault();
-      setThickness(app.plate_thickness_setting() + Number(b.dataset.step) * 0.05);
+      setThickness(app.plate_thickness_setting() + Number(b.dataset.step) * PLATE_THICKNESS_STEP_M);
     });
   }
   $("thickness-input").addEventListener("change", (e) => setThickness(parseNum(e.target.value)));
+
+  // Wall settings (for new walls) and the flip-side toggle.
+  const setWallSettings = ({ height = stats.wall.height, thickness = stats.wall.thickness, flip = stats.wall.flip }) => {
+    app.set_wall_settings(height, thickness, flip);
+    stats = JSON.parse(app.stats_json());
+    renderChrome();
+    requestRender();
+    sessionSave();
+  };
+  for (const b of document.querySelectorAll("#wall-settings button[data-wall]")) {
+    b.addEventListener("click", (e) => {
+      e.preventDefault();
+      const step = Number(b.dataset.step);
+      if (b.dataset.wall === "height") {
+        setWallSettings({ height: Math.round((stats.wall.height + step * WALL_HEIGHT_STEP_M) * 100) / 100 });
+      } else {
+        setWallSettings({ thickness: Math.round((stats.wall.thickness + step * WALL_THICKNESS_STEP_M) * 100) / 100 });
+      }
+    });
+  }
+  $("wall-height-input").addEventListener("change", (e) => {
+    const v = parseNum(e.target.value);
+    if (Number.isFinite(v)) setWallSettings({ height: v });
+  });
+  $("wall-thickness-input").addEventListener("change", (e) => {
+    const v = parseNum(e.target.value);
+    if (Number.isFinite(v)) setWallSettings({ thickness: v });
+  });
+  $("flip-toggle").addEventListener("click", () => setWallSettings({ flip: !stats.wall.flip }));
+
+  // Window flow: tap a wall -> elevation view -> Done.
+  function beginWindow(wall) {
+    if (!app.begin_window(wall)) return;
+    if (sheetPage === "properties") closeSheet(false);
+    stats = JSON.parse(app.stats_json());
+    renderChrome();
+    requestRender();
+  }
+  function endWindow() {
+    app.end_window();
+    stats = JSON.parse(app.stats_json());
+    renderChrome();
+    requestRender();
+  }
+  $("window-done").addEventListener("click", () => endWindow());
 
   // Keyboard (desktop) ----------------------------------------------------------------
   window.addEventListener("keydown", (e) => {
@@ -1004,6 +1117,7 @@ async function main() {
       }
     } else if (e.key === "Escape") {
       if (!$("sheet").hidden) closeSheet();
+      else if (stats.tool !== "select") setTool("select");
     } else if ((e.key === "Delete" || e.key === "Backspace") && app.selection() >= 0) {
       e.preventDefault();
       deleteElement(app.selection());
@@ -1013,6 +1127,8 @@ async function main() {
     if (k === "v" || k === "s") setTool("select");
     else if (k === "f") setTool("plate");
     else if (k === "h") setTool("hole");
+    else if (k === "w") setTool("wall");
+    else if (k === "n") setTool("window");
     else if (k === "r" && isDrawing()) { app.set_shape(stats.shape === "rect" ? "polygon" : "rect"); stats = JSON.parse(app.stats_json()); renderChrome(); requestRender(); }
     else if (k === "p") { app.set_view_mode("plan"); stats = JSON.parse(app.stats_json()); renderChrome(); requestRender(); }
     else if (k === "3") { app.set_view_mode("3d"); stats = JSON.parse(app.stats_json()); renderChrome(); requestRender(); }
@@ -1037,10 +1153,12 @@ async function main() {
   function revealSelection() {
     if (innerWidth >= 760) return;
     const e = JSON.parse(app.selected_json());
-    if (!e?.outline?.length) return;
+    const outline = e?.outline ?? (e?.start ? [e.start, e.end] : null);
+    if (!outline?.length) return;
     const lvl = JSON.parse(app.levels_json()).levels.find((l) => l.id === e.levelId);
     const z = lvl ? lvl.elevation : 0;
-    const pts = e.outline.map(([x, y]) => JSON.parse(app.world_to_screen(x, y, z))).filter(Boolean);
+    const zs = e.kind === "wall" ? [z, z + e.height] : [z];
+    const pts = outline.flatMap(([x, y]) => zs.map((zz) => JSON.parse(app.world_to_screen(x, y, zz)))).filter(Boolean);
     if (!pts.length) return;
     const xs = pts.map((p) => p[0]), ys = pts.map((p) => p[1]);
     const box = { x0: Math.min(...xs), x1: Math.max(...xs), y0: Math.min(...ys), y1: Math.max(...ys) };
@@ -1273,61 +1391,116 @@ async function main() {
 
   // -- Properties ------------------------------------------------------------------------
   let propsFor = null;
+  const KIND_LABEL = { floor_plate: "Floor plate", wall: "Wall", element: "Element" };
+  // A numeric property edited by stepper, text field, and slider. One
+  // undo step per edit gesture: typing and dragging coalesce until the
+  // field commits; each stepper tap is its own step.
+  function measureGroup({ title, label, id, value, min, max, step, apply, current }) {
+    const input = el("input", { type: "text", inputmode: "decimal", id, value: value.toFixed(2) });
+    const slider = el("input", {
+      type: "range", min: String(min), max: String(max), step: "0.01", id: `${id}-slider`,
+      style: "width:100%;accent-color:var(--accent)",
+    });
+    slider.value = String(value);
+    const set = (v) => {
+      if (!Number.isFinite(v)) return;
+      apply(v);
+      refresh();
+    };
+    input.addEventListener("input", () => set(parseNum(input.value)));
+    input.addEventListener("change", () => { app.end_gesture(); input.value = current().toFixed(2); });
+    slider.addEventListener("input", () => set(parseFloat(slider.value)));
+    slider.addEventListener("change", () => app.end_gesture());
+    const bump = (d) => { set(Math.round((current() + d) * 100) / 100); app.end_gesture(); };
+    const stepper = el("div", { class: "stepper" },
+      el("button", { type: "button", text: "−", "aria-label": `Decrease ${title.toLowerCase()}`, onclick: () => bump(-step) }),
+      input, el("span", { class: "unit", text: "m" }),
+      el("button", { type: "button", text: "+", "aria-label": `Increase ${title.toLowerCase()}`, onclick: () => bump(step) }));
+    return group(title,
+      el("div", { class: "field" }, el("span", { class: "field-label", id: `${id}-label`, text: label }), stepper),
+      el("div", { class: "field" }, slider));
+  }
+  const stat = (k, id, v) =>
+    el("div", { class: "stat" }, el("div", { class: "k", text: k }), el("div", { class: "v", id, text: v }));
+  const selectedValue = (key, fallback) => JSON.parse(app.selected_json())?.[key] ?? fallback;
+
   function pageProperties() {
     const e = JSON.parse(app.selected_json());
     if (!e) { closeSheet(false); return; }
     propsFor = e.id;
-    const isPlate = e.kind === "floor_plate";
     $("sheet-title").textContent = e.name;
     const nameInput = el("input", { type: "text", class: "wide", id: "prop-name", value: e.name, autocomplete: "off" });
     nameInput.addEventListener("input", () => { app.set_element_name(e.id, nameInput.value); refresh(); });
     nameInput.addEventListener("change", () => app.end_gesture());
+    const kind = KIND_LABEL[e.kind] ?? "Element";
     const children = [
-      el("div", { class: "group kind-group" }, el("span", { class: "kind-badge", html: `${icon("cube")} ${isPlate ? "Floor plate" : "Element"}` })),
+      el("div", { class: "group kind-group" }, el("span", { class: "kind-badge", html: `${icon("cube")} ${kind}` })),
       group(null,
         el("div", { class: "field" }, el("label", { for: "prop-name", text: "Name" }), nameInput),
         el("div", { class: "field" }, el("span", { class: "field-label", text: "Level" }), el("span", { class: "value", id: "prop-level", text: e.levelName ?? "—" })),
       ),
     ];
-    if (isPlate) {
-      const tInput = el("input", { type: "text", inputmode: "decimal", id: "prop-thickness", value: e.thickness.toFixed(2) });
-      const slider = el("input", { type: "range", min: "0.05", max: "1.00", step: "0.01", id: "prop-thickness-slider", style: "width:100%;accent-color:var(--accent)" });
-      slider.value = String(e.thickness);
-      const applyT = (v) => {
-        if (!Number.isFinite(v)) return;
-        app.set_plate_thickness(e.id, v);
-        refresh();
-      };
-      tInput.addEventListener("input", () => applyT(parseNum(tInput.value)));
-      tInput.addEventListener("change", () => { app.end_gesture(); tInput.value = currentThickness().toFixed(2); });
-      slider.addEventListener("input", () => applyT(parseFloat(slider.value)));
-      slider.addEventListener("change", () => app.end_gesture());
-      const step = (d) => { applyT(Math.round((currentThickness() + d) * 100) / 100); app.end_gesture(); };
-      const stepper = el("div", { class: "stepper" },
-        el("button", { type: "button", text: "−", "aria-label": "Thinner", onclick: () => step(-0.05) }),
-        tInput, el("span", { class: "unit", text: "m" }),
-        el("button", { type: "button", text: "+", "aria-label": "Thicker", onclick: () => step(0.05) }));
+    if (e.kind === "floor_plate") {
       children.push(
-        group("Thickness",
-          el("div", { class: "field" }, el("span", { class: "field-label", text: "Below level" }), stepper),
-          el("div", { class: "field" }, slider),
-        ),
-        el("div", { class: "stat-grid" },
-          el("div", { class: "stat" }, el("div", { class: "k", text: "Net area" }), el("div", { class: "v", id: "prop-area", text: fmtArea(e.area) })),
-          el("div", { class: "stat" }, el("div", { class: "k", text: "Holes" }), el("div", { class: "v", id: "prop-hole-count", text: String(e.holes.length) })),
-        ),
+        measureGroup({
+          title: "Thickness", label: "Below level", id: "prop-thickness", value: e.thickness,
+          min: 0.05, max: 1.0, step: PLATE_THICKNESS_STEP_M,
+          apply: (v) => app.set_plate_thickness(e.id, v), current: () => selectedValue("thickness", 0.3),
+        }),
+        el("div", { class: "stat-grid" }, stat("Net area", "prop-area", fmtArea(e.area)), stat("Holes", "prop-hole-count", String(e.holes.length))),
         el("div", { class: "group" }, el("div", { class: "group-title", text: "Holes" }), el("div", { class: "card", id: "prop-holes" })),
+      );
+    } else if (e.kind === "wall") {
+      children.push(
+        measureGroup({
+          title: "Height", label: "Above level", id: "prop-height", value: e.height,
+          min: 0.5, max: 6.0, step: WALL_HEIGHT_STEP_M,
+          apply: (v) => app.set_wall_height(e.id, v), current: () => selectedValue("height", 2.7),
+        }),
+        measureGroup({
+          title: "Thickness", label: "Into the wall", id: "prop-wall-thickness", value: e.thickness,
+          min: 0.05, max: 0.6, step: WALL_THICKNESS_STEP_M,
+          apply: (v) => app.set_wall_thickness(e.id, v), current: () => selectedValue("thickness", 0.2),
+        }),
+        el("div", { class: "stat-grid" }, stat("Length", "prop-length", fmtM(e.length)), stat("Windows", "prop-window-count", String(e.windows.length))),
+        el("div", { class: "group" }, el("div", { class: "group-title", text: "Windows" }), el("div", { class: "card", id: "prop-windows" })),
+        el("button", {
+          type: "button", class: "btn block", id: "prop-add-window", style: "margin-bottom:10px",
+          html: `${icon("plus")} Add windows`, onclick: () => beginWindow(e.id),
+        }),
       );
     }
     children.push(el("button", {
       type: "button", class: "btn subtle-danger block", id: "prop-delete",
-      html: `${icon("trash")} Delete ${isPlate ? "floor plate" : "element"}`,
+      html: `${icon("trash")} Delete ${kind.toLowerCase()}`,
       onclick: () => deleteElement(e.id),
     }));
     sheetBody.replaceChildren(...children);
     updateProperties();
   }
-  const currentThickness = () => JSON.parse(app.selected_json())?.thickness ?? 0.3;
+
+  /** Rows of a plate's holes or a wall's windows, each deletable. */
+  function renderOpenings(list, e, items, noun, testid, emptyText) {
+    list.replaceChildren();
+    if (items.length === 0) list.append(el("div", { class: "empty-note", text: emptyText }));
+    for (const h of items) {
+      list.append(el("div", { class: "hole-row" },
+        el("span", { class: "hole-name", text: `${noun} ${h.index}` }),
+        el("span", { class: "hole-area", text: fmtArea(h.area) }),
+        el("button", {
+          type: "button", class: "icon-btn ghost", "aria-label": `Delete ${noun.toLowerCase()} ${h.index}`,
+          "data-testid": testid, html: icon("trash", "ico"), style: "color:var(--danger)",
+          onclick: () => {
+            if (app.delete_hole(e.id, h.wire)) {
+              refresh();
+              toast(`${noun} ${h.index} removed`, { action: { label: "Undo", fn: () => { if (app.undo()) refresh(); } } });
+            }
+          },
+        }),
+      ));
+    }
+  }
+
   function updateProperties() {
     const e = JSON.parse(app.selected_json());
     if (!e) { closeSheet(false); return; }
@@ -1336,31 +1509,21 @@ async function main() {
     const name = $("prop-name");
     if (name) guardAssign(name, e.name);
     if ($("prop-level")) $("prop-level").textContent = e.levelName ?? "—";
-    if (e.kind !== "floor_plate") return;
-    guardAssign($("prop-thickness"), e.thickness.toFixed(2));
-    guardAssign($("prop-thickness-slider"), String(e.thickness));
-    $("prop-area").textContent = fmtArea(e.area);
-    $("prop-hole-count").textContent = String(e.holes.length);
-    const list = $("prop-holes");
-    list.replaceChildren();
-    if (e.holes.length === 0) {
-      list.append(el("div", { class: "empty-note", text: "No holes yet — use the Hole tool to cut one." }));
-    }
-    for (const h of e.holes) {
-      list.append(el("div", { class: "hole-row" },
-        el("span", { class: "hole-name", text: `Hole ${h.index}` }),
-        el("span", { class: "hole-area", text: fmtArea(h.area) }),
-        el("button", {
-          type: "button", class: "icon-btn ghost", "aria-label": `Delete hole ${h.index}`,
-          "data-testid": "delete-hole", html: icon("trash", "ico"), style: "color:var(--danger)",
-          onclick: () => {
-            if (app.delete_hole(e.id, h.wire)) {
-              refresh();
-              toast(`Hole ${h.index} removed`, { action: { label: "Undo", fn: () => { if (app.undo()) refresh(); } } });
-            }
-          },
-        }),
-      ));
+    if (e.kind === "floor_plate") {
+      guardAssign($("prop-thickness"), e.thickness.toFixed(2));
+      guardAssign($("prop-thickness-slider"), String(e.thickness));
+      $("prop-area").textContent = fmtArea(e.area);
+      $("prop-hole-count").textContent = String(e.holes.length);
+      renderOpenings($("prop-holes"), e, e.holes, "Hole", "delete-hole", "No holes yet — use the Hole tool to cut one.");
+    } else if (e.kind === "wall") {
+      guardAssign($("prop-height"), e.height.toFixed(2));
+      guardAssign($("prop-height-slider"), String(e.height));
+      $("prop-height-label").textContent = e.windows.length ? `Above level (min ${fmtM(e.minHeight)})` : "Above level";
+      guardAssign($("prop-wall-thickness"), e.thickness.toFixed(2));
+      guardAssign($("prop-wall-thickness-slider"), String(e.thickness));
+      $("prop-length").textContent = fmtM(e.length);
+      $("prop-window-count").textContent = String(e.windows.length);
+      renderOpenings($("prop-windows"), e, e.windows, "Window", "delete-window", "No windows yet — tap Add windows.");
     }
   }
 
@@ -1577,6 +1740,16 @@ async function main() {
     saveNow,
     debugInfo,
     refresh,
+    // Wall-local (u along the wall from its start, v up from its base)
+    // -> world coordinates.
+    wallToWorld: (wallId, u, v) => {
+      const w = JSON.parse(app.elements_json()).find((e) => e.id === wallId && e.kind === "wall");
+      if (!w) return null;
+      const lvl = JSON.parse(app.levels_json()).levels.find((l) => l.id === w.levelId);
+      const len = Math.hypot(w.end[0] - w.start[0], w.end[1] - w.start[1]);
+      const d = [(w.end[0] - w.start[0]) / len, (w.end[1] - w.start[1]) / len];
+      return [w.start[0] + d[0] * u, w.start[1] + d[1] * u, (lvl?.elevation ?? 0) + w.baseW + v];
+    },
     // World -> page CSS pixels (specs compute tap targets from world
     // coordinates instead of hardcoding pixels).
     worldToClient: (x, y, z) => {

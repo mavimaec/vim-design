@@ -151,3 +151,54 @@ avoid known failures of existing tools (see the pitfall table, §7).
 | Hosted elements hard to re-host (Revit) | Attachment is an ordinary rewire command — undoable, composable, with world-position-preserving conversion in the UI |
 | Active view/level state polluting undo history | Session state, never document state (§5) |
 | Stored story order drifting from elevations | Order is always derived from elevation, never stored |
+
+## 8. Web authoring app
+
+The GitHub Pages site (`www/app.html`, `AuthorApp`) is a mobile + desktop authoring
+front end over the same document. The element list it shows is derived from the
+document after every change; every action is one undo step; the document persists in
+the browser (`localStorage`, VIMD bytes as base64) and exports/imports as `.vimd`.
+
+**Tools.** Select (properties, delete), Floor plate, Hole, Wall, Window. Plan view
+(orthographic onto the active level, cut 1.2 m above it) and 3D view both accept
+drawing. Snapping, in priority order: the first vertex (closes the outline), existing
+corners, existing edges (plate outlines and wall base lines — tracing a plate edge is
+how walls go onto a plate), horizontal/vertical alignment with the previous and first
+vertex, the grid. Outlines the kernel would accept but that are wrong (self-crossing,
+zero area, holes or windows outside their host or touching each other) are rejected
+live in the UI.
+
+**Floor plates.** A horizontal profile face on the level plane, extruded downward by
+its thickness, so the top face sits at the level elevation. Holes are hole wires in the
+profile face; a new hole goes into the plate that strictly contains it.
+
+**Walls.** The drawn line is one face of the wall; the thickness grows to the left of
+the drawing direction (to the right with "flip side"). A closed loop is normalized
+counter-clockwise first, so an unflipped loop grows inward. Each segment becomes one
+Wall element whose profile is the vertical rectangle (length × height) in the plane of
+the drawn line, extruded along the wall normal by the thickness. Height edits move the
+profile's top edge; thickness edits move only the extrusion path's end point, so the
+profile face and its windows stay put. Butt joins at corners: at a convex corner
+(turning toward the thickness side) the next segment's start is trimmed by the
+thickness; at a reflex corner the previous segment's end is extended by it.
+
+**Windows.** Tapping a wall with the Window tool opens an orthographic elevation view
+facing the wall's profile face, with a wall-local grid: `u` along the wall from its
+start (the drawn direction), `v` up from the level (world up) — a basis from stable
+inputs only, so it never flips. A window is a hole wire in the wall's profile face — the
+same face-with-holes construction as plate holes, no booleans. It must stay 5 cm inside
+the face and must not touch other windows.
+
+**Attachment.** Every point of plates, walls, and windows is attached to the level it
+was drawn on, so a level elevation edit moves everything on it as a transform only
+(no re-evaluation, no re-tessellation).
+
+**Known limitations.**
+- Butt joins are exact only at 90°; at other angles the corner blocks overlap or leave
+  a sliver. Joins are computed when a run is drawn: separately drawn runs are not
+  joined, and a later thickness edit does not re-trim neighbours.
+- Window points attach to the level, not to the wall face: a window does not follow its
+  wall if the wall is later moved. The planned `FaceFrame` construction plane (§3)
+  fixes this.
+- No doors yet. A door can be a notch in the wall's outer profile (the profile becomes
+  a U-shaped outline) — again no boolean needed.

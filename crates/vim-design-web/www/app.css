@@ -204,13 +204,15 @@ input { font: inherit; color: inherit; }
   border-radius: 12px; box-shadow: var(--shadow);
   border-left: 4px solid var(--accent);
   font-size: 14px; font-weight: 500;
-  pointer-events: auto;
+  /* Taps pass through a toast to the canvas; only its button is live. */
+  pointer-events: none;
   animation: toast-in 0.18s ease-out;
 }
 .toast.error { border-left-color: var(--danger); }
 .toast.ok { border-left-color: var(--ok); }
 .toast .toast-msg { flex: 1; }
 .toast button {
+  pointer-events: auto;
   border: 0; background: var(--accent-soft); color: var(--accent);
   font-weight: 650; border-radius: 8px; padding: 6px 10px; min-height: 34px;
 }
@@ -457,7 +459,8 @@ button.row:active { background: rgba(16, 24, 40, 0.04); }
   .sheet-handle { display: none; }
   @keyframes panel-in { from { transform: translateX(16px); opacity: 0.4; } to { transform: none; opacity: 1; } }
   #toasts { top: auto; bottom: calc(var(--gap) + 8px); }
-  body.drawing #toasts { bottom: calc(var(--gap) + 140px); }
+  /* While drawing, the drawing bar owns the bottom: toasts go on top. */
+  body.drawing #toasts { bottom: auto; top: calc(var(--gap) + var(--st) + var(--top-h) + 48px); }
   .hint { font-size: 13px; }
 }
 .level-row .lvl-unit { color: var(--muted); font-size: 13px; margin-left: -4px; }
@@ -465,3 +468,27 @@ button.row:active { background: rgba(16, 24, 40, 0.04); }
 .level-row { grid-template-columns: minmax(0, 1fr); }
 .level-line { min-width: 0; }
 .level-row input[type=text] { min-width: 0; }
+
+/* ---- wall / window drawing controls -------------------------------------------------------- */
+.chip-toggle {
+  display: inline-flex; align-items: center; gap: 6px; flex: none;
+  height: 44px; padding: 0 12px;
+  border: 1px solid var(--line); border-radius: 11px;
+  background: var(--surface-2); color: var(--muted);
+  font-weight: 600; font-size: 13.5px;
+}
+.chip-toggle.on { background: var(--accent-soft); color: var(--accent); border-color: rgba(47, 111, 237, 0.35); }
+.chip-toggle.primary { background: var(--accent); color: var(--accent-ink); border-color: transparent; }
+#wall-settings { justify-content: space-between; }
+@media (max-width: 520px) {
+  .tool { width: 50px; font-size: 10.5px; }
+  .tool .ico { width: 21px; height: 21px; }
+  #wall-settings .stepper-label { display: inline; font-size: 11px; padding: 0 2px 0 4px; }
+  #wall-settings .stepper button { width: 32px; }
+  #wall-settings .stepper input { width: 40px; }
+  #wall-settings .stepper .unit { padding: 0 3px 0 1px; }
+}
+@media (max-width: 380px) {
+  .tool { width: 46px; }
+  #wall-settings .stepper-label { display: none; }
+}

@@ -9,11 +9,16 @@ use super::geom::{
     validate_outline,
 };
 use super::snap::{SnapKind, SnapResult};
+use super::walls;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SketchTool {
     Plate,
     Hole,
+    /// A run of wall reference lines on the level plane.
+    Wall,
+    /// A window outline on a wall face (wall-local u/v coordinates).
+    Window,
 }
 
 impl SketchTool {
@@ -21,6 +26,8 @@ impl SketchTool {
         match self {
             SketchTool::Plate => "plate",
             SketchTool::Hole => "hole",
+            SketchTool::Wall => "wall",
+            SketchTool::Window => "window",
         }
     }
 }
@@ -197,11 +204,37 @@ pub struct SketchStatus {
     pub reason: Option<Invalid>,
 }
 
-pub fn status(sketch: &Sketch, plates: &[PlateOutline]) -> SketchStatus {
+/// What a sketch is validated against.
+pub enum SketchContext<'a> {
+    Plate,
+    /// Plates on the sketch plane (the hole picks its container).
+    Hole(&'a [PlateOutline<'a>]),
+    Wall { thickness: f64, flip: bool },
+    /// The host wall's profile and existing windows (wall-local).
+    Window { profile: &'a [P2], windows: Vec<&'a [P2]> },
+}
+
+/// The committed shape of a finished wall sketch: the reference points
+/// and whether the run is a closed loop.
+pub fn wall_run(sketch: &Sketch, closing: bool) -> (Vec<P2>, bool) {
+    match sketch.shape {
+        Shape::Rect => (sketch.outline(), true),
+        Shape::Polygon => (sketch.outline(), closing),
+    }
+}
+
+pub fn status(sketch: &Sketch, ctx: &SketchContext) -> SketchStatus {
     let outline = sketch.outline();
-    let finish = match sketch.tool {
-        SketchTool::Plate => validate_plate(&outline).map(|_| ()),
-        SketchTool::Hole => validate_hole(&outline, plates).map(|_| ()),
+    let finish = match (sketch.tool, ctx) {
+        (SketchTool::Hole, SketchContext::Hole(plates)) => validate_hole(&outline, plates).map(|_| ()),
+        (SketchTool::Wall, SketchContext::Wall { thickness, flip }) => {
+            let (run, closed) = wall_run(sketch, false);
+            walls::wall_segments(&run, closed, *thickness, *flip).map(|_| ())
+        }
+        (SketchTool::Window, SketchContext::Window { profile, windows }) => {
+            walls::validate_window(&outline, profile, windows)
+        }
+        _ => validate_plate(&outline),
     };
     let preview = sketch.preview();
     let mut preview_err = None;
@@ -211,21 +244,31 @@ pub fn status(sketch: &Sketch, plates: &[PlateOutline]) -> SketchStatus {
     };
     if open_crossing {
         preview_err = Some(Invalid::SelfIntersecting);
-    } else if sketch.tool == SketchTool::Hole && !preview.is_empty() {
-        if plates.is_empty() {
-            preview_err = Some(Invalid::NoPlateOnLevel);
-        } else {
-            let inside_one = plates.iter().any(|p| {
-                preview.iter().all(|q| geom::point_in_polygon(*q, p.outline))
-            });
-            if !inside_one {
-                preview_err = Some(Invalid::HoleOutsidePlate);
+    } else if !preview.is_empty() {
+        match ctx {
+            SketchContext::Hole([]) => {
+                preview_err = Some(Invalid::NoPlateOnLevel);
             }
+            SketchContext::Hole(plates) => {
+                let inside_one = plates.iter().any(|p| {
+                    preview.iter().all(|q| geom::point_in_polygon(*q, p.outline))
+                });
+                if !inside_one {
+                    preview_err = Some(Invalid::HoleOutsidePlate);
+                }
+            }
+            SketchContext::Window { profile, .. }
+                if !preview.iter().all(|q| geom::point_in_polygon(*q, profile)) =>
+            {
+                preview_err = Some(Invalid::WindowOutsideWall);
+            }
+            _ => {}
         }
     }
-    let enough = match sketch.shape {
-        Shape::Polygon => outline.len() >= 3,
-        Shape::Rect => sketch.points.len() >= 2,
+    let enough = match (sketch.shape, sketch.tool) {
+        (Shape::Rect, _) => sketch.points.len() >= 2,
+        (Shape::Polygon, SketchTool::Wall) => outline.len() >= 2,
+        (Shape::Polygon, _) => outline.len() >= 3,
     };
     let finish_err = finish.err().filter(|_| enough);
     SketchStatus {
@@ -253,7 +296,7 @@ mod tests {
         assert_eq!(s.place(), PlaceOutcome::Duplicate);
         s.cursor = cursor([0.0, 0.0], SnapKind::First);
         assert_eq!(s.place(), PlaceOutcome::CloseRequested);
-        let st = status(&s, &[]);
+        let st = status(&s, &SketchContext::Plate);
         assert!(st.can_finish && st.preview_ok);
     }
 
@@ -265,11 +308,11 @@ mod tests {
             s.place();
         }
         s.cursor = cursor([0.0, 4.0], SnapKind::Grid);
-        let st = status(&s, &[]);
+        let st = status(&s, &SketchContext::Plate);
         assert!(!st.preview_ok);
         assert_eq!(st.reason, Some(Invalid::SelfIntersecting));
         s.place();
-        assert!(!status(&s, &[]).can_finish, "the bowtie cannot be finished");
+        assert!(!status(&s, &SketchContext::Plate).can_finish, "the bowtie cannot be finished");
     }
 
     #[test]
