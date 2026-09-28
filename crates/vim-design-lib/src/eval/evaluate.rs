@@ -352,6 +352,7 @@ fn value_equal(a: &Evaluated, b: &Evaluated) -> bool {
         (Evaluated::Material, Evaluated::Material) => true,
         (Evaluated::Site, Evaluated::Site) => true,
         (Evaluated::Room(x), Evaluated::Room(y)) => x == y,
+        (Evaluated::PlanSpan(x), Evaluated::PlanSpan(y)) => x == y,
         (
             Evaluated::Frame {
                 origin: ao,
@@ -388,7 +389,7 @@ fn evaluation_inputs(record: &EntityRecord) -> Vec<EntityId> {
     match record.kind() {
         // A room is its params: its plane only places it through its
         // layout.
-        EntityKind::Room => Vec::new(),
+        EntityKind::Room | EntityKind::PlanSpan => Vec::new(),
         EntityKind::Element => record
             .inputs
             .get(slot::ELEMENT_MEMBERS)
@@ -1264,6 +1265,9 @@ pub(crate) fn evaluate_entity(
             .map(|room| Evaluated::Room(Box::new(room)))
             .ok_or_else(|| params_mismatch(record)),
         EntityKind::RoomLayout => evaluate_room_layout(record, lookup, own_space),
+        EntityKind::PlanSpan => crate::plan_span::PlanSpanData::from_params(&record.params)
+            .map(Evaluated::PlanSpan)
+            .ok_or_else(|| params_mismatch(record)),
     }
 }
 

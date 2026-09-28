@@ -25,8 +25,12 @@
 //! a closed run on Level 2 with a window, a door, a niche, and a gable
 //! segment profile, and an open run up to the ceiling workplane.
 //!
+//! `authoring_project_v5.vimd` adds a room layout on the ground level:
+//! three rooms (one with higher precedence cutting into another, one
+//! with a hidden edge), a window, a door, and a niche.
+//!
 //! `write_fixture` / `write_fixture_v2` / `write_fixture_v3` /
-//! `write_fixture_v4` are the generators. They only
+//! `write_fixture_v4` / `write_fixture_v5` are the generators. They only
 //! write when the environment variable `VIMD_WRITE_COMPAT_FIXTURE` is
 //! set; regenerate a fixture only on an intentional, announced format
 //! break.
@@ -47,6 +51,10 @@ const FIXTURE_V2: &str = concat!(
 const FIXTURE_V3: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/fixtures/authoring_project_v3.vimd"
+);
+const FIXTURE_V5: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/fixtures/authoring_project_v5.vimd"
 );
 const FIXTURE_V4: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -222,6 +230,83 @@ fn build_project_v3() -> Document {
             },
         );
     }
+    doc
+}
+
+/// The wall-run project plus a room layout.
+fn build_project_v5() -> Document {
+    use vim_design_lib::room_layout::RoomOpening;
+    use vim_design_lib::wall_run::OpeningKind;
+    let mut doc = build_project_v4();
+    let ground = doc
+        .entities()
+        .find(|(_, r)| matches!(&r.params, Params::Level { name, .. } if name == "Ground"))
+        .map(|(id, _)| *id)
+        .expect("Ground");
+    let layout = one(
+        &mut doc,
+        Command::CreateRoomLayout {
+            plane: ground,
+            top: None,
+            rooms: vec![],
+            thickness_m: 0.114,
+            height_m: 2.7,
+            top_offset_m: 0.0,
+            openings: vec![],
+        },
+    );
+    let mut rooms = Vec::new();
+    for (name, precedence, corners, hidden) in [
+        ("Room 001", 0, [[20.0, 0.0], [24.0, 3.0]], vec![]),
+        ("Room 002", 0, [[24.0, 0.0], [27.0, 3.0]], vec![3]),
+        ("Room 003", 1, [[23.0, 2.0], [25.0, 5.0]], vec![]),
+    ] {
+        let room = vim_design_lib::room::from_rectangle(name, precedence, corners[0], corners[1]).expect("room");
+        rooms.push(one(
+            &mut doc,
+            Command::CreateRoom {
+                plane: ground,
+                name: room.name,
+                precedence,
+                boundary: room.boundary,
+                hidden_edges: hidden,
+                layout: Some(layout),
+            },
+        ));
+    }
+    let opening = |id, room, edge, offset_m, kind, depth_m| RoomOpening {
+        id,
+        room,
+        edge,
+        offset_m,
+        sill_m: 0.9,
+        width_m: 0.9,
+        height_m: if kind == OpeningKind::Door { 2.1 } else { 1.2 },
+        kind,
+        depth_m,
+    };
+    ok(
+        &mut doc,
+        Command::UpdateRoomLayout {
+            id: layout,
+            plane: None,
+            top: None,
+            rooms: None,
+            thickness_m: None,
+            height_m: None,
+            top_offset_m: None,
+            openings: Some(vec![
+                opening(0, rooms[0], 0, 1.0, OpeningKind::Window, None),
+                opening(1, rooms[1], 0, 1.0, OpeningKind::Door, None),
+                opening(2, rooms[0], 3, 1.0, OpeningKind::Window, Some(0.03)),
+            ]),
+            coalesce: false,
+        },
+    );
+    one(
+        &mut doc,
+        Command::CreateElement { name: "Rooms".to_owned(), members: vec![layout], level: ground },
+    );
     doc
 }
 
@@ -537,6 +622,35 @@ fn write_fixture_v3() {
     }
     let bytes = build_project_v3().save().expect("save");
     std::fs::write(FIXTURE_V3, bytes).expect("write fixture");
+}
+
+#[test]
+#[ignore = "generator: writes the fixture only when VIMD_WRITE_COMPAT_FIXTURE is set"]
+fn write_fixture_v5() {
+    if std::env::var_os("VIMD_WRITE_COMPAT_FIXTURE").is_none() {
+        return;
+    }
+    let bytes = build_project_v5().save().expect("save");
+    std::fs::write(FIXTURE_V5, bytes).expect("write fixture");
+}
+
+#[test]
+fn saved_room_project_loads_evaluates_and_resaves_identically() {
+    let bytes = std::fs::read(FIXTURE_V5).expect("read fixture");
+    let mut doc = Document::load(&bytes).expect("a saved project must still load");
+    doc.debug_validate().expect("loaded graph is consistent");
+    assert_eq!(doc.save().expect("save"), bytes, "load -> save must reproduce the saved bytes");
+    let count = |kind: EntityKind| doc.entities().filter(|(_, r)| r.kind() == kind).count();
+    assert_eq!(count(EntityKind::WallRun), 2);
+    assert_eq!(count(EntityKind::Room), 3);
+    assert_eq!(count(EntityKind::RoomLayout), 1);
+    assert_eq!(count(EntityKind::Element), 8);
+    let mut engine = Engine::new();
+    engine.evaluate_pending(&mut doc);
+    let updates = engine.poll_updates(&doc);
+    assert!(updates.errors.is_empty(), "{:?}", updates.errors);
+    assert_eq!(updates.meshes.len(), 8);
+    assert_eq!(build_project_v5().save().expect("save"), bytes, "generator reproduces it");
 }
 
 #[test]

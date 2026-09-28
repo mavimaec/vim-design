@@ -6,6 +6,7 @@
 use proptest::prelude::*;
 use vim_design_lib::sketch::{Sketch, SketchDirection, SketchFaceKind, ops};
 use vim_design_lib::wall::{self, ops as wall_ops};
+use vim_design_lib::plan_span;
 use vim_design_lib::room::{self, RoomData, ops as room_ops};
 use vim_design_lib::room_layout::{self, RoomLayoutData, RoomOpening, ops as layout_ops};
 use vim_design_lib::wall_run::{
@@ -64,6 +65,8 @@ enum Op {
     EditRoom { pick: usize, op: u8, a: usize, x: i8, coalesce: bool },
     EditRoomLayout { pick: usize, op: u8, a: usize, x: i8, coalesce: bool },
     DeleteRoom(usize),
+    // Plan spans: one per level (a second create rejects), slider drags.
+    SetPlanSpan { level: usize, above: u8, top: Option<u8>, coalesce: bool },
 }
 
 fn op_strategy() -> impl Strategy<Value = Op> {
@@ -121,6 +124,8 @@ fn op_strategy() -> impl Strategy<Value = Op> {
         3 => (any::<usize>(), 0u8..6, any::<usize>(), any::<i8>(), any::<bool>())
             .prop_map(|(pick, op, a, x, coalesce)| Op::EditRoomLayout { pick, op, a, x, coalesce }),
         1 => any::<usize>().prop_map(Op::DeleteRoom),
+        2 => (any::<usize>(), 0u8..=100, prop::option::of(13u8..60), any::<bool>())
+            .prop_map(|(level, above, top, coalesce)| Op::SetPlanSpan { level, above, top, coalesce }),
     ]
 }
 
@@ -501,6 +506,7 @@ fn run_op(doc: &mut Document, op: &Op) {
                     Some(EntityKind::WallRun) => Command::DeleteWallRun { id },
                     Some(EntityKind::Room) => Command::DeleteRoom { id },
                     Some(EntityKind::RoomLayout) => Command::DeleteRoomLayout { id },
+                    Some(EntityKind::PlanSpan) => Command::DeletePlanSpan { id },
                     Some(EntityKind::Workplane) => Command::DeleteWorkplane { id },
                     _ => fallback,
                 },
@@ -735,6 +741,34 @@ fn run_op(doc: &mut Document, op: &Op) {
             pick(&layouts, *p)
                 .and_then(|id| edit_room_layout(doc, id, *op, *a, *x, *coalesce))
                 .unwrap_or(fallback)
+        }
+        Op::SetPlanSpan { level, above, top, coalesce } => {
+            let levels = ids_of_kind(doc, EntityKind::Level);
+            let top = top.map_or(plan_span::SpanTop::NextStory, |t| plan_span::SpanTop::Offset(f64::from(t) * 0.1));
+            let above = f32::from(*above) / 100.0;
+            match pick(&levels, *level) {
+                Some(level) => match plan_span::of_level(doc, level) {
+                    // Every other time, a second create: rejected.
+                    Some(id) if !*coalesce || above > 0.5 => Command::UpdatePlanSpan {
+                        id,
+                        top: Some(top),
+                        cut_offset_m: None,
+                        bottom_offset_m: None,
+                        above_opacity: Some(above),
+                        below_opacity: None,
+                        coalesce: *coalesce,
+                    },
+                    _ => Command::CreatePlanSpan {
+                        level,
+                        top,
+                        cut_offset_m: 1.2,
+                        bottom_offset_m: 0.0,
+                        above_opacity: above,
+                        below_opacity: 0.35,
+                    },
+                },
+                None => fallback,
+            }
         }
         Op::DeleteRoom(i) => {
             let rooms = ids_of_kind(doc, EntityKind::Room);

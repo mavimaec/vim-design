@@ -82,6 +82,11 @@ pub enum VimStatus {
     /// on another plane or already in another layout).
     /// `room_layout::validate_structure` names most problems.
     InvalidRoomLayout = 26,
+    /// A plan span fails structural validation (a non-finite offset or
+    /// opacity, an opacity outside 0..=1, a bottom not below the cut, a
+    /// cut not below a fixed top). `plan_span::validate` names the
+    /// problem.
+    InvalidPlanSpan = 27,
 }
 
 impl VimStatus {

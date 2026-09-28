@@ -22,6 +22,7 @@ use crate::selection::{PredicateAst, SelectionScope};
 use crate::status::VimStatus;
 use crate::sketch::{Sketch, SketchDirection};
 use crate::subref::{EdgeTarget, FaceTarget, SubRef, SubRefSet};
+use crate::plan_span::{PlanSpanData, SpanTop};
 use crate::room::RoomData;
 use crate::room_layout::{RoomLayoutData, RoomOpening};
 use crate::wall_run::{Opening, RunPoint, SegmentProfile, WallRunData};
@@ -638,6 +639,34 @@ pub enum Command {
     DeleteRoomLayout {
         id: EntityId,
     },
+    // -- Plan span --------------------------------------------------------
+    /// Create the plan span of `level`. Rejected with `InvalidPlanSpan`
+    /// when invalid (`plan_span::validate`) and with `SingletonExists`
+    /// when the level has one already (enforced at the delta gate).
+    CreatePlanSpan {
+        level: EntityId,
+        top: SpanTop,
+        cut_offset_m: f64,
+        bottom_offset_m: f64,
+        above_opacity: f32,
+        below_opacity: f32,
+    },
+    /// Update a plan span: every field is optional; the merged result is
+    /// validated like a create. One undo step; coalesced updates merge a
+    /// slider drag.
+    UpdatePlanSpan {
+        id: EntityId,
+        top: Option<SpanTop>,
+        cut_offset_m: Option<f64>,
+        bottom_offset_m: Option<f64>,
+        above_opacity: Option<f32>,
+        below_opacity: Option<f32>,
+        coalesce: bool,
+    },
+    /// Delete a plan span (the level returns to the defaults).
+    DeletePlanSpan {
+        id: EntityId,
+    },
 }
 
 /// Serde default for `DeleteElement::sweep_orphans` — sweeping is the
@@ -742,6 +771,9 @@ impl Command {
             Command::CreateRoomLayout { .. } => "CreateRoomLayout",
             Command::UpdateRoomLayout { .. } => "UpdateRoomLayout",
             Command::DeleteRoomLayout { .. } => "DeleteRoomLayout",
+            Command::CreatePlanSpan { .. } => "CreatePlanSpan",
+            Command::UpdatePlanSpan { .. } => "UpdatePlanSpan",
+            Command::DeletePlanSpan { .. } => "DeletePlanSpan",
         }
     }
 
@@ -775,6 +807,7 @@ impl Command {
             | Command::UpdateWallRun { id, coalesce, .. }
             | Command::UpdateRoom { id, coalesce, .. }
             | Command::UpdateRoomLayout { id, coalesce, .. }
+            | Command::UpdatePlanSpan { id, coalesce, .. }
             | Command::UpdateLevel { id, coalesce, .. } => (*coalesce, *id),
             Command::UpdateCylinder {
                 extrusion, coalesce, ..
@@ -2061,6 +2094,49 @@ fn run(ctx: &mut Ctx<'_>, command: &Command) -> Result<(), VimStatus> {
             ctx.set_params(*id, params)
         }
         Command::DeleteRoomLayout { id } => ctx.delete(*id, EntityKind::RoomLayout),
+
+        // -- Plan span -----------------------------------------------------
+        Command::CreatePlanSpan {
+            level,
+            top,
+            cut_offset_m,
+            bottom_offset_m,
+            above_opacity,
+            below_opacity,
+        } => {
+            let span = PlanSpanData {
+                top: *top,
+                cut_offset_m: *cut_offset_m,
+                bottom_offset_m: *bottom_offset_m,
+                above_opacity: *above_opacity,
+                below_opacity: *below_opacity,
+            };
+            crate::plan_span::validate(&span).map_err(|_| VimStatus::InvalidPlanSpan)?;
+            ctx.create(span.into_params(), vec![SlotValue::One(Some(*level))])?;
+            Ok(())
+        }
+        Command::UpdatePlanSpan {
+            id,
+            top,
+            cut_offset_m,
+            bottom_offset_m,
+            above_opacity,
+            below_opacity,
+            ..
+        } => {
+            let record = ctx.expect_kind(*id, EntityKind::PlanSpan)?;
+            let old = PlanSpanData::from_params(&record.params).ok_or(VimStatus::ParamsKindMismatch)?;
+            let span = PlanSpanData {
+                top: top.unwrap_or(old.top),
+                cut_offset_m: cut_offset_m.unwrap_or(old.cut_offset_m),
+                bottom_offset_m: bottom_offset_m.unwrap_or(old.bottom_offset_m),
+                above_opacity: above_opacity.unwrap_or(old.above_opacity),
+                below_opacity: below_opacity.unwrap_or(old.below_opacity),
+            };
+            crate::plan_span::validate(&span).map_err(|_| VimStatus::InvalidPlanSpan)?;
+            ctx.set_params(*id, span.into_params())
+        }
+        Command::DeletePlanSpan { id } => ctx.delete(*id, EntityKind::PlanSpan),
     }
 }
 

@@ -83,6 +83,9 @@ pub enum Evaluated {
     /// A room layout's wall solids with its room regions and the issues
     /// that left parts out. Produced by `RoomLayout`.
     RoomLayout(Box<LayoutValue>),
+    /// A level's plan span data (plain data; the world-z resolution is
+    /// `plan_span::resolve`). Produced by `PlanSpan`; never a mesh.
+    PlanSpan(crate::plan_span::PlanSpanData),
 }
 
 /// The evaluated value of a room layout.

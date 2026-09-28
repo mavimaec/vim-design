@@ -151,6 +151,18 @@ Plus two kinds from the authoring-tool direction (2026-08-23, see
   opening that does not fit leaves that part out and makes the layout a per-entity error
   while the rest still evaluates (§6.4). `DeleteRoom` removes the room from its layout
   and drops its openings in the same undo step. See AUTHORING.md §12.
+- **`PlanSpan`** — a level's view range: `top` (`NextStory` | `Offset(m)`, relative to the
+  level), `cut_offset_m` (the plan cut, default 1.2), `bottom_offset_m` (default 0,
+  negative reaches below), `above_opacity` / `below_opacity` (0..=1, defaults 0.25 /
+  0.35). Slot 0 `level` (required, `Level` only); at most ONE per level, enforced at the
+  delta gate like the Site singleton (`SingletonExists`). It evaluates to its plain data
+  (`Evaluated::PlanSpan`, no mesh); `plan_span::resolve(doc, level)` gives the span in
+  world z, with defaults for a level without one. Invalid values reject
+  (`InvalidPlanSpan`). It is metadata (`EntityKind::is_metadata`), deleted by its level's
+  cascade. **Deliberate exception** to "view-only state never routes through the
+  command system": the user chose the span as per-level project data (saved, exported,
+  undoable), like a floor plan's view range. The camera, the active level, selection,
+  and hover stay session state. See AUTHORING.md §13.
 
 > Note: `Element`/`Instance` commands (`CreateElement`, `CreateInstance`, …) extend the
 > command list in the requirements; they fall out of the performance requirement (§8 of
@@ -537,7 +549,8 @@ undo is the escape hatch.
   lib-side command/params types. What lives in the caller is the *intent layer*:
   widget→command mapping, interaction state machines, and view-only state (camera,
   hover, selection highlights — which must never route through the undoable command
-  system). Precedent: Revit transactions, OCCT OCAF — the document owns undo.
+  system). The one exception is a level's `PlanSpan` (§3.1): per-level project data by
+  the user's choice. Precedent: Revit transactions, OCCT OCAF — the document owns undo.
 - **Commands:** one `extern "C"` function per command with a plain-C params struct, e.g.
   `VimStatus vim_create_control_point(VimDesignHandle, const VimControlPointParams*, VimEntityId* out_id);`
   Composite commands likewise. (A batched binary command buffer is deferred — open question.)

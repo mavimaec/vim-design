@@ -124,6 +124,13 @@ pub fn apply_delta(graph: &mut GraphState, delta: &Delta) -> Result<(), VimStatu
     Ok(())
 }
 
+/// True when `level` already has a plan span other than `except`.
+fn plan_span_taken(graph: &GraphState, level: EntityId, except: EntityId) -> bool {
+    graph.dependents(level).into_iter().any(|d| {
+        d != except && graph.get(d).is_some_and(|r| r.kind() == crate::entity::EntityKind::PlanSpan)
+    })
+}
+
 fn apply_delta_inner(graph: &mut GraphState, delta: &Delta) -> Result<(), VimStatus> {
     match delta {
         Delta::Insert { id, record } => {
@@ -144,6 +151,16 @@ fn apply_delta_inner(graph: &mut GraphState, delta: &Delta) -> Result<(), VimSta
                 && graph.iter().any(|(_, r)| {
                     r.kind() == crate::entity::EntityKind::Site
                 })
+            {
+                return Err(VimStatus::SingletonExists);
+            }
+            // One plan span per level, by the same gate.
+            if record.kind() == crate::entity::EntityKind::PlanSpan
+                && let Some(level) = record
+                    .inputs
+                    .get(crate::entity::slot::PLAN_SPAN_LEVEL)
+                    .and_then(|s| s.referenced().next())
+                && plan_span_taken(graph, level, *id)
             {
                 return Err(VimStatus::SingletonExists);
             }
@@ -206,6 +223,12 @@ fn apply_delta_inner(graph: &mut GraphState, delta: &Delta) -> Result<(), VimSta
                 return Err(VimStatus::DeltaMismatch);
             }
             validate_new_slot_value(graph, *id, slots(current.kind()), *slot, new)?;
+            if current.kind() == crate::entity::EntityKind::PlanSpan
+                && *slot == crate::entity::slot::PLAN_SPAN_LEVEL
+                && new.referenced().any(|level| plan_span_taken(graph, level, *id))
+            {
+                return Err(VimStatus::SingletonExists);
+            }
             // Re-index around the mutation using whole records so that an
             // input referenced by several slots keeps its edge.
             let before = current.clone();
