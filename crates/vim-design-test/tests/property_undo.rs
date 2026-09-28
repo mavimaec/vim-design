@@ -6,6 +6,8 @@
 use proptest::prelude::*;
 use vim_design_lib::sketch::{Sketch, SketchDirection, SketchFaceKind, ops};
 use vim_design_lib::wall::{self, ops as wall_ops};
+use vim_design_lib::room::{self, RoomData, ops as room_ops};
+use vim_design_lib::room_layout::{self, RoomLayoutData, RoomOpening, ops as layout_ops};
 use vim_design_lib::wall_run::{
     self, Opening, OpeningKind, RunPoint, WallRunData,
     ops::{self as run_ops, RunEnd},
@@ -53,6 +55,15 @@ enum Op {
     CreateWallRun { base: usize, top: Option<usize>, corners: u8, closed: bool },
     EditWallRun { pick: usize, op: u8, a: usize, x: i8, coalesce: bool },
     DeleteWorkplaneCascade(usize),
+    // Rooms and room layouts: layouts on planes, rooms added to them,
+    // boundary edits through the room operations (which re-anchor the
+    // layout's openings), openings through the layout operations, and
+    // the room delete that also edits its layout.
+    CreateRoomLayout { plane: usize, top: Option<usize> },
+    CreateRoom { layout: usize, x: i8, y: i8, w: u8, h: u8, precedence: i8 },
+    EditRoom { pick: usize, op: u8, a: usize, x: i8, coalesce: bool },
+    EditRoomLayout { pick: usize, op: u8, a: usize, x: i8, coalesce: bool },
+    DeleteRoom(usize),
 }
 
 fn op_strategy() -> impl Strategy<Value = Op> {
@@ -101,6 +112,15 @@ fn op_strategy() -> impl Strategy<Value = Op> {
         4 => (any::<usize>(), 0u8..10, any::<usize>(), any::<i8>(), any::<bool>())
             .prop_map(|(pick, op, a, x, coalesce)| Op::EditWallRun { pick, op, a, x, coalesce }),
         1 => any::<usize>().prop_map(Op::DeleteWorkplaneCascade),
+        1 => (any::<usize>(), prop::option::of(any::<usize>()))
+            .prop_map(|(plane, top)| Op::CreateRoomLayout { plane, top }),
+        2 => (any::<usize>(), any::<i8>(), any::<i8>(), 1u8..60, 1u8..60, -3i8..3)
+            .prop_map(|(layout, x, y, w, h, precedence)| Op::CreateRoom { layout, x, y, w, h, precedence }),
+        3 => (any::<usize>(), 0u8..8, any::<usize>(), any::<i8>(), any::<bool>())
+            .prop_map(|(pick, op, a, x, coalesce)| Op::EditRoom { pick, op, a, x, coalesce }),
+        3 => (any::<usize>(), 0u8..6, any::<usize>(), any::<i8>(), any::<bool>())
+            .prop_map(|(pick, op, a, x, coalesce)| Op::EditRoomLayout { pick, op, a, x, coalesce }),
+        1 => any::<usize>().prop_map(Op::DeleteRoom),
     ]
 }
 
@@ -224,6 +244,114 @@ fn edit_wall_run(doc: &Document, id: EntityId, op: u8, a: usize, x: i8, coalesce
         profiles: Some(run.profiles),
         coalesce,
     })
+}
+
+/// One random room edit through `room::ops`, or `None`.
+fn edit_room(doc: &Document, id: EntityId, op: u8, a: usize, x: i8, coalesce: bool) -> Option<Command> {
+    let room = RoomData::from_params(&doc.entity(id)?.params)?;
+    let d = f64::from(x) * 0.05;
+    let edges = room.edges();
+    let edge = *edges.get(a % edges.len().max(1))?;
+    let edited = match op {
+        0 => room_ops::move_points(&room, &[edge], [d, -d]),
+        1 => room_ops::move_edges(&room, &[edge], [d, d]),
+        2 => {
+            let (p, q) = room.edge_ends(edge)?;
+            let length = ((q[0] - p[0]).powi(2) + (q[1] - p[1]).powi(2)).sqrt();
+            room_ops::insert_point(&room, edge, length / 2.0).map(|(r, _)| r)
+        }
+        3 => room_ops::delete_points(&room, &[edge]),
+        4 => room_ops::delete_edges(&room, &[edge]),
+        5 => room_ops::set_hidden(&room, &[edge], !room.is_hidden(edge)),
+        6 => {
+            return Some(Command::UpdateRoom {
+                id,
+                plane: None,
+                name: None,
+                precedence: Some(i32::from(x) % 4),
+                boundary: None,
+                hidden_edges: None,
+                coalesce,
+            });
+        }
+        _ => room_ops::set_point(&room, edge, [d, d]),
+    };
+    let room = edited.ok()?;
+    Some(Command::UpdateRoom {
+        id,
+        plane: None,
+        name: None,
+        precedence: None,
+        boundary: Some(room.boundary),
+        hidden_edges: Some(room.hidden_edges),
+        coalesce,
+    })
+}
+
+/// One random layout edit through `room_layout::ops`, or `None`.
+fn edit_room_layout(doc: &Document, id: EntityId, op: u8, a: usize, x: i8, coalesce: bool) -> Option<Command> {
+    let input = room_layout::inputs(doc, id)?;
+    let d = f64::from(x) * 0.02;
+    let update = |data: RoomLayoutData| Command::UpdateRoomLayout {
+        id,
+        plane: None,
+        top: None,
+        rooms: None,
+        thickness_m: None,
+        height_m: None,
+        top_offset_m: None,
+        openings: Some(data.openings),
+        coalesce,
+    };
+    let opening = input.layout.openings.get(a % input.layout.openings.len().max(1)).map(|o| o.id);
+    match op {
+        0 | 1 => {
+            let (room, data) = input.rooms.get(a % input.rooms.len().max(1))?;
+            let edges = data.edges();
+            let edge = *edges.get(a % edges.len().max(1))?;
+            let spans = room_layout::opening_span(&input, *room, edge).ok()?;
+            let (lo, hi) = *spans.first()?;
+            let width = ((hi - lo) * 0.5).min(1.0);
+            let opening = RoomOpening {
+                id: 0,
+                room: *room,
+                edge,
+                offset_m: lo + (hi - lo - width) / 2.0,
+                sill_m: 0.9,
+                width_m: width,
+                height_m: 1.0,
+                kind: if op == 0 { OpeningKind::Window } else { OpeningKind::Door },
+                depth_m: if x < 0 { Some(0.03) } else { None },
+            };
+            layout_ops::add_opening(&input, opening).ok().map(|(data, _)| update(data))
+        }
+        2 => layout_ops::move_opening(&input, opening?, [d, d]).ok().map(update),
+        3 => layout_ops::delete_opening(&input, opening?).ok().map(update),
+        4 => Some(Command::UpdateRoomLayout {
+            id,
+            plane: None,
+            top: None,
+            rooms: None,
+            thickness_m: Some(0.1 + f64::from(x.unsigned_abs()) * 0.001),
+            height_m: Some(2.0 + d.abs()),
+            top_offset_m: None,
+            openings: None,
+            coalesce,
+        }),
+        _ => {
+            let (room, _) = input.rooms.get(a % input.rooms.len().max(1))?;
+            let precedence = layout_ops::bring_forward(&input, *room).ok()??;
+            Some(Command::UpdateRoom {
+                id: *room,
+                plane: None,
+                name: None,
+                precedence: Some(precedence),
+                boundary: None,
+                hidden_edges: None,
+                coalesce,
+            })
+        }
+    }
 }
 
 fn stored_sketch(doc: &Document, id: EntityId) -> Option<Sketch> {
@@ -371,6 +499,8 @@ fn run_op(doc: &mut Document, op: &Op) {
                     Some(EntityKind::Sketch) => Command::DeleteSketch { id },
                     Some(EntityKind::Wall) => Command::DeleteWall { id },
                     Some(EntityKind::WallRun) => Command::DeleteWallRun { id },
+                    Some(EntityKind::Room) => Command::DeleteRoom { id },
+                    Some(EntityKind::RoomLayout) => Command::DeleteRoomLayout { id },
                     Some(EntityKind::Workplane) => Command::DeleteWorkplane { id },
                     _ => fallback,
                 },
@@ -430,6 +560,8 @@ fn run_op(doc: &mut Document, op: &Op) {
             producers.extend(ids_of_kind(doc, EntityKind::Sketch));
             producers.extend(ids_of_kind(doc, EntityKind::Wall));
             producers.extend(ids_of_kind(doc, EntityKind::WallRun));
+            producers.extend(ids_of_kind(doc, EntityKind::RoomLayout));
+            producers.extend(ids_of_kind(doc, EntityKind::Room));
             producers.sort_unstable();
             let levels = ids_of_kind(doc, EntityKind::Level);
             match (pick(&producers, *member), pick(&levels, *level)) {
@@ -555,6 +687,61 @@ fn run_op(doc: &mut Document, op: &Op) {
             pick(&runs, *p)
                 .and_then(|id| edit_wall_run(doc, id, *op, *a, *x, *coalesce))
                 .unwrap_or(fallback)
+        }
+        Op::CreateRoomLayout { plane, top } => {
+            let all = planes(doc);
+            match pick(&all, *plane) {
+                Some(plane) => Command::CreateRoomLayout {
+                    plane,
+                    top: top.and_then(|t| pick(&all, t)),
+                    rooms: vec![],
+                    thickness_m: room_layout::DEFAULT_PARTITION_THICKNESS_M,
+                    height_m: 2.7,
+                    top_offset_m: 0.0,
+                    openings: vec![],
+                },
+                None => fallback,
+            }
+        }
+        Op::CreateRoom { layout, x, y, w, h, precedence } => {
+            let layouts = ids_of_kind(doc, EntityKind::RoomLayout);
+            let target = pick(&layouts, *layout).and_then(|id| {
+                let plane = doc.entity(id)?.inputs.first()?.referenced().next()?;
+                Some((id, plane))
+            });
+            let (x0, y0) = (f64::from(*x) * 0.1, f64::from(*y) * 0.1);
+            let (w, h) = (f64::from(*w) * 0.1, f64::from(*h) * 0.1);
+            let room = room::from_rectangle(&room::default_name(doc), i32::from(*precedence), [x0, y0], [x0 + w, y0 + h]);
+            match (target, room) {
+                (Some((layout, plane)), Ok(room)) => Command::CreateRoom {
+                    plane,
+                    name: room.name,
+                    precedence: room.precedence,
+                    boundary: room.boundary,
+                    hidden_edges: vec![],
+                    layout: Some(layout),
+                },
+                _ => fallback,
+            }
+        }
+        Op::EditRoom { pick: p, op, a, x, coalesce } => {
+            let rooms = ids_of_kind(doc, EntityKind::Room);
+            pick(&rooms, *p)
+                .and_then(|id| edit_room(doc, id, *op, *a, *x, *coalesce))
+                .unwrap_or(fallback)
+        }
+        Op::EditRoomLayout { pick: p, op, a, x, coalesce } => {
+            let layouts = ids_of_kind(doc, EntityKind::RoomLayout);
+            pick(&layouts, *p)
+                .and_then(|id| edit_room_layout(doc, id, *op, *a, *x, *coalesce))
+                .unwrap_or(fallback)
+        }
+        Op::DeleteRoom(i) => {
+            let rooms = ids_of_kind(doc, EntityKind::Room);
+            match pick(&rooms, *i) {
+                Some(id) => Command::DeleteRoom { id },
+                None => fallback,
+            }
         }
         Op::DeleteWorkplaneCascade(i) => {
             let workplanes = ids_of_kind(doc, EntityKind::Workplane);

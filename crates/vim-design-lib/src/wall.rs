@@ -25,6 +25,11 @@ use crate::sketch::{POINT_TOLERANCE, Sketch, SketchError, SketchFace, SketchFace
 
 pub mod ops;
 
+/// Default thickness of a new wall (meters): a stud-and-gypsum partition,
+/// a 2x4 stud (89 mm actual) faced with one 12.7 mm (1/2 in) gypsum board
+/// on each side: 89 + 2 x 12.7 = 114.4 mm, rounded to 0.114 m.
+pub const DEFAULT_PARTITION_THICKNESS_M: f64 = 0.114;
+
 /// Typed failure of a wall check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WallError {

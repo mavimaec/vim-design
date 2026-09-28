@@ -60,6 +60,31 @@ pub enum ProvenancePath {
     /// run point `segment` it bounds. Faces of one part share the name
     /// (a reference face split by a window is one name).
     RunFace { segment: u32, part: RunPart },
+    /// A vertical face of a room layout's wall network: which part of
+    /// the wall along edge `edge` (a start point id) of room `room` it
+    /// is. A wall face is named by the room it faces; a face toward no
+    /// room by the first covering room (rank order) as `Outside`.
+    RoomWall { room: EntityId, edge: u32, part: RoomWallPart },
+    /// A horizontal face of a room layout at `z_um` micrometers above
+    /// its plane, facing up or down (the wall tops and bottoms, window
+    /// sills and heads). All such faces at one height and facing share
+    /// the name.
+    LayoutCap { z_um: i64, up: bool },
+}
+
+/// The part of a room-layout wall a vertical face is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum RoomWallPart {
+    /// The face toward the room's interior.
+    Inside,
+    /// The face toward no room.
+    Outside,
+    /// A wall end (a free end or a bevel).
+    End,
+    /// The reveal faces of opening `opening`.
+    Opening { opening: u32 },
+    /// The back of niche `opening`.
+    NicheBack { opening: u32 },
 }
 
 /// The part of a wall-run segment a face bounds.

@@ -22,6 +22,8 @@ use crate::selection::{PredicateAst, SelectionScope};
 use crate::status::VimStatus;
 use crate::sketch::{Sketch, SketchDirection};
 use crate::subref::{EdgeTarget, FaceTarget, SubRef, SubRefSet};
+use crate::room::RoomData;
+use crate::room_layout::{RoomLayoutData, RoomOpening};
 use crate::wall_run::{Opening, RunPoint, SegmentProfile, WallRunData};
 
 /// The closed set of user-level commands — the full requirements list
@@ -571,6 +573,71 @@ pub enum Command {
     DeleteWallRun {
         id: EntityId,
     },
+    // -- Rooms ------------------------------------------------------------
+    /// Create a room on `plane`; with `layout`, also add it to that
+    /// layout's rooms (one undo step). Rejected with `InvalidRoom` when
+    /// structurally invalid (`room::validate_structure`), and with
+    /// `InvalidRoomLayout` when the layout is on another plane. A
+    /// self-crossing, zero-area, or clockwise boundary commits; its
+    /// layout reports it.
+    CreateRoom {
+        plane: EntityId,
+        name: String,
+        precedence: i32,
+        boundary: Vec<RunPoint>,
+        hidden_edges: Vec<u32>,
+        layout: Option<EntityId>,
+    },
+    /// Update a room: every field is optional. The openings of its
+    /// layout on an edge the update changes keep their plan position on
+    /// the edge that now contains it (same group); an opening no edge
+    /// contains is kept and reported by the layout.
+    UpdateRoom {
+        id: EntityId,
+        plane: Option<EntityId>,
+        name: Option<String>,
+        precedence: Option<i32>,
+        boundary: Option<Vec<RunPoint>>,
+        hidden_edges: Option<Vec<u32>>,
+        coalesce: bool,
+    },
+    /// Delete a room: it leaves its layout and the layout's openings on
+    /// its edges go, in the same undo step. Rejected while anything else
+    /// depends on it (an element).
+    DeleteRoom {
+        id: EntityId,
+    },
+    /// Create a room layout on `plane`, optionally height-constrained by
+    /// `top`, with `rooms` (rooms of the same plane, in no other
+    /// layout). Rejected with `InvalidRoomLayout` when structurally
+    /// invalid (`room_layout::validate_structure`).
+    CreateRoomLayout {
+        plane: EntityId,
+        top: Option<EntityId>,
+        rooms: Vec<EntityId>,
+        thickness_m: f64,
+        height_m: f64,
+        top_offset_m: f64,
+        openings: Vec<RoomOpening>,
+    },
+    /// Update a room layout: every field is optional; `top: Some(None)`
+    /// removes the top constraint. The merged result is validated like a
+    /// create. One undo step; coalesced updates merge a drag.
+    UpdateRoomLayout {
+        id: EntityId,
+        plane: Option<EntityId>,
+        top: Option<Option<EntityId>>,
+        rooms: Option<Vec<EntityId>>,
+        thickness_m: Option<f64>,
+        height_m: Option<f64>,
+        top_offset_m: Option<f64>,
+        openings: Option<Vec<RoomOpening>>,
+        coalesce: bool,
+    },
+    /// Delete a room layout (its rooms stay).
+    DeleteRoomLayout {
+        id: EntityId,
+    },
 }
 
 /// Serde default for `DeleteElement::sweep_orphans` — sweeping is the
@@ -669,6 +736,12 @@ impl Command {
             Command::CreateWallRun { .. } => "CreateWallRun",
             Command::UpdateWallRun { .. } => "UpdateWallRun",
             Command::DeleteWallRun { .. } => "DeleteWallRun",
+            Command::CreateRoom { .. } => "CreateRoom",
+            Command::UpdateRoom { .. } => "UpdateRoom",
+            Command::DeleteRoom { .. } => "DeleteRoom",
+            Command::CreateRoomLayout { .. } => "CreateRoomLayout",
+            Command::UpdateRoomLayout { .. } => "UpdateRoomLayout",
+            Command::DeleteRoomLayout { .. } => "DeleteRoomLayout",
         }
     }
 
@@ -700,6 +773,8 @@ impl Command {
             | Command::UpdateWorkplane { id, coalesce, .. }
             | Command::UpdateWall { id, coalesce, .. }
             | Command::UpdateWallRun { id, coalesce, .. }
+            | Command::UpdateRoom { id, coalesce, .. }
+            | Command::UpdateRoomLayout { id, coalesce, .. }
             | Command::UpdateLevel { id, coalesce, .. } => (*coalesce, *id),
             Command::UpdateCylinder {
                 extrusion, coalesce, ..
@@ -1828,6 +1903,242 @@ fn run(ctx: &mut Ctx<'_>, command: &Command) -> Result<(), VimStatus> {
             ctx.set_params(*id, run.into_params())
         }
         Command::DeleteWallRun { id } => ctx.delete(*id, EntityKind::WallRun),
+
+        // -- Rooms ---------------------------------------------------------
+        Command::CreateRoom {
+            plane,
+            name,
+            precedence,
+            boundary,
+            hidden_edges,
+            layout,
+        } => {
+            let room = RoomData {
+                name: name.clone(),
+                precedence: *precedence,
+                boundary: boundary.clone(),
+                hidden_edges: canonical_ids(hidden_edges),
+            };
+            crate::room::validate_structure(&room).map_err(|_| VimStatus::InvalidRoom)?;
+            let id = ctx.create(room.into_params(), vec![SlotValue::One(Some(*plane))])?;
+            if let Some(layout) = layout {
+                let record = ctx.expect_kind(*layout, EntityKind::RoomLayout)?;
+                let rooms: Vec<EntityId> = record
+                    .inputs
+                    .get(slot::ROOM_LAYOUT_ROOMS)
+                    .map(|s| s.referenced().collect())
+                    .unwrap_or_default();
+                let rooms = crate::room_layout::ops::add_room(&rooms, id);
+                check_layout(ctx, Some(*layout), single_ref(&record, slot::ROOM_LAYOUT_PLANE)?, &rooms, &record.params)?;
+                ctx.rewire(*layout, slot::ROOM_LAYOUT_ROOMS, SlotValue::Many(rooms))?;
+            }
+            Ok(())
+        }
+        Command::UpdateRoom {
+            id,
+            plane,
+            name,
+            precedence,
+            boundary,
+            hidden_edges,
+            ..
+        } => {
+            let record = ctx.expect_kind(*id, EntityKind::Room)?;
+            let old = RoomData::from_params(&record.params).ok_or(VimStatus::ParamsKindMismatch)?;
+            let room = RoomData {
+                name: name.clone().unwrap_or_else(|| old.name.clone()),
+                precedence: precedence.unwrap_or(old.precedence),
+                boundary: boundary.clone().unwrap_or_else(|| old.boundary.clone()),
+                hidden_edges: hidden_edges
+                    .as_ref()
+                    .map(|ids| canonical_ids(ids))
+                    .unwrap_or_else(|| old.hidden_edges.clone()),
+            };
+            crate::room::validate_structure(&room).map_err(|_| VimStatus::InvalidRoom)?;
+            let layouts = layouts_of(ctx, *id);
+            if let Some(plane) = plane {
+                for layout in &layouts {
+                    let layout_plane = single_ref(&ctx.record(*layout)?, slot::ROOM_LAYOUT_PLANE)?;
+                    if layout_plane != *plane {
+                        return Err(VimStatus::InvalidRoomLayout);
+                    }
+                }
+                ctx.rewire(*id, slot::ROOM_PLANE, SlotValue::One(Some(*plane)))?;
+            }
+            for layout in layouts {
+                let record = ctx.record(layout)?;
+                if let Some(mut data) = RoomLayoutData::from_params(&record.params) {
+                    for opening in data.openings.iter_mut().filter(|o| o.room == *id) {
+                        reanchor(opening, &old, &room);
+                    }
+                    ctx.set_params(layout, data.into_params())?;
+                }
+            }
+            ctx.set_params(*id, room.into_params())
+        }
+        Command::DeleteRoom { id } => {
+            ctx.expect_kind(*id, EntityKind::Room)?;
+            for layout in layouts_of(ctx, *id) {
+                let record = ctx.record(layout)?;
+                let rooms: Vec<EntityId> = record
+                    .inputs
+                    .get(slot::ROOM_LAYOUT_ROOMS)
+                    .map(|s| s.referenced().filter(|r| r != id).collect())
+                    .unwrap_or_default();
+                if let Some(mut data) = RoomLayoutData::from_params(&record.params) {
+                    data.openings.retain(|o| o.room != *id);
+                    ctx.set_params(layout, data.into_params())?;
+                }
+                ctx.rewire(layout, slot::ROOM_LAYOUT_ROOMS, SlotValue::Many(rooms))?;
+            }
+            ctx.delete(*id, EntityKind::Room)
+        }
+        Command::CreateRoomLayout {
+            plane,
+            top,
+            rooms,
+            thickness_m,
+            height_m,
+            top_offset_m,
+            openings,
+        } => {
+            let params = RoomLayoutData {
+                thickness_m: *thickness_m,
+                height_m: *height_m,
+                top_offset_m: *top_offset_m,
+                openings: openings.clone(),
+            }
+            .into_params();
+            check_layout(ctx, None, *plane, rooms, &params)?;
+            ctx.create(
+                params,
+                vec![SlotValue::One(Some(*plane)), SlotValue::One(*top), SlotValue::Many(rooms.clone())],
+            )?;
+            Ok(())
+        }
+        Command::UpdateRoomLayout {
+            id,
+            plane,
+            top,
+            rooms,
+            thickness_m,
+            height_m,
+            top_offset_m,
+            openings,
+            ..
+        } => {
+            let record = ctx.expect_kind(*id, EntityKind::RoomLayout)?;
+            let old = RoomLayoutData::from_params(&record.params).ok_or(VimStatus::ParamsKindMismatch)?;
+            let params = RoomLayoutData {
+                thickness_m: thickness_m.unwrap_or(old.thickness_m),
+                height_m: height_m.unwrap_or(old.height_m),
+                top_offset_m: top_offset_m.unwrap_or(old.top_offset_m),
+                openings: openings.clone().unwrap_or(old.openings),
+            }
+            .into_params();
+            let new_plane = match plane {
+                Some(plane) => *plane,
+                None => single_ref(&record, slot::ROOM_LAYOUT_PLANE)?,
+            };
+            let new_rooms: Vec<EntityId> = match rooms {
+                Some(rooms) => rooms.clone(),
+                None => record
+                    .inputs
+                    .get(slot::ROOM_LAYOUT_ROOMS)
+                    .map(|s| s.referenced().collect())
+                    .unwrap_or_default(),
+            };
+            check_layout(ctx, Some(*id), new_plane, &new_rooms, &params)?;
+            if let Some(plane) = plane {
+                ctx.rewire(*id, slot::ROOM_LAYOUT_PLANE, SlotValue::One(Some(*plane)))?;
+            }
+            if let Some(top) = top {
+                ctx.rewire(*id, slot::ROOM_LAYOUT_TOP, SlotValue::One(*top))?;
+            }
+            if rooms.is_some() {
+                ctx.rewire(*id, slot::ROOM_LAYOUT_ROOMS, SlotValue::Many(new_rooms))?;
+            }
+            ctx.set_params(*id, params)
+        }
+        Command::DeleteRoomLayout { id } => ctx.delete(*id, EntityKind::RoomLayout),
+    }
+}
+
+/// The room layouts that list `room` among their rooms.
+fn layouts_of(ctx: &Ctx<'_>, room: EntityId) -> Vec<EntityId> {
+    let graph = ctx.doc.graph_ref();
+    let mut layouts: Vec<EntityId> = graph
+        .dependents(room)
+        .into_iter()
+        .filter(|d| graph.get(*d).is_some_and(|r| r.kind() == EntityKind::RoomLayout))
+        .collect();
+    layouts.sort_unstable();
+    layouts
+}
+
+/// The structural checks of a layout (`layout` is `None` for a new one):
+/// unique rooms of kind `Room` on `plane` and in no other layout, and
+/// valid layout data (`room_layout::validate_structure`).
+fn check_layout(
+    ctx: &Ctx<'_>,
+    layout: Option<EntityId>,
+    plane: EntityId,
+    rooms: &[EntityId],
+    params: &Params,
+) -> Result<(), VimStatus> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut data = Vec::with_capacity(rooms.len());
+    for room in rooms {
+        if !seen.insert(*room) {
+            return Err(VimStatus::InvalidRoomLayout);
+        }
+        let record = ctx.expect_kind(*room, EntityKind::Room)?;
+        if single_ref(&record, slot::ROOM_PLANE)? != plane {
+            return Err(VimStatus::InvalidRoomLayout);
+        }
+        if layouts_of(ctx, *room).iter().any(|other| Some(*other) != layout) {
+            return Err(VimStatus::InvalidRoomLayout);
+        }
+        data.push((*room, RoomData::from_params(&record.params).ok_or(VimStatus::ParamsKindMismatch)?));
+    }
+    let input = crate::room_layout::LayoutInput {
+        layout: RoomLayoutData::from_params(params).ok_or(VimStatus::ParamsKindMismatch)?,
+        rooms: data,
+    };
+    crate::room_layout::validate_structure(&input).map_err(|_| VimStatus::InvalidRoomLayout)
+}
+
+/// Keep an opening at its plan position when a room edit changes its
+/// edge: an edge that still runs between the same two points keeps the
+/// opening as is; otherwise the new edge that contains the whole opening
+/// (same direction) takes it. An opening no edge contains is left as is.
+fn reanchor(opening: &mut RoomOpening, old: &RoomData, new: &RoomData) {
+    use crate::sketch::geom;
+    let same = old.edge_end_id(opening.edge).is_some() && old.edge_end_id(opening.edge) == new.edge_end_id(opening.edge);
+    if same {
+        return;
+    }
+    let Some((a, b)) = old.edge_ends(opening.edge) else { return };
+    let length = geom::dist(a, b);
+    if length <= crate::sketch::POINT_TOLERANCE {
+        return;
+    }
+    let d = geom::scale(geom::sub(b, a), 1.0 / length);
+    let p = geom::add(a, geom::scale(d, opening.offset_m));
+    let q = geom::add(a, geom::scale(d, opening.offset_m + opening.width_m));
+    for edge in new.edges() {
+        let Some((na, nb)) = new.edge_ends(edge) else { continue };
+        let nl = geom::dist(na, nb);
+        if nl <= crate::sketch::POINT_TOLERANCE {
+            continue;
+        }
+        let nd = geom::scale(geom::sub(nb, na), 1.0 / nl);
+        let on = |x| geom::point_segment_distance(x, na, nb) <= crate::sketch::POINT_TOLERANCE;
+        if geom::dot(d, nd) > 1.0 - 1e-9 && on(p) && on(q) {
+            opening.edge = edge;
+            opening.offset_m = geom::dot(geom::sub(p, na), nd);
+            return;
+        }
     }
 }
 
@@ -1967,6 +2278,8 @@ fn sweepable(kind: EntityKind) -> bool {
             | EntityKind::Sketch
             | EntityKind::Wall
             | EntityKind::WallRun
+            | EntityKind::Room
+            | EntityKind::RoomLayout
     )
 }
 
@@ -2263,6 +2576,7 @@ fn disconnect_topped_walls(
             let (base_slot, top_slot) = match record.kind() {
                 EntityKind::Wall => (slot::WALL_BASE, slot::WALL_TOP),
                 EntityKind::WallRun => (slot::WALL_RUN_BASE, slot::WALL_RUN_TOP),
+                EntityKind::RoomLayout => (slot::ROOM_LAYOUT_PLANE, slot::ROOM_LAYOUT_TOP),
                 _ => continue,
             };
             let top_doomed = plane_of(record, top_slot).is_some_and(|p| planes.contains(&p));
@@ -2277,12 +2591,19 @@ fn disconnect_topped_walls(
         let record = ctx.record(wall)?;
         let current = match record.kind() {
             EntityKind::WallRun => crate::wall_run::run_top_height(ctx.doc, wall),
+            EntityKind::RoomLayout => crate::room_layout::layout_top_height(ctx.doc, wall),
             _ => crate::wall::wall_top_height(ctx.doc, wall),
         };
         let height = current
             .filter(|h| h.is_finite())
             .unwrap_or(MIN_DISCONNECTED_WALL_HEIGHT_M)
             .max(MIN_DISCONNECTED_WALL_HEIGHT_M);
+        if let Some(mut layout) = RoomLayoutData::from_params(&record.params) {
+            layout.height_m = height;
+            ctx.rewire(wall, slot::ROOM_LAYOUT_TOP, SlotValue::One(None))?;
+            ctx.set_params(wall, layout.into_params())?;
+            continue;
+        }
         if let Some(mut run) = WallRunData::from_params(&record.params) {
             run.height_m = height;
             ctx.rewire(wall, slot::WALL_RUN_TOP, SlotValue::One(None))?;

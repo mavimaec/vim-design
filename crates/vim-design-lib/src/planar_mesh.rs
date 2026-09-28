@@ -136,30 +136,64 @@ struct Region {
     shapes: Vec<Shape>,
 }
 
+/// A cheap hasher for integer cell keys (the default SipHash dominates
+/// the grid lookups otherwise).
+#[derive(Default)]
+struct CellHasher(u64);
+
+impl std::hash::Hasher for CellHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 = (self.0.rotate_left(5) ^ u64::from(*byte)).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+        }
+    }
+
+    fn write_i64(&mut self, value: i64) {
+        self.0 = (self.0.rotate_left(5) ^ value as u64).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    }
+}
+
+type CellMap = std::collections::HashMap<[i64; 3], Vec<usize>, std::hash::BuildHasherDefault<CellHasher>>;
+
+/// Grid cell size: several tolerances, so a point usually needs only its
+/// own cell.
+const CELL: f64 = 4.0 * TOL;
+
 /// Distinct vertices (no two within tolerance) on a hash grid, for
 /// snapping near-coincident points to one exact position.
 struct VertexGrid {
-    cells: std::collections::HashMap<[i64; 3], Vec<usize>>,
+    cells: CellMap,
     points: Vec<P3>,
 }
 
 impl VertexGrid {
     fn new() -> VertexGrid {
-        VertexGrid { cells: std::collections::HashMap::new(), points: Vec::new() }
+        VertexGrid { cells: CellMap::default(), points: Vec::new() }
     }
 
     fn cell(p: P3) -> [i64; 3] {
-        [(p[0] / TOL).floor() as i64, (p[1] / TOL).floor() as i64, (p[2] / TOL).floor() as i64]
+        [(p[0] / CELL).floor() as i64, (p[1] / CELL).floor() as i64, (p[2] / CELL).floor() as i64]
+    }
+
+    /// The cells within tolerance of `p` along one axis.
+    fn span(c: f64) -> std::ops::RangeInclusive<i64> {
+        let base = (c / CELL).floor();
+        let low = if c - base * CELL < TOL { -1 } else { 0 };
+        let high = if (base + 1.0) * CELL - c < TOL { 1 } else { 0 };
+        (base as i64 + low)..=(base as i64 + high)
     }
 
     /// The nearest stored vertex within tolerance.
     fn nearest(&self, p: P3) -> Option<P3> {
-        let [x, y, z] = Self::cell(p);
         let mut best: Option<(f64, P3)> = None;
-        for dx in -1..=1 {
-            for dy in -1..=1 {
-                for dz in -1..=1 {
-                    let Some(ids) = self.cells.get(&[x + dx, y + dy, z + dz]) else { continue };
+        for x in Self::span(p[0]) {
+            for y in Self::span(p[1]) {
+                for z in Self::span(p[2]) {
+                    let Some(ids) = self.cells.get(&[x, y, z]) else { continue };
                     for q in ids.iter().filter_map(|i| self.points.get(*i)) {
                         let d = dist(*q, p);
                         if d <= TOL && best.is_none_or(|(bd, _)| d < bd) {
@@ -212,6 +246,26 @@ fn without_collinear(mut ring: Vec<P3>) -> Vec<P3> {
         }
     }
     ring
+}
+
+/// The loops of one face as a boolean shape: the largest ring first and
+/// counter-clockwise, the others clockwise.
+fn oriented(mut rings: Vec<Vec<P2>>) -> Shape {
+    let largest = rings
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| signed_area(a).abs().total_cmp(&signed_area(b).abs()))
+        .map_or(0, |(i, _)| i);
+    if largest != 0 {
+        rings.swap(0, largest);
+    }
+    for (i, ring) in rings.iter_mut().enumerate() {
+        let area = signed_area(ring);
+        if (i == 0) != (area > 0.0) {
+            ring.reverse();
+        }
+    }
+    rings
 }
 
 /// A ring without consecutive (or closing) repeats within tolerance.
@@ -375,38 +429,62 @@ pub(crate) fn mesh_planar_faces(
     for p in faces.iter().flat_map(|f| f.loops.iter().flatten()) {
         known.insert(*p);
     }
-    let mut regions: Vec<Region> = Vec::new();
-    for (plane_index, plane) in planes.iter().enumerate() {
-        // Every ring in this plane's basis, counter-clockwise for outers.
-        let rings_of = |sign: f64, path: Option<&Option<ProvenancePath>>| -> Vec<Vec<P2>> {
-            faces
+    let mut on_plane: Vec<Vec<usize>> = vec![Vec::new(); planes.len()];
+    for (index, (plane, _)) in face_plane.iter().enumerate() {
+        if let Some(list) = on_plane.get_mut(*plane) {
+            list.push(index);
+        }
+    }
+    // Every face's rings in its plane's basis, counter-clockwise for
+    // outers.
+    let flat: Vec<Vec<Vec<P2>>> = faces
+        .iter()
+        .zip(face_plane.iter())
+        .map(|(face, (plane, sign))| {
+            let Some(plane) = planes.get(*plane) else { return Vec::new() };
+            face.loops
                 .iter()
-                .zip(face_plane.iter())
-                .filter(|(f, (pi, s))| {
-                    *pi == plane_index && *s == sign && path.is_none_or(|p| &f.path == p)
+                .map(|ring| {
+                    let mut r: Vec<P2> = ring.iter().map(|p| plane.to_2d(known.snap(*p))).collect();
+                    if *sign < 0.0 {
+                        r.reverse();
+                    }
+                    r
                 })
-                .flat_map(|(f, _)| {
-                    f.loops.iter().map(|ring| {
-                        let mut r: Vec<P2> = ring.iter().map(|p| plane.to_2d(known.snap(*p))).collect();
-                        if sign < 0.0 {
-                            r.reverse();
-                        }
-                        r
-                    })
-                })
+                .collect()
+        })
+        .collect();
+    let mut regions: Vec<Region> = Vec::new();
+    for plane_index in 0..planes.len() {
+        let here: Vec<(&PlanarFace, f64, &Vec<Vec<P2>>)> = on_plane
+            .get(plane_index)
+            .into_iter()
+            .flatten()
+            .filter_map(|i| Some((faces.get(*i)?, face_plane.get(*i)?.1, flat.get(*i)?)))
+            .collect();
+        let rings_of = |sign: f64, path: Option<&Option<ProvenancePath>>| -> Vec<Vec<P2>> {
+            here.iter()
+                .filter(|(f, s, _)| *s == sign && path.is_none_or(|p| &f.path == p))
+                .flat_map(|(_, _, rings)| rings.iter().cloned())
                 .collect()
         };
         for sign in [1.0, -1.0] {
             let mut names: Vec<Option<ProvenancePath>> = Vec::new();
-            for (face, (pi, s)) in faces.iter().zip(face_plane.iter()) {
-                if *pi == plane_index && *s == sign && !names.contains(&face.path) {
+            for (face, s, _) in &here {
+                if *s == sign && !names.contains(&face.path) {
                     names.push(face.path.clone());
                 }
             }
             let opposite = rings_of(-sign, None);
             for name in names {
                 let own = rings_of(sign, Some(&name));
-                let shapes = boolean(&own, &opposite, OverlayRule::Difference)?;
+                let single = here.iter().filter(|(f, s, _)| *s == sign && f.path == name).count() == 1;
+                let shapes = if single && opposite.is_empty() {
+                    // One face alone on its plane side: no boolean.
+                    vec![oriented(own)]
+                } else {
+                    boolean(&own, &opposite, OverlayRule::Difference)?
+                };
                 if !shapes.is_empty() {
                     regions.push(Region {
                         plane: plane_index,
@@ -445,7 +523,19 @@ pub(crate) fn mesh_planar_faces(
     for p in rings3.iter().flatten().flatten().flatten() {
         distinct.insert(*p);
     }
-    let all = distinct.points;
+    // Per plane, the vertices on it: the only ones that can lie on the
+    // edges of its faces.
+    let plane_vertices: Vec<Vec<P3>> = planes
+        .iter()
+        .map(|plane| {
+            distinct
+                .points
+                .iter()
+                .filter(|p| (dot(plane.normal, **p) - plane.offset).abs() <= TOL)
+                .copied()
+                .collect()
+        })
+        .collect();
 
     // 4. Triangulate.
     let mut out = Vec::with_capacity(regions.len());
@@ -455,7 +545,8 @@ pub(crate) fn mesh_planar_faces(
         let n32 = [normal[0] as f32, normal[1] as f32, normal[2] as f32];
         let mut mesh = RawMesh::default();
         for shape in shapes {
-            let conformed: Vec<Vec<P3>> = shape.iter().map(|ring| conform(ring, &all)).collect();
+            let all = plane_vertices.get(region.plane).map(Vec::as_slice).unwrap_or_default();
+            let conformed: Vec<Vec<P3>> = shape.iter().map(|ring| conform(ring, all)).collect();
             let rings2: Vec<Vec<P2>> = conformed
                 .iter()
                 .map(|ring| ring.iter().map(|p| plane.to_2d(*p)).collect())

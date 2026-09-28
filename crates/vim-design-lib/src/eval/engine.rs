@@ -109,6 +109,24 @@ impl Engine {
         self.meshes.get(&id).map(|entry| &entry.mesh)
     }
 
+    /// The effective room regions of room layout `layout` (for overlays
+    /// and labels), in rooms-slot order; `None` before it evaluates.
+    pub fn room_regions(&self, layout: EntityId) -> Option<&[crate::room_layout::RoomRegion]> {
+        match self.value(layout)? {
+            Evaluated::RoomLayout(value) => Some(&value.regions),
+            _ => None,
+        }
+    }
+
+    /// The rooms and openings room layout `layout` left out at its last
+    /// evaluation.
+    pub fn room_layout_issues(&self, layout: EntityId) -> Option<&[crate::room_layout::LayoutIssue]> {
+        match self.value(layout)? {
+            Evaluated::RoomLayout(value) => Some(&value.issues),
+            _ => None,
+        }
+    }
+
     /// How many times `id` has been (re-)evaluated — instrumentation for
     /// incrementality tests and profiling.
     pub fn eval_count(&self, id: EntityId) -> u64 {
@@ -181,16 +199,18 @@ impl Engine {
         // of them (one name may cover faces of several prisms).
         let solids: Vec<&KernelSolid> = match value {
             Evaluated::Solid { solid, .. } => vec![solid],
-            Evaluated::SolidSet(members) => members.iter().map(|(_, s, _)| s).collect(),
-            _ => {
-                return Err(EvalDiag::new(
-                    EvalErrorKind::UnresolvedSubRef,
-                    format!(
-                        "owner entity {} did not evaluate to a solid",
-                        subref.owner.0
-                    ),
-                ));
-            }
+            other => match other.solid_set() {
+                Some(members) => members.iter().map(|(_, s, _)| s).collect(),
+                None => {
+                    return Err(EvalDiag::new(
+                        EvalErrorKind::UnresolvedSubRef,
+                        format!(
+                            "owner entity {} did not evaluate to a solid",
+                            subref.owner.0
+                        ),
+                    ));
+                }
+            },
         };
         let (faces, edges) = solids
             .iter()
@@ -323,11 +343,31 @@ impl Engine {
                 Ok(value) => {
                     let was_error =
                         matches!(entry.state, Some(EvalState::Error { .. }));
+                    // A result with parts left out is current AND in
+                    // error: the value stands, the diagnostic reports.
+                    let partial = value.partial_diag();
                     entry.value = Some(value);
                     entry.value_generation = generation;
-                    entry.state = Some(EvalState::UpToDate { generation });
-                    if was_error {
-                        self.error_transitions.insert(id);
+                    match partial {
+                        Some(diag) => {
+                            let changed = match &entry.state {
+                                Some(EvalState::Error { diag: old, .. }) => *old != diag,
+                                _ => true,
+                            };
+                            entry.state = Some(EvalState::Error {
+                                diag,
+                                stale_generation: Some(generation),
+                            });
+                            if changed {
+                                self.error_transitions.insert(id);
+                            }
+                        }
+                        None => {
+                            entry.state = Some(EvalState::UpToDate { generation });
+                            if was_error {
+                                self.error_transitions.insert(id);
+                            }
+                        }
                     }
                 }
                 Err(diag) => {
@@ -457,7 +497,8 @@ impl Engine {
                 | EntityKind::Chamfer
                 | EntityKind::Sketch
                 | EntityKind::Wall
-                | EntityKind::WallRun => !consumed.contains(id),
+                | EntityKind::WallRun
+                | EntityKind::RoomLayout => !consumed.contains(id),
                 _ => false,
             })
             .map(|(id, _)| *id)
@@ -743,9 +784,10 @@ fn build_owner_mesh(
         // Consecutive prisms of one member built from planar 2D data are
         // meshed together by the direct planar mesher; everything else
         // is tessellated per solid by the kernel.
-        Evaluated::SolidSet(members) => {
+        Evaluated::SolidSet(_) | Evaluated::RoomLayout(_) => {
+            let members = value.solid_set().unwrap_or_default();
             let mut outcome = Ok(());
-            let mut rest = members.as_slice();
+            let mut rest = members;
             while let Some((member, _, material)) = rest.first() {
                 let run = rest
                     .iter()

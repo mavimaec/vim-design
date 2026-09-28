@@ -26,6 +26,8 @@ pub mod status;
 pub mod subref;
 pub mod wall;
 pub mod wall_run;
+pub mod room;
+pub mod room_layout;
 pub mod workplane;
 
 pub use command::{Command, CommandOutput};

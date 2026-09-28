@@ -77,6 +77,47 @@ pub enum Evaluated {
         /// not change when only the root level moves.
         level_offset: [f64; 3],
     },
+    /// A room's data (plain data, compared for the early cutoff).
+    /// Produced by `Room`; its walls come from the room's layout.
+    Room(Box<crate::room::RoomData>),
+    /// A room layout's wall solids with its room regions and the issues
+    /// that left parts out. Produced by `RoomLayout`.
+    RoomLayout(Box<LayoutValue>),
+}
+
+/// The evaluated value of a room layout.
+#[derive(Debug, Clone)]
+pub struct LayoutValue {
+    /// `(layout id, solid, material)`: one prism per height layer and
+    /// plan piece.
+    pub solids: Vec<(EntityId, KernelSolid, Option<EntityId>)>,
+    /// Every room's effective region, in rooms-slot order.
+    pub regions: Vec<crate::room_layout::RoomRegion>,
+    /// Rooms and openings left out.
+    pub issues: Vec<crate::room_layout::LayoutIssue>,
+}
+
+impl Evaluated {
+    /// The solids of a set-valued result (`SolidSet`, `RoomLayout`).
+    pub fn solid_set(&self) -> Option<&[(EntityId, KernelSolid, Option<EntityId>)]> {
+        match self {
+            Evaluated::SolidSet(members) => Some(members),
+            Evaluated::RoomLayout(value) => Some(&value.solids),
+            _ => None,
+        }
+    }
+
+    /// The per-entity diagnostic of a result that evaluated with parts
+    /// left out (a room layout with issues).
+    pub(crate) fn partial_diag(&self) -> Option<EvalDiag> {
+        match self {
+            Evaluated::RoomLayout(value) if !value.issues.is_empty() => {
+                let listed: Vec<String> = value.issues.iter().map(|i| i.to_string()).collect();
+                Some(EvalDiag::new(EvalErrorKind::Degenerate, listed.join("; ")))
+            }
+            _ => None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------

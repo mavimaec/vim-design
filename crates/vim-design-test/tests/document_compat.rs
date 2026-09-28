@@ -21,8 +21,12 @@
 //! fixed height, up to Level 2, and up to the workplane — with windows
 //! and a door.
 //!
-//! `write_fixture` / `write_fixture_v2` / `write_fixture_v3` are the
-//! generators. They only
+//! `authoring_project_v4.vimd` adds `WallRun` entities to that project:
+//! a closed run on Level 2 with a window, a door, a niche, and a gable
+//! segment profile, and an open run up to the ceiling workplane.
+//!
+//! `write_fixture` / `write_fixture_v2` / `write_fixture_v3` /
+//! `write_fixture_v4` are the generators. They only
 //! write when the environment variable `VIMD_WRITE_COMPAT_FIXTURE` is
 //! set; regenerate a fixture only on an intentional, announced format
 //! break.
@@ -43,6 +47,10 @@ const FIXTURE_V2: &str = concat!(
 const FIXTURE_V3: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/fixtures/authoring_project_v3.vimd"
+);
+const FIXTURE_V4: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/fixtures/authoring_project_v4.vimd"
 );
 
 fn one(doc: &mut Document, cmd: Command) -> EntityId {
@@ -214,6 +222,91 @@ fn build_project_v3() -> Document {
             },
         );
     }
+    doc
+}
+
+/// The wall project plus two wall runs.
+fn build_project_v4() -> Document {
+    use vim_design_lib::wall_run::{Opening, OpeningKind, RunPoint, SegmentProfile};
+    let mut doc = build_project_v3();
+    let plane = |doc: &Document, wanted: &str| {
+        doc.entities()
+            .find(|(_, r)| match &r.params {
+                Params::Level { name, .. } | Params::Workplane { name, .. } => name == wanted,
+                _ => false,
+            })
+            .map(|(id, _)| *id)
+            .expect("plane")
+    };
+    let ground = plane(&doc, "Ground");
+    let second = plane(&doc, "Level 2");
+    let ceiling = plane(&doc, "Ceiling");
+    let points = |uv: &[[f64; 2]]| -> Vec<RunPoint> {
+        uv.iter()
+            .enumerate()
+            .map(|(i, uv)| RunPoint { id: i as u32, uv: *uv })
+            .collect()
+    };
+    let opening = |id, segment, offset_m, sill_m, width_m, height_m, kind, depth_m| Opening {
+        id,
+        segment,
+        offset_m,
+        sill_m,
+        width_m,
+        height_m,
+        kind,
+        depth_m,
+    };
+    // A gable on segment 1 (6 m long), drawn at H = 2.7: the upper
+    // points are top-anchored.
+    let gable = ops::add_face(
+        &Sketch::default(),
+        &[[0.0, 0.0], [6.0, 0.0], [6.0, 2.7], [3.0, 3.9], [0.0, 2.7]],
+        SketchFaceKind::Solid { thickness: 0.2 },
+    )
+    .expect("gable");
+    let top_points: Vec<u32> = gable.points.iter().filter(|p| p.uv[1] > 2.0).map(|p| p.id).collect();
+    let gable = vim_design_lib::wall::stored_profile(&gable, &top_points, 2.7);
+    let closed = one(
+        &mut doc,
+        Command::CreateWallRun {
+            base: second,
+            top: None,
+            points: points(&[[0.0, 0.0], [8.0, 0.0], [8.0, 6.0], [0.0, 6.0]]),
+            closed: true,
+            thickness_m: 0.2,
+            height_m: 2.7,
+            top_offset_m: 0.0,
+            openings: vec![
+                opening(0, 0, 1.0, 0.9, 1.2, 1.2, OpeningKind::Window, None),
+                opening(1, 0, 4.0, 0.0, 0.9, 2.1, OpeningKind::Door, None),
+                opening(2, 2, 2.0, 1.0, 1.0, 0.8, OpeningKind::Window, Some(0.05)),
+            ],
+            profiles: vec![SegmentProfile { segment: 1, profile: gable, top_points }],
+        },
+    );
+    one(
+        &mut doc,
+        Command::CreateElement { name: "Run 1".to_owned(), members: vec![closed], level: second },
+    );
+    let open = one(
+        &mut doc,
+        Command::CreateWallRun {
+            base: ground,
+            top: Some(ceiling),
+            points: points(&[[10.0, 0.0], [14.0, 0.0], [16.0, 3.0]]),
+            closed: false,
+            thickness_m: 0.15,
+            height_m: 2.7,
+            top_offset_m: -0.1,
+            openings: vec![opening(0, 1, 0.8, 1.0, 1.0, 1.0, OpeningKind::Window, None)],
+            profiles: vec![],
+        },
+    );
+    one(
+        &mut doc,
+        Command::CreateElement { name: "Run 2".to_owned(), members: vec![open], level: ground },
+    );
     doc
 }
 
@@ -444,6 +537,36 @@ fn write_fixture_v3() {
     }
     let bytes = build_project_v3().save().expect("save");
     std::fs::write(FIXTURE_V3, bytes).expect("write fixture");
+}
+
+#[test]
+#[ignore = "generator: writes the fixture only when VIMD_WRITE_COMPAT_FIXTURE is set"]
+fn write_fixture_v4() {
+    if std::env::var_os("VIMD_WRITE_COMPAT_FIXTURE").is_none() {
+        return;
+    }
+    let bytes = build_project_v4().save().expect("save");
+    std::fs::write(FIXTURE_V4, bytes).expect("write fixture");
+}
+
+#[test]
+fn saved_wall_run_project_loads_evaluates_and_resaves_identically() {
+    let bytes = std::fs::read(FIXTURE_V4).expect("read fixture");
+    let mut doc = Document::load(&bytes).expect("a saved project must still load");
+    doc.debug_validate().expect("loaded graph is consistent");
+    assert_eq!(doc.save().expect("save"), bytes, "load -> save must reproduce the saved bytes");
+    let count = |kind: EntityKind| doc.entities().filter(|(_, r)| r.kind() == kind).count();
+    assert_eq!(count(EntityKind::Workplane), 1);
+    assert_eq!(count(EntityKind::Sketch), 1);
+    assert_eq!(count(EntityKind::Wall), 4);
+    assert_eq!(count(EntityKind::WallRun), 2);
+    assert_eq!(count(EntityKind::Element), 7);
+    let mut engine = Engine::new();
+    engine.evaluate_pending(&mut doc);
+    let updates = engine.poll_updates(&doc);
+    assert!(updates.errors.is_empty(), "{:?}", updates.errors);
+    assert_eq!(updates.meshes.len(), 7);
+    assert_eq!(build_project_v4().save().expect("save"), bytes, "generator reproduces it");
 }
 
 #[test]

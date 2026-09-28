@@ -72,6 +72,16 @@ pub enum VimStatus {
     /// that is not positive, an invalid opening size, an invalid segment
     /// profile). `wall_run::validate_structure` names the exact problem.
     InvalidWallRun = 24,
+    /// A room fails structural validation (fewer than three points, a
+    /// duplicate id, a non-finite coordinate, a hidden edge that is not a
+    /// boundary edge). `room::validate_structure` names the problem.
+    InvalidRoom = 25,
+    /// A room layout fails structural validation (a thickness or height
+    /// that is not positive, a non-finite value, a duplicate or invalid
+    /// opening, an opening on a room or edge outside the layout, a room
+    /// on another plane or already in another layout).
+    /// `room_layout::validate_structure` names most problems.
+    InvalidRoomLayout = 26,
 }
 
 impl VimStatus {

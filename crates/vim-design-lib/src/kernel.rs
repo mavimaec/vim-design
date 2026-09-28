@@ -1296,38 +1296,53 @@ pub(crate) fn polyhedron_solid(
     points: &[[f64; 3]],
     faces: &[(Vec<usize>, Option<ProvenancePath>)],
 ) -> Result<KernelSolid, KernelError> {
+    let faces: Vec<(Vec<Vec<usize>>, Option<ProvenancePath>)> =
+        faces.iter().map(|(ring, name)| (vec![ring.clone()], name.clone())).collect();
+    polyhedron_solid_with_holes(points, &faces)
+}
+
+/// [`polyhedron_solid`] with faces that have holes: each face is an
+/// outer loop (counter-clockwise seen from outside) followed by hole
+/// loops (clockwise).
+pub(crate) fn polyhedron_solid_with_holes(
+    points: &[[f64; 3]],
+    faces: &[(Vec<Vec<usize>>, Option<ProvenancePath>)],
+) -> Result<KernelSolid, KernelError> {
     guard(|| {
         let vertices: Vec<MtVertex> = points.iter().map(|p| builder::vertex(point3(*p))).collect();
         let mut edges: std::collections::HashMap<(usize, usize), MtEdge> =
             std::collections::HashMap::new();
         let mut shell_faces: Vec<MtFace> = Vec::with_capacity(faces.len());
         let mut provenance = Vec::with_capacity(faces.len());
-        for (ring, name) in faces {
-            let n = ring.len();
-            if n < 3 {
-                return Err(KernelError::Topology("a polyhedron face needs three vertices".to_owned()));
-            }
-            let mut wire_edges: Vec<MtEdge> = Vec::with_capacity(n);
-            for i in 0..n {
-                let (Some(&a), Some(&b)) = (ring.get(i), ring.get((i + 1) % n)) else {
-                    return Err(KernelError::Topology("polyhedron face index".to_owned()));
-                };
-                let edge = if let Some(e) = edges.get(&(a, b)) {
-                    e.clone()
-                } else if let Some(e) = edges.get(&(b, a)) {
-                    e.inverse()
-                } else {
-                    let (Some(va), Some(vb)) = (vertices.get(a), vertices.get(b)) else {
-                        return Err(KernelError::Topology("polyhedron vertex index".to_owned()));
+        for (rings, name) in faces {
+            let mut wires: Vec<MtWire> = Vec::with_capacity(rings.len());
+            for ring in rings {
+                let n = ring.len();
+                if n < 3 {
+                    return Err(KernelError::Topology("a polyhedron face needs three vertices".to_owned()));
+                }
+                let mut wire_edges: Vec<MtEdge> = Vec::with_capacity(n);
+                for i in 0..n {
+                    let (Some(&a), Some(&b)) = (ring.get(i), ring.get((i + 1) % n)) else {
+                        return Err(KernelError::Topology("polyhedron face index".to_owned()));
                     };
-                    let e: MtEdge = builder::line(va, vb);
-                    edges.insert((a, b), e.clone());
-                    e
-                };
-                wire_edges.push(edge);
+                    let edge = if let Some(e) = edges.get(&(a, b)) {
+                        e.clone()
+                    } else if let Some(e) = edges.get(&(b, a)) {
+                        e.inverse()
+                    } else {
+                        let (Some(va), Some(vb)) = (vertices.get(a), vertices.get(b)) else {
+                            return Err(KernelError::Topology("polyhedron vertex index".to_owned()));
+                        };
+                        let e: MtEdge = builder::line(va, vb);
+                        edges.insert((a, b), e.clone());
+                        e
+                    };
+                    wire_edges.push(edge);
+                }
+                wires.push(wire_edges.into());
             }
-            let wire: MtWire = wire_edges.into();
-            let face: MtFace = builder::try_attach_plane(vec![wire]).map_err(|e| match e {
+            let face: MtFace = builder::try_attach_plane(wires).map_err(|e| match e {
                 monstertruck_modeling::errors::Error::WireNotInOnePlane => KernelError::NotPlanar,
                 other => KernelError::Topology(other.to_string()),
             })?;
@@ -1344,6 +1359,54 @@ pub(crate) fn polyhedron_solid(
             direct_mesh: true,
         })
     })
+}
+
+/// A straight prism as a polyhedron: the profile `loops` (outer ring
+/// counter-clockwise about `direction`, then clockwise holes) with a
+/// name per ring edge, swept by `direction`; the profile-side cap is
+/// `start_cap`, the far one `end_cap`. Cheaper than [`prism_solid`]:
+/// no sweep and no face classification.
+pub(crate) fn polyhedron_prism(
+    loops: &[PrismLoop],
+    direction: [f64; 3],
+    start_cap: ProvenancePath,
+    end_cap: ProvenancePath,
+) -> Result<KernelSolid, KernelError> {
+    let mut points: Vec<[f64; 3]> = Vec::new();
+    let mut starts: Vec<usize> = Vec::with_capacity(loops.len());
+    for ring in loops {
+        starts.push(points.len());
+        points.extend(ring.points.iter().copied());
+    }
+    let count = points.len();
+    let far: Vec<[f64; 3]> = points
+        .iter()
+        .map(|p| [p[0] + direction[0], p[1] + direction[1], p[2] + direction[2]])
+        .collect();
+    points.extend(far);
+    let mut faces: Vec<(Vec<Vec<usize>>, Option<ProvenancePath>)> = Vec::new();
+    // Start cap: seen from outside (against `direction`), the rings run
+    // the other way.
+    let start_rings: Vec<Vec<usize>> = loops
+        .iter()
+        .zip(starts.iter())
+        .map(|(ring, s)| (0..ring.points.len()).rev().map(|i| s + i).collect())
+        .collect();
+    let end_rings: Vec<Vec<usize>> = loops
+        .iter()
+        .zip(starts.iter())
+        .map(|(ring, s)| (0..ring.points.len()).map(|i| count + s + i).collect())
+        .collect();
+    faces.push((start_rings, Some(start_cap)));
+    faces.push((end_rings, Some(end_cap)));
+    for (ring, s) in loops.iter().zip(starts.iter()) {
+        let n = ring.points.len();
+        for i in 0..n {
+            let (a, b) = (s + i, s + (i + 1) % n);
+            faces.push((vec![vec![a, b, count + b, count + a]], ring.names.get(i).cloned().flatten()));
+        }
+    }
+    polyhedron_solid_with_holes(&points, &faces)
 }
 
 /// Rebuild the face-provenance vector for `solid` from its sweep model.

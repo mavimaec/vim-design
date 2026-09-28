@@ -263,6 +263,17 @@
 //! self-crossing line, an opening in a join zone) is a per-entity
 //! [`EvalErrorKind::Degenerate`] error.
 //!
+//! # Rooms and room layouts
+//!
+//! A `Room` evaluates to its own data ([`Evaluated::Room`], compared for
+//! the early cutoff). A `RoomLayout` evaluates to
+//! [`Evaluated::RoomLayout`]: the arrangement of its rooms (precedence
+//! cuts into effective regions), the wall graph and its centered
+//! footprint, and one prism per height layer and plan piece, named
+//! `RoomWall` / `LayoutCap`. A layout with an invalid room or a misfit
+//! opening leaves that part out and is in error WITH its current value
+//! (the engine records the diagnostic and keeps the value and mesh).
+//!
 //! # Meshing
 //!
 //! Solids built from planar 2D data (sketch prisms, walls, wall runs)
@@ -308,6 +319,6 @@ mod types;
 pub use engine::Engine;
 pub use types::{
     BaseTransformUpdate, EvalDiag, EvalErrorKind, EvalState, Evaluated, IDENTITY_TRANSFORM,
-    InstanceUpdate, Mesh, MeshUpdate,
+    InstanceUpdate, LayoutValue, Mesh, MeshUpdate,
     QueryResolution, SubRefResolution, Submesh, Updates,
 };

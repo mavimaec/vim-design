@@ -182,6 +182,8 @@ pub(crate) fn compute_spaces(
                 | EntityKind::Sketch
                 | EntityKind::Wall
                 | EntityKind::WallRun
+                | EntityKind::Room
+                | EntityKind::RoomLayout
         )
     };
 
@@ -209,6 +211,14 @@ pub(crate) fn compute_spaces(
                         Space::World
                     } else {
                         plane_space(graph, record, slot::WALL_RUN_BASE)
+                    }
+                }
+                EntityKind::Room => plane_space(graph, record, slot::ROOM_PLANE),
+                EntityKind::RoomLayout => {
+                    if record.inputs.get(slot::ROOM_LAYOUT_TOP).is_some_and(|s| !s.is_empty()) {
+                        Space::World
+                    } else {
+                        plane_space(graph, record, slot::ROOM_LAYOUT_PLANE)
                     }
                 }
                 // An explicit Plane input anchors the entity to world
@@ -341,6 +351,7 @@ fn value_equal(a: &Evaluated, b: &Evaluated) -> bool {
         (Evaluated::Wire(x), Evaluated::Wire(y)) => x == y,
         (Evaluated::Material, Evaluated::Material) => true,
         (Evaluated::Site, Evaluated::Site) => true,
+        (Evaluated::Room(x), Evaluated::Room(y)) => x == y,
         (
             Evaluated::Frame {
                 origin: ao,
@@ -375,6 +386,9 @@ fn value_equal(a: &Evaluated, b: &Evaluated) -> bool {
 /// structural, not evaluation — both unaffected by this exemption.
 fn evaluation_inputs(record: &EntityRecord) -> Vec<EntityId> {
     match record.kind() {
+        // A room is its params: its plane only places it through its
+        // layout.
+        EntityKind::Room => Vec::new(),
         EntityKind::Element => record
             .inputs
             .get(slot::ELEMENT_MEMBERS)
@@ -1033,6 +1047,9 @@ pub(crate) fn evaluate_entity(
                     }
                     // A sketch member contributes all of its prisms.
                     Evaluated::SolidSet(prisms) => members.extend(prisms.iter().cloned()),
+                    Evaluated::RoomLayout(value) => members.extend(value.solids.iter().cloned()),
+                    // A room is data: its walls come from its layout.
+                    Evaluated::Room(_) => {}
                     other => {
                         return Err(diag(
                             EvalErrorKind::UpstreamError,
@@ -1243,6 +1260,10 @@ pub(crate) fn evaluate_entity(
         }
         EntityKind::Wall => evaluate_wall(record, lookup, own_space, tol),
         EntityKind::WallRun => evaluate_wall_run(record, lookup, own_space, tol),
+        EntityKind::Room => crate::room::RoomData::from_params(&record.params)
+            .map(|room| Evaluated::Room(Box::new(room)))
+            .ok_or_else(|| params_mismatch(record)),
+        EntityKind::RoomLayout => evaluate_room_layout(record, lookup, own_space),
     }
 }
 
@@ -1595,6 +1616,79 @@ fn evaluate_wall_run(
         }
     }
     Ok(Evaluated::SolidSet(solids))
+}
+
+/// Evaluate a room layout: its rooms' arrangement, the wall footprint,
+/// and one prism per height layer and plan piece, named by room edge,
+/// opening, and height.
+fn evaluate_room_layout(
+    record: &EntityRecord,
+    lookup: &Lookup<'_>,
+    own_space: Space,
+) -> Result<Evaluated, EvalDiag> {
+    use crate::room_layout::{LayoutInput, RoomLayoutData};
+    use crate::subref::ProvenancePath;
+
+    let layout = RoomLayoutData::from_params(&record.params).ok_or_else(|| params_mismatch(record))?;
+    let base = plane_frame(lookup, single_id(record, slot::ROOM_LAYOUT_PLANE), "plane", own_space)?;
+    let height = top_reference(
+        record,
+        lookup,
+        &base,
+        slot::ROOM_LAYOUT_TOP,
+        layout.height_m,
+        layout.top_offset_m,
+    )?;
+    let rooms = multi_ids(record, slot::ROOM_LAYOUT_ROOMS)
+        .into_iter()
+        .filter_map(|id| match lookup.value(id) {
+            Some(Evaluated::Room(room)) => Some((id, (**room).clone())),
+            _ => None,
+        })
+        .collect();
+    let input = LayoutInput { layout, rooms };
+    let plan = crate::room_layout::plan(&input, height)
+        .map_err(|err| diag(EvalErrorKind::Degenerate, format!("room layout: {err}")))?;
+    let z = base.z_axis;
+    let at = |uv: [f64; 2], h: f64| -> [f64; 3] {
+        [
+            base.origin[0] + uv[0] * base.x_axis[0] + uv[1] * base.y_axis[0] + h * z[0],
+            base.origin[1] + uv[0] * base.x_axis[1] + uv[1] * base.y_axis[1] + h * z[1],
+            base.origin[2] + uv[0] * base.x_axis[2] + uv[1] * base.y_axis[2] + h * z[2],
+        ]
+    };
+    let z_um = |h: f64| (h * 1.0e6).round() as i64;
+    let mut solids = Vec::new();
+    for layer in &plan.layers {
+        let rise = layer.z1 - layer.z0;
+        let extrude = [rise * z[0], rise * z[1], rise * z[2]];
+        for (shape, names) in layer.shapes.iter().zip(layer.names.iter()) {
+            let loops: Vec<kernel::PrismLoop> = shape
+                .iter()
+                .zip(names.iter())
+                .map(|(ring, names)| kernel::PrismLoop {
+                    points: ring.iter().map(|p| at(*p, layer.z0)).collect(),
+                    names: names.clone(),
+                })
+                .collect();
+            if loops.is_empty() {
+                continue;
+            }
+            let solid = kernel::polyhedron_prism(
+                &loops,
+                extrude,
+                ProvenancePath::LayoutCap { z_um: z_um(layer.z0), up: false },
+                ProvenancePath::LayoutCap { z_um: z_um(layer.z1), up: true },
+            )
+            .map_err(kernel_diag)?;
+            solids.push((record.id, solid, None));
+        }
+    }
+    Ok(Evaluated::RoomLayout(Box::new(super::types::LayoutValue {
+        solids,
+        regions: plan.regions,
+        issues: plan.issues,
+    })))
 }
 
 fn params_mismatch(record: &EntityRecord) -> EvalDiag {

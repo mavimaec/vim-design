@@ -132,6 +132,25 @@ Plus two kinds from the authoring-tool direction (2026-08-23, see
   the TOP of a `Wall` or `WallRun` disconnects it (it keeps its current height as a
   fixed height, in the same undo step); deleting its base deletes it. See AUTHORING.md
   §11.
+- **`Room`** — data: a `name`, a `precedence`, a closed counter-clockwise `boundary` of
+  run points (stable ids; an edge is named by its start point id), and `hidden_edges`
+  (edges that generate no wall). Slot 0 `plane` (required, a construction plane). It
+  evaluates to its own data (`Evaluated::Room`) and generates no geometry by itself.
+  Structural problems reject (`InvalidRoom`); a self-crossing, zero-area, or clockwise
+  boundary is reported by its layout.
+- **`RoomLayout`** — the wall network of the rooms of one plane: `thickness_m`,
+  `height_m` / `top_offset_m` (as for `WallRun`), and `openings` anchored to room edges
+  (`RoomOpening { id, room, edge, offset_m, sill_m, width_m, height_m, kind, depth_m }`).
+  Slots: 0 `plane` (required), 1 `top` (optional), 2 `rooms` (multi, `Room`; each room on
+  the layout's plane and in one layout at most). Rooms are cut by higher-precedence rooms
+  into non-overlapping effective regions; the edges of all regions form one wall graph (a
+  boundary shared by two rooms is one wall), walls are centered on it, and the openings
+  cut layered prisms. It evaluates to `Evaluated::RoomLayout` (the solids plus every
+  room's region and the issues); `Engine::room_regions` and `Engine::room_layout_issues`
+  expose them. Structural problems reject (`InvalidRoomLayout`); an invalid room or an
+  opening that does not fit leaves that part out and makes the layout a per-entity error
+  while the rest still evaluates (§6.4). `DeleteRoom` removes the room from its layout
+  and drops its openings in the same undo step. See AUTHORING.md §12.
 
 > Note: `Element`/`Instance` commands (`CreateElement`, `CreateInstance`, …) extend the
 > command list in the requirements; they fall out of the performance requirement (§8 of
@@ -192,6 +211,10 @@ the wrong face. The rule here, mandatory from the first evaluator onward:
   the part (`Reference`, `Opposite`, `Top`, `Bottom`, `Start`, `End`,
   `Opening { opening }`, `NicheBack { depth_um }`, `ProfileVoid { face }`). A face split
   by an opening or built from several pieces keeps one name.
+- A room layout's vertical faces are `RoomWall { room, edge, part }` (part `Inside`,
+  `Outside`, `End`, `Opening { opening }`, `NicheBack { opening }`): a wall face is named
+  by the room edge whose room it faces, a face toward no room by the first covering room
+  edge (rank order) as `Outside`. Its horizontal faces are `LayoutCap { z_um, up }`.
 - Commands and slots reference subelements **only via `SubRef`** (or its set-valued
   sibling `SubRefSet`, a provenance *query* — §3.5), **never by index**.
 
@@ -468,7 +491,10 @@ The caller-facing output contract:
 If an entity fails to evaluate (kernel error), it is marked `EvalState::Error` with a
 diagnostic; its last successful geometry is retained and flagged stale. Downstream
 entities evaluate against the stale value where possible, or inherit the error state.
-The FFI exposes a query for entities in error state. The *command* that introduced the
+The FFI exposes a query for entities in error state. A room layout can be in error
+with a CURRENT value: an invalid room or an opening that does not fit is left out, the
+rest evaluates and meshes, and the diagnostic lists what was left out (`LayoutIssue`).
+The *command* that introduced the
 bad parameters still succeeded (it validly changed parameters) and is still undoable —
 undo is the escape hatch.
 
