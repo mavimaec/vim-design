@@ -82,6 +82,16 @@ const WORKPLANE_OFFSET_RANGE_M = 6.0;
 /** Level sheet: the elevation stepper step and slider range (meters). */
 const LEVEL_ELEVATION_STEP_M = 0.1;
 const LEVEL_ELEVATION_RANGE_M = 30.0;
+/** Plan span diagram: strip height (px), the scale's margins (m), the
+ *  handle step (m) and level snap radius (px), the opacity step. */
+const SPAN_DIAGRAM_H = 300;
+const SPAN_DIAGRAM_H_PHONE = 260;
+const SPAN_DIAGRAM_DEFAULT_STORY_M = 3.0;
+const SPAN_DIAGRAM_PAD_M = 0.4;
+const SPAN_DIAGRAM_ABOVE_M = 1.2;
+const SPAN_STEP_M = 0.05;
+const SPAN_SNAP_PX = 8;
+const SPAN_OPACITY_STEP = 0.05;
 /** Range of the wall top offset slider (meters, either way). */
 const WALL_TOP_OFFSET_RANGE_M = 3.0;
 /** A wall opening whose bottom is below this (m above the base) is a door. */
@@ -1509,6 +1519,7 @@ async function main() {
     renderLevelChip();
     renderChrome();
     if (sheetPage === "levels") renderSheet();
+    retargetLevelSheet();
     requestRender();
     sessionSave();
   }
@@ -2385,6 +2396,7 @@ async function main() {
     if (!sheetPage) return;
     $("sheet-title").textContent = PAGE_TITLES[sheetPage] ?? "";
     $("sheet-back").hidden = sheetStack.length === 0;
+    $("sheet-chip").hidden = true; // the Level and Workplane sheets show it
     const pages = {
       menu: pageMenu, levels: pageLevels, project: pageProject, about: pageAbout, properties: pageProperties,
       model: () => renderTree(sheetBody),
@@ -2633,6 +2645,7 @@ async function main() {
   }
   function activatePlane(id) {
     app.set_active_plane(id);
+    retargetLevelSheet();
     stats = JSON.parse(app.stats_json());
     renderLevelChip();
     renderChrome();
@@ -3318,13 +3331,7 @@ async function main() {
     const nameInput = el("input", { type: "text", class: "wide", id: "wp-name", value: w.name, autocomplete: "off" });
     nameInput.addEventListener("input", () => { app.update_workplane_name(id, nameInput.value); refresh(); });
     nameInput.addEventListener("change", () => app.end_gesture());
-    const color = el("input", { type: "color", id: "wp-color", "aria-label": "Workplane color", value: floatToHex(w.color) });
-    color.addEventListener("input", () => {
-      const [r, g, b] = hexToFloat(color.value);
-      app.update_workplane_color(id, r, g, b);
-      refresh();
-    });
-    color.addEventListener("change", () => app.end_gesture());
+    sheetChip(w.color, (r, g, b) => app.update_workplane_color(id, r, g, b), "Workplane color");
     sheetBody.replaceChildren(
       el("div", { class: "group kind-group" }, el("span", { class: "kind-badge", html: `${svg(TREE_ICON.plane)} Workplane` })),
       group(null,
@@ -3332,7 +3339,6 @@ async function main() {
         el("div", { class: "field" }, el("label", { for: "wp-parent-picker", text: "In" }), parentPicker(w)),
         el("div", { class: "field" }, el("span", { class: "field-label", text: "Path" }), el("span", { class: "value", id: "wp-parent", text: w.path })),
         el("div", { class: "field" }, el("span", { class: "field-label", text: "Elevation" }), el("span", { class: "value", id: "wp-elevation", text: fmtM(w.elevation) })),
-        el("div", { class: "field" }, el("label", { for: "wp-color", text: "Color" }), color),
       ),
       measureGroup({
         title: "Offset", label: `Above ${w.parentName}`, id: "wp-offset", value: w.offset,
@@ -3387,7 +3393,7 @@ async function main() {
     if (!$("wp-name")) return;
     $("sheet-title").textContent = w.name;
     guardAssign($("wp-name"), w.name);
-    guardAssign($("wp-color"), floatToHex(w.color));
+    guardAssign($("sheet-chip-input"), floatToHex(w.color));
     guardAssign($("wp-offset"), w.offset.toFixed(2));
     guardAssign($("wp-offset-slider"), String(w.offset));
     $("wp-parent").textContent = w.path;
@@ -3466,6 +3472,22 @@ async function main() {
   }
 
   // -- Level sheet (the tree's pencil on a level row) ------------------------------------------
+  /** The sheet header's color chip is the color picker (Level and
+   *  Workplane sheets): live while dragging, one undo step per pick. */
+  function sheetChip(color, apply, label) {
+    const chip = $("sheet-chip"), input = $("sheet-chip-input");
+    chip.hidden = false;
+    input.setAttribute("aria-label", label);
+    input.value = floatToHex(color);
+    input.oninput = () => { const [r, g, b] = hexToFloat(input.value); apply(r, g, b); refresh(); };
+    input.onchange = () => app.end_gesture();
+  }
+  /** An open Level sheet follows the active level (tree tap, level chip). */
+  function retargetLevelSheet() {
+    if (sheetPage !== "level") return;
+    const active = JSON.parse(app.levels_json()).activeId;
+    if (active != null && active !== levelFor) { levelFor = active; pageLevel(); }
+  }
   let levelFor = null;
   function openLevel(id) {
     levelFor = id;
@@ -3480,9 +3502,7 @@ async function main() {
     const nameInput = el("input", { type: "text", class: "wide", id: "lvl-name", value: l.name, autocomplete: "off" });
     nameInput.addEventListener("input", () => { app.update_level_name(id, nameInput.value); refresh(); });
     nameInput.addEventListener("change", () => app.end_gesture());
-    const color = el("input", { type: "color", id: "lvl-color", "aria-label": "Level color", value: floatToHex(l.color) });
-    color.addEventListener("input", () => { const [r, g, b] = hexToFloat(color.value); app.update_level_color(id, r, g, b); refresh(); });
-    color.addEventListener("change", () => app.end_gesture());
+    sheetChip(l.color, (r, g, b) => app.update_level_color(id, r, g, b), "Level color");
     const story = el("input", { type: "checkbox", id: "lvl-story" });
     story.checked = l.isStory;
     story.addEventListener("change", () => { app.update_level_story(id, story.checked); app.end_gesture(); refresh(); });
@@ -3490,7 +3510,6 @@ async function main() {
       el("div", { class: "group kind-group" }, el("span", { class: "kind-badge", html: `${svg(TREE_ICON.plane)} Level` })),
       group(null,
         el("div", { class: "field" }, el("label", { for: "lvl-name", text: "Name" }), nameInput),
-        el("div", { class: "field" }, el("label", { for: "lvl-color", text: "Color" }), color),
         el("div", { class: "field" }, el("label", { for: "lvl-story", text: "Building story" }), el("label", { class: "switch" }, story, el("span"))),
         el("div", { class: "field" }, el("span", { class: "field-label", text: "Contents" }),
           el("span", { class: "value", id: "lvl-contents", text: `${l.elements} element${l.elements === 1 ? "" : "s"}` })),
@@ -3501,7 +3520,7 @@ async function main() {
         apply: (v) => app.update_level_elevation(id, v),
         current: () => levelInfo()?.elevation ?? 0,
       }),
-      el("div", { id: "lvl-span" }),
+      group("Plan span", (spanView = spanDiagram(id)).node),
       el("div", { class: "btn-row", style: "margin-bottom:10px" },
         el("button", {
           type: "button", class: "btn", id: "lvl-activate", html: `${svg(TREE_ICON.plane)} Draw on it`,
@@ -3519,81 +3538,274 @@ async function main() {
     );
     updateLevel();
   }
-  /** The level's plan span: where the normally drawn band ends above
-   *  (the next story, or an offset) and below, the plan cut, and the
-   *  opacity of what lies above and below it. The first change creates
-   *  the level's PlanSpan; drags coalesce; Reset returns to defaults. */
-  function renderSpanGroup(box, levelId) {
-    const sp = JSON.parse(app.plan_span_json(levelId));
-    if (!sp) { box.replaceChildren(); return; }
-    const key = JSON.stringify(sp);
-    if (box.dataset.key === key || box.contains(document.activeElement)) return;
-    box.dataset.key = key;
-    const set = (o) => {
-      const reason = app.set_plan_span(levelId, o.top ?? "", o.topOffset ?? NaN, o.cut ?? NaN, o.bottom ?? NaN, o.above ?? NaN, o.below ?? NaN);
-      if (reason) toast(reason, { kind: "error" });
-      refresh();
+  // -- Plan span section diagram ------------------------------------------------------------
+  // A side view of the active level's view range: the story levels near
+  // it (the level itself emphasized), the span band (drawn solid), the
+  // plan cut (dashed), and the regions above and below the span, whose
+  // fill alpha IS the band's opacity (over a checkerboard, so "25 %"
+  // reads as see-through). Top, cut, and bottom are draggable handles
+  // (snapping to 0.05 m and to level elevations; the top locks onto
+  // "Next story"); a drag across a region sets its opacity. Exact values
+  // are numeric fields; everything stays in sync with the document (one
+  // undo step per gesture; a refusal toasts and snaps back).
+  function spanDiagram(levelId) {
+    const H = innerWidth < TREE_DEFAULT_OPEN_MIN_PX ? SPAN_DIAGRAM_H_PHONE : SPAN_DIAGRAM_H;
+    let sp = null, lvl = null, dom = null, drag = null;
+    const node = el("div", { class: "span-diagram", id: "span-diagram" });
+    const strip = el("div", { class: "sd-strip", style: `height:${H}px` });
+    const col = el("div", { class: "sd-col" });
+    const region = (cls, label) => {
+      const r = el("div", { class: `sd-region ${cls}`, tabindex: cls === "sd-span" ? null : "0", role: cls === "sd-span" ? null : "slider" });
+      r.append(el("span", { class: "sd-region-label", text: label }));
+      return r;
     };
-    const now = () => JSON.parse(app.plan_span_json(levelId));
+    const above = region("sd-above", "Above");
+    const band = region("sd-span", "Span");
+    const below = region("sd-below", "Below");
+    const cutLine = el("div", { class: "sd-cut" }, el("span", { class: "sd-cut-label" }));
+    col.append(above, band, below, cutLine);
+    const ticks = el("div", { class: "sd-ticks" });
+    const handle = (kind, label) => el("div", {
+      class: `sd-handle sd-h-${kind}`, role: "slider", tabindex: "0", "data-handle": kind, "aria-label": label,
+      html: `<span class="sd-grip"></span><span class="sd-val"></span>`,
+    });
+    const hTop = handle("top", "Span top"), hCut = handle("cut", "Plan cut"), hBottom = handle("bottom", "Span bottom");
+    strip.append(ticks, col, hTop, hCut, hBottom);
+
+    // Fields (level-relative meters; opacities in %).
+    const num = (id, label, unit) => {
+      const input = el("input", { type: "text", inputmode: "decimal", id, "aria-label": `${label} (${unit})`, class: "sd-num" });
+      return {
+        input,
+        row: el("div", { class: "sd-field sd-stack" }, el("label", { for: id, text: label }),
+          el("span", { class: "sd-input" }, input, el("span", { class: "unit", text: unit }))),
+      };
+    };
+    const fTop = num("span-top", "Top", "m"), fCut = num("span-cut", "Cut", "m"), fBottom = num("span-bottom", "Bottom", "m");
+    const fAbove = num("span-above-pct", "Above", "%"), fBelow = num("span-below-pct", "Below", "%");
+    const slider = (id, label) => el("input", { type: "range", min: "0", max: "1", step: String(SPAN_OPACITY_STEP), id, "aria-label": label, class: "sd-slider" });
+    const sAbove = slider("span-above", "Opacity above the span"), sBelow = slider("span-below", "Opacity below the span");
     const seg = el("div", { class: "seg small", id: "span-top-mode" });
-    for (const [m, label] of [["next", "Next story"], ["offset", "Offset"]]) {
-      seg.append(el("button", {
-        type: "button", text: label, "data-span-top": m, class: sp.top.mode === m ? "on" : "",
-        onclick: () => { if (m !== sp.top.mode) { set({ top: m }); app.end_gesture(); box.dataset.key = ""; renderSpanGroup(box, levelId); } },
-      }));
-    }
-    const pct = (v) => `${Math.round(v * 100)}%`;
-    const opacity = (id, label, value, field) => {
-      const out = el("span", { class: "value", id: `${id}-value`, text: pct(value) });
-      const slider = el("input", { type: "range", min: "0", max: "1", step: "0.05", id, "aria-label": label, style: "width:100%;accent-color:var(--accent)" });
-      slider.value = String(value);
-      slider.addEventListener("input", () => { set({ [field]: Number(slider.value) }); out.textContent = pct(Number(slider.value)); });
-      slider.addEventListener("change", () => app.end_gesture());
-      return [el("div", { class: "field" }, el("label", { for: id, text: label }), out), el("div", { class: "field" }, slider)];
-    };
-    const children = [
-      group("Plan span",
-        el("div", { class: "field" }, el("span", { class: "field-label", text: "Top" }), seg),
-        el("div", { class: "field" }, el("span", { class: "field-label", text: "Band" }),
-          el("span", { class: "value", id: "span-band", text: `${fmtM(sp.bottomZ)} to ${fmtM(sp.topZ)} · cut ${fmtM(sp.cutZ)}` })),
-        ...opacity("span-above", "Above: opacity", sp.above, "above"),
-        ...opacity("span-below", "Below: opacity", sp.below, "below"),
-      ),
-    ];
-    if (sp.topRaised) children.push(el("div", { class: "span-hint", id: "span-raised", text: "The next story is at or below the cut: the span's top is the cut." }));
-    if (sp.top.mode === "offset") {
-      children.push(measureGroup({
-        title: "Span top", label: "Above the level", id: "span-top", value: sp.top.offset,
-        min: 0, max: 10, step: WALL_HEIGHT_STEP_M,
-        apply: (v) => set({ top: "offset", topOffset: v }), current: () => now()?.top.offset ?? 3,
-      }));
-    }
-    children.push(
-      measureGroup({
-        title: "Plan cut", label: "Above the level", id: "span-cut", value: sp.cut,
-        min: 0, max: 6, step: WALL_HEIGHT_STEP_M,
-        apply: (v) => set({ cut: v }), current: () => now()?.cut ?? 1.2,
-      }),
-      measureGroup({
-        title: "Span bottom", label: "From the level", id: "span-bottom", value: sp.bottom,
-        min: -6, max: 3, step: WALL_HEIGHT_STEP_M,
-        apply: (v) => set({ bottom: v }), current: () => now()?.bottom ?? 0,
-      }),
-      el("button", {
-        type: "button", class: "btn block", id: "span-reset", text: "Reset plan span to defaults", disabled: !sp.custom,
-        onclick: () => { if (app.reset_plan_span(levelId)) { refresh(); box.dataset.key = ""; renderSpanGroup(box, levelId); } },
-      }),
+    const segBtn = (m, text) => el("button", { type: "button", text, "data-span-top": m });
+    const bNext = segBtn("next", "Next story"), bOffset = segBtn("offset", "Offset");
+    seg.append(bNext, bOffset);
+    const reset = el("button", { type: "button", class: "btn block", id: "span-reset", text: "Reset plan span to defaults" });
+    const hint = el("div", { class: "span-hint", id: "span-raised", hidden: true, text: "The next story is at or below the cut: the span's top is the cut." });
+    const fields = el("div", { class: "sd-fields" },
+      el("div", { class: "sd-field sd-topmode" }, el("span", { class: "sd-field-label", text: "Span top" }), seg),
+      el("div", { class: "sd-heights" }, fTop.row, fCut.row, fBottom.row),
+      el("div", { class: "sd-opacities" },
+        el("div", { class: "sd-opacity" }, fAbove.row, sAbove),
+        el("div", { class: "sd-opacity" }, fBelow.row, sBelow)),
     );
-    box.replaceChildren(...children);
+    node.append(strip, fields, hint, reset);
+
+    // -- document <-> view ------------------------------------------------------------
+    const read = () => {
+      sp = JSON.parse(app.plan_span_json(levelId));
+      lvl = JSON.parse(app.levels_json()).levels.find((l) => l.id === levelId) ?? null;
+    };
+    /** The vertical scale: from a level below (or 3 m) to two levels above. */
+    const domainOf = () => {
+      const e = lvl.elevation;
+      const stories = JSON.parse(app.levels_json()).levels.filter((l) => l.isStory || l.id === levelId).sort((a, b) => a.elevation - b.elevation);
+      const belowL = stories.filter((l) => l.elevation < e - 1e-6).at(-1);
+      const aboveL = stories.filter((l) => l.elevation > e + 1e-6);
+      const lo = Math.min(sp.bottomZ, belowL ? belowL.elevation : e - SPAN_DIAGRAM_DEFAULT_STORY_M) - SPAN_DIAGRAM_PAD_M;
+      const hi = Math.max(sp.topZ + SPAN_DIAGRAM_ABOVE_M, (aboveL[1] ?? aboveL[0])?.elevation ?? e + SPAN_DIAGRAM_DEFAULT_STORY_M) + SPAN_DIAGRAM_PAD_M;
+      return { lo, hi, stories: stories.filter((l) => l.elevation >= lo && l.elevation <= hi) };
+    };
+    const y = (z) => ((dom.hi - z) / (dom.hi - dom.lo)) * H;
+    const zAt = (clientY) => dom.hi - ((clientY - strip.getBoundingClientRect().top) / H) * (dom.hi - dom.lo);
+    const fmtRel = (v) => (Math.abs(v) < 0.005 ? "0.00" : `${v > 0 ? "+" : "−"}${Math.abs(v).toFixed(2)}`);
+    const pct = (v) => `${Math.round(v * 100)}`;
+    /** Draw everything from `v` (the document, or a drag's live values). */
+    const draw = (v) => {
+      const e = lvl.elevation;
+      const [yt, yc, yb] = [y(v.topZ), y(v.cutZ), y(v.bottomZ)];
+      above.style.top = "0px"; above.style.height = `${Math.max(0, yt)}px`;
+      band.style.top = `${yt}px`; band.style.height = `${Math.max(0, yb - yt)}px`;
+      below.style.top = `${yb}px`; below.style.height = `${Math.max(0, H - yb)}px`;
+      above.style.setProperty("--a", String(v.above));
+      below.style.setProperty("--a", String(v.below));
+      above.firstChild.textContent = `Above · ${pct(v.above)} %`;
+      below.firstChild.textContent = `Below · ${pct(v.below)} %`;
+      above.setAttribute("aria-label", `Opacity above: ${pct(v.above)} %`);
+      below.setAttribute("aria-label", `Opacity below: ${pct(v.below)} %`);
+      above.setAttribute("aria-valuenow", pct(v.above)); below.setAttribute("aria-valuenow", pct(v.below));
+      cutLine.style.top = `${yc}px`;
+      cutLine.firstChild.textContent = `Cut ${fmtRel(v.cutZ - e)}`;
+      for (const [h, yy, z, text] of [
+        [hTop, yt, v.topZ, v.top === "next" ? `Top · next story` : `Top ${fmtRel(v.topZ - e)}`],
+        [hCut, yc, v.cutZ, `Cut ${fmtRel(v.cutZ - e)}`],
+        [hBottom, yb, v.bottomZ, `Bottom ${fmtRel(v.bottomZ - e)}`],
+      ]) {
+        h.style.top = `${yy}px`;
+        h.querySelector(".sd-val").textContent = text;
+        h.setAttribute("aria-valuenow", (z - e).toFixed(2));
+        h.setAttribute("aria-valuetext", text);
+      }
+      hTop.classList.toggle("locked", v.top === "next");
+      for (const h of [hTop, hCut, hBottom]) h.classList.toggle("bad", !!v.bad && drag?.kind === h.dataset.handle);
+    };
+    const docValues = () => ({ topZ: sp.topZ, cutZ: sp.cutZ, bottomZ: sp.bottomZ, above: sp.above, below: sp.below, top: sp.top.mode });
+    const update = (force = false) => {
+      read();
+      if (!sp || !lvl) return;
+      const put = force ? (input, v) => { input.value = v; } : guardValue;
+      if (!drag) dom = domainOf();
+      ticks.replaceChildren(...dom.stories.map((l) => el("div", {
+        class: `sd-level${l.id === levelId ? " active" : ""}`, style: `top:${y(l.elevation)}px`,
+        html: `<span class="sd-level-name"></span>`,
+      })));
+      [...ticks.children].forEach((t, i) => {
+        t.firstChild.textContent = dom.stories[i].name;
+        t.title = `${dom.stories[i].name} · ${fmtM(dom.stories[i].elevation)}`;
+      });
+      if (!drag) draw(docValues());
+      put(fTop.input, (sp.topZ - lvl.elevation).toFixed(2));
+      put(fCut.input, sp.cut.toFixed(2));
+      put(fBottom.input, sp.bottom.toFixed(2));
+      put(fAbove.input, pct(sp.above));
+      put(fBelow.input, pct(sp.below));
+      if (force || !sAbove.matches(":active")) sAbove.value = String(sp.above);
+      if (force || !sBelow.matches(":active")) sBelow.value = String(sp.below);
+      bNext.classList.toggle("on", sp.top.mode === "next");
+      bOffset.classList.toggle("on", sp.top.mode === "offset");
+      bNext.setAttribute("aria-pressed", String(sp.top.mode === "next"));
+      bOffset.setAttribute("aria-pressed", String(sp.top.mode === "offset"));
+      reset.disabled = !sp.custom;
+      hint.hidden = !sp.topRaised;
+    };
+    /** One edit (coalesced into the open gesture). Returns "" or why it
+     *  was refused; a refusal outside a drag toasts and snaps back. */
+    const send = (o, { quiet = false } = {}) => {
+      const reason = app.set_plan_span(levelId, o.top ?? "", o.topOffset ?? NaN, o.cut ?? NaN, o.bottom ?? NaN, o.above ?? NaN, o.below ?? NaN);
+      if (reason && !quiet) toast(reason, { kind: "error" });
+      refresh();
+      return reason;
+    };
+    const commit = (o) => { const r = send(o); app.end_gesture(); update(true); return r; };
+
+    // -- handles: drag and keys -----------------------------------------------------------
+    const snapZ = (z, kind) => {
+      const e = lvl.elevation;
+      const px = SPAN_SNAP_PX * (dom.hi - dom.lo) / H;
+      for (const l of dom.stories) if (Math.abs(z - l.elevation) <= px) return { z: l.elevation, level: l };
+      return { z: e + Math.round((z - e) / SPAN_STEP_M) * SPAN_STEP_M, level: null };
+    };
+    /** A handle at world height z: the edit it makes. */
+    const editFor = (kind, z, level) => {
+      const off = +(z - lvl.elevation).toFixed(3);
+      if (kind === "top") {
+        const next = dom.stories.find((l) => l.elevation > lvl.elevation + 1e-6);
+        // On the next story: "Next story" (the top follows it).
+        if (level && next && level.id === next.id) return { top: "next" };
+        return { top: "offset", topOffset: off };
+      }
+      return kind === "cut" ? { cut: off } : { bottom: off };
+    };
+    for (const h of [hTop, hCut, hBottom]) {
+      const kind = h.dataset.handle;
+      h.addEventListener("pointerdown", (ev) => {
+        ev.preventDefault();
+        h.setPointerCapture(ev.pointerId);
+        h.focus({ preventScroll: true });
+        drag = { kind, bad: "", changed: false };
+      });
+      h.addEventListener("pointermove", (ev) => {
+        if (!drag || drag.kind !== kind) return;
+        const { z, level } = snapZ(zAt(ev.clientY), kind);
+        const edit = editFor(kind, z, level);
+        drag.bad = send(edit, { quiet: true });
+        if (!drag.bad) drag.changed = true;
+        read();
+        const live = docValues();
+        if (drag.bad) live[{ top: "topZ", cut: "cutZ", bottom: "bottomZ" }[kind]] = z; // shown where dragged, in red
+        live.bad = drag.bad;
+        draw(live);
+        requestRender();
+      });
+      const end = () => {
+        if (!drag || drag.kind !== kind) return;
+        const { bad, changed } = drag;
+        drag = null;
+        app.end_gesture();
+        if (bad) {
+          // Released where it cannot go: the whole drag is taken back
+          // (its steps were one gesture), and the reason is shown.
+          if (changed && app.undo()) refresh();
+          toast(bad, { kind: "error" });
+        }
+        update(true);
+      };
+      h.addEventListener("pointerup", end);
+      h.addEventListener("pointercancel", end);
+      h.addEventListener("keydown", (ev) => {
+        const step = ev.shiftKey ? SPAN_STEP_M * 5 : SPAN_STEP_M;
+        const d = ev.key === "ArrowUp" ? step : ev.key === "ArrowDown" ? -step : 0;
+        if (!d) return;
+        ev.preventDefault();
+        const z = { top: sp.topZ, cut: sp.cutZ, bottom: sp.bottomZ }[kind] + d;
+        commit(kind === "top" ? { top: "offset", topOffset: +(z - lvl.elevation).toFixed(3) } : editFor(kind, z, null));
+      });
+    }
+    // -- regions: a drag across sets the opacity; keys step it ----------------------------
+    for (const [r, field] of [[above, "above"], [below, "below"]]) {
+      const setFromX = (ev) => {
+        const b = col.getBoundingClientRect();
+        const a = Math.round(Math.min(1, Math.max(0, (ev.clientX - b.left) / b.width)) / SPAN_OPACITY_STEP) * SPAN_OPACITY_STEP;
+        send({ [field]: +a.toFixed(2) });
+        update();
+        requestRender();
+      };
+      r.addEventListener("pointerdown", (ev) => { ev.preventDefault(); r.setPointerCapture(ev.pointerId); r.dataset.dragging = "1"; setFromX(ev); });
+      r.addEventListener("pointermove", (ev) => { if (r.dataset.dragging) setFromX(ev); });
+      const end = () => { if (r.dataset.dragging) { delete r.dataset.dragging; app.end_gesture(); update(true); } };
+      r.addEventListener("pointerup", end);
+      r.addEventListener("pointercancel", end);
+      r.addEventListener("keydown", (ev) => {
+        const d = ev.key === "ArrowRight" || ev.key === "ArrowUp" ? SPAN_OPACITY_STEP : ev.key === "ArrowLeft" || ev.key === "ArrowDown" ? -SPAN_OPACITY_STEP : 0;
+        if (!d) return;
+        ev.preventDefault();
+        commit({ [field]: +Math.min(1, Math.max(0, sp[field] + d)).toFixed(2) });
+      });
+    }
+    // -- fields -------------------------------------------------------------------------
+    const numField = (f, make, scale = 1) => {
+      f.input.addEventListener("change", () => {
+        const v = parseNum(f.input.value);
+        // A refusal toasts; the field shows the document value again.
+        if (Number.isFinite(v)) commit(make(v / scale)); else update(true);
+      });
+    };
+    numField(fTop, (v) => ({ top: "offset", topOffset: v }));
+    numField(fCut, (v) => ({ cut: v }));
+    numField(fBottom, (v) => ({ bottom: v }));
+    numField(fAbove, (v) => ({ above: Math.min(1, Math.max(0, v)) }), 100);
+    numField(fBelow, (v) => ({ below: Math.min(1, Math.max(0, v)) }), 100);
+    for (const [s2, field, f] of [[sAbove, "above", fAbove], [sBelow, "below", fBelow]]) {
+      s2.addEventListener("input", () => { send({ [field]: Number(s2.value) }); f.input.value = pct(Number(s2.value)); draw({ ...docValues() }); requestRender(); });
+      s2.addEventListener("change", () => { app.end_gesture(); update(true); });
+    }
+    bNext.addEventListener("click", () => commit({ top: "next" }));
+    bOffset.addEventListener("click", () => commit({ top: "offset" }));
+    reset.addEventListener("click", () => {
+      if (app.reset_plan_span(levelId)) { refresh(); toast("Plan span back to the defaults", { ms: 1600 }); }
+      update(true);
+    });
+    update();
+    return { node, update, levelId };
   }
+  let spanView = null;
   function updateLevel() {
     const l = levelInfo();
     if (!l) { closeSheet(false); return; }
     if (!$("lvl-name")) return;
-    renderSpanGroup($("lvl-span"), l.id);
+    if (spanView?.levelId === l.id) spanView.update();
     $("sheet-title").textContent = l.name;
     guardAssign($("lvl-name"), l.name);
-    guardAssign($("lvl-color"), floatToHex(l.color));
+    guardAssign($("sheet-chip-input"), floatToHex(l.color));
     guardAssign($("lvl-story"), l.isStory, "checked");
     guardAssign($("lvl-elevation"), l.elevation.toFixed(2));
     guardAssign($("lvl-elevation-slider"), String(l.elevation));

@@ -338,9 +338,19 @@ drawn far to near, depth-tested, not depth-written; opacity 0 hides the band); t
 view cuts at the span's cut height (a workplane above the cut gets 1.2 m over it). A pick
 passes through a band at or under 30% opacity (the default "above" 25% does), so the work
 inside the span stays pickable. View menu → "Plan span" toggles the bands (session state;
-a dot on the View button when on; the plan still cuts). The Level sheet's Plan span group
-edits Top (Next story | Offset), the cut, the bottom, both opacities, and Reset (the first
-edit creates the level's `PlanSpan`, drags coalesce). Note: floor plates hang below their
+a dot on the View button when on; the plan still cuts). The Level sheet's Plan span group is a
+**section diagram**: a side view with the story levels near the level (the level itself
+emphasized), the span band solid, the plan cut dashed, and the regions above and below
+filled at the band's opacity over a checkerboard (so 25% reads as see-through). Top, cut,
+and bottom are draggable handles (44 px targets; 5 cm steps; they snap to level
+elevations, and the top locks onto "Next story" on the next story level, an Offset
+elsewhere; arrow keys step them); a drag across a region sets its opacity. Exact values
+are fields below (Top mode, top / cut / bottom in meters above the level, opacities in %,
+with sliders); diagram and fields always show the document. Each drag or edit is one undo
+step and the 3D view follows live; a refused value (bottom < cut < top) shows why and
+snaps back (a refused drag release takes the whole drag back). Reset returns to the
+defaults. An open Level sheet follows the active level (tree, level chip); the chip next
+to the name in the Level and Workplane sheet headers is their color picker. Note: floor plates hang below their
 level, so an upper level's slab lies inside the lower story's default span (it reads as
 that story's ceiling); an Offset top below it makes it see-through.
 
