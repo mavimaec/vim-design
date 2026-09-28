@@ -68,7 +68,7 @@ impl EditProfile {
         match self {
             EditProfile::Sketch(s) => s.faces.is_empty(),
             EditProfile::Run(r) => r.data.points.is_empty(),
-            EditProfile::Room(r) => r.room.boundary.is_empty(),
+            EditProfile::Room(r) => r.data.boundary.is_empty(),
         }
     }
 }
@@ -381,8 +381,9 @@ impl AuthorApp {
             return r#"{"result":"none"}"#.to_owned();
         };
         if self.edit_target == EditTarget::Room {
-            let changed = self.end_room_session(true);
+            let changed = self.gestures.end_session(&self.doc);
             self.leave_edit();
+            self.sync("room edit");
             return serde_json::json!({ "result": "confirmed", "changed": changed, "name": session.name }).to_string();
         }
         let empty = session.model.is_empty();
@@ -420,11 +421,6 @@ impl AuthorApp {
     /// Leave Edit Mode discarding the changes: the document returns to
     /// its state at entry.
     pub fn edit_cancel(&mut self) {
-        if self.edit_target == EditTarget::Room && self.edit.take().is_some() {
-            self.end_room_session(false);
-            self.leave_edit();
-            return;
-        }
         if self.edit.take().is_some() {
             self.gestures.cancel_session(&mut self.doc);
             self.leave_edit();
@@ -633,9 +629,6 @@ impl AuthorApp {
     }
 
     pub fn edit_undo(&mut self) -> bool {
-        if self.edit_target == EditTarget::Room {
-            return self.edit.is_some() && self.rooms_undo();
-        }
         if self.edit.is_none() || !self.gestures.undo(&mut self.doc) {
             return false;
         }
@@ -645,9 +638,6 @@ impl AuthorApp {
     }
 
     pub fn edit_redo(&mut self) -> bool {
-        if self.edit_target == EditTarget::Room {
-            return self.edit.is_some() && self.rooms_redo();
-        }
         if self.edit.is_none() || !self.gestures.redo(&mut self.doc) {
             return false;
         }
@@ -898,7 +888,7 @@ impl AuthorApp {
             _ => None,
         };
         if let Some(p) = room {
-            footprint = vec![p.room.polygon().iter().filter_map(|q| proj(*q)).collect()];
+            footprint = vec![p.data.polygon().iter().filter_map(|q| proj(*q)).collect()];
         }
         serde_json::json!({
             "active": true,
@@ -1075,11 +1065,11 @@ impl AuthorApp {
     }
 
     pub(super) fn edit_can_undo(&self) -> bool {
-        if self.edit_target == EditTarget::Room { self.rooms_can_undo() } else { self.gestures.can_undo() }
+        self.gestures.can_undo()
     }
 
     pub(super) fn edit_can_redo(&self) -> bool {
-        if self.edit_target == EditTarget::Room { self.rooms_can_redo() } else { self.gestures.can_redo() }
+        self.gestures.can_redo()
     }
 
     pub(super) fn start_edit(&mut self, session: EditSession<EditProfile>) {
@@ -1095,6 +1085,7 @@ impl AuthorApp {
 
     fn leave_edit(&mut self) {
         self.paste_armed = false;
+        self.room_edit = None;
         if matches!(self.edit_target, EditTarget::Run | EditTarget::Room) {
             if let Some(c) = self.prev_camera.take() {
                 self.camera = c;
@@ -1187,7 +1178,7 @@ impl AuthorApp {
             return self.submit_run_edit(ops::update_run(edit.run, &run.data, false), key, ok);
         }
         if let EditProfile::Room(p) = next {
-            return self.store_room_edit(p.room, ok);
+            return self.store_room_edit(&p, key, ok);
         }
         let EditProfile::Sketch(next) = next else { return r#"{"result":"none"}"#.to_owned() };
         let (plane, name) = (s.level, s.name.clone());

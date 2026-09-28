@@ -31,6 +31,8 @@ pub enum Clip {
     Plate { sketch: Sketch, name: String },
     /// A wall run: its data, its top plane, and its name.
     Run { data: WallRunData, top: Option<EntityId>, base: EntityId, top_height: f64, name: String },
+    /// A room (its layout places it on top of the rooms it overlaps).
+    Room(vim_design_lib::room::RoomData),
 }
 
 impl Clip {
@@ -39,7 +41,7 @@ impl Clip {
         match self {
             Clip::Faces(_) => "faces",
             Clip::Openings(_) => "openings",
-            Clip::Plate { .. } | Clip::Run { .. } => "element",
+            Clip::Plate { .. } | Clip::Run { .. } | Clip::Room(_) => "element",
         }
     }
 
@@ -54,6 +56,7 @@ impl Clip {
             },
             Clip::Openings(o) => format!("{} openings", o.len()),
             Clip::Plate { name, .. } | Clip::Run { name, .. } => name.clone(),
+            Clip::Room(r) => r.name.clone(),
         }
     }
 
@@ -64,6 +67,7 @@ impl Clip {
             Clip::Faces(f) => f.iter().map(|(o, _)| (o.clone(), true)).collect(),
             Clip::Plate { sketch, .. } => sketch_outlines(sketch),
             Clip::Run { data, .. } => vec![(data.points.iter().map(|p| p.uv).collect(), data.closed)],
+            Clip::Room(r) => vec![(r.polygon(), true)],
             Clip::Openings(_) => Vec::new(),
         }
     }

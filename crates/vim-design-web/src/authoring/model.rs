@@ -199,6 +199,57 @@ impl WallModel {
     }
 }
 
+/// The walls of a plane's rooms: the element that owns the plane's
+/// `RoomLayout` (its mesh). The rooms themselves are not elements (see
+/// [`RoomModel`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RoomWallsModel {
+    pub element: EntityId,
+    pub name: String,
+    pub level: EntityId,
+    pub layout: EntityId,
+    pub plane: EntityId,
+    pub top: Option<EntityId>,
+    pub rooms: Vec<EntityId>,
+    pub data: vim_design_lib::room_layout::RoomLayoutData,
+    /// Top reference height H above the plane (`layout_top_height`).
+    pub top_height: f64,
+}
+
+/// A room: data on a construction plane, grouped under the plane's root
+/// level; its walls come from the plane's layout.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RoomModel {
+    pub room: EntityId,
+    pub plane: EntityId,
+    /// The plane's root level (the tree groups rooms under it).
+    pub level: Option<EntityId>,
+    pub layout: Option<EntityId>,
+    pub data: vim_design_lib::room::RoomData,
+}
+
+/// Every room of the document.
+pub fn rooms(doc: &Document) -> Vec<RoomModel> {
+    let layouts: Vec<(EntityId, Vec<EntityId>)> = doc
+        .entities()
+        .filter(|(_, r)| matches!(r.params, Params::RoomLayout { .. }))
+        .map(|(id, _)| (*id, input_of(doc, *id, slot::ROOM_LAYOUT_ROOMS)))
+        .collect();
+    doc.entities()
+        .filter_map(|(id, r)| {
+            let data = vim_design_lib::room::RoomData::from_params(&r.params)?;
+            let plane = first_input(doc, *id, slot::ROOM_PLANE)?;
+            Some(RoomModel {
+                room: *id,
+                plane,
+                level: vim_design_lib::workplane::root_level(doc, plane),
+                layout: layouts.iter().find(|(_, rooms)| rooms.contains(id)).map(|(l, _)| *l),
+                data,
+            })
+        })
+        .collect()
+}
+
 /// A wall run (the library's `WallRun`, the current wall tool).
 #[derive(Debug, Clone, PartialEq)]
 pub struct WallRunModel {
@@ -301,6 +352,7 @@ pub enum ElementModel {
     Run(WallRunModel),
     Wall(WallModel),
     LegacyWall(LegacyWallModel),
+    RoomWalls(RoomWallsModel),
     Other(OtherModel),
 }
 
@@ -312,6 +364,7 @@ impl ElementModel {
             ElementModel::Run(r) => r.element,
             ElementModel::Wall(w) => w.element,
             ElementModel::LegacyWall(w) => w.element,
+            ElementModel::RoomWalls(r) => r.element,
             ElementModel::Other(o) => o.element,
         }
     }
@@ -323,6 +376,7 @@ impl ElementModel {
             ElementModel::Run(r) => &r.name,
             ElementModel::Wall(w) => &w.name,
             ElementModel::LegacyWall(w) => &w.name,
+            ElementModel::RoomWalls(r) => &r.name,
             ElementModel::Other(o) => &o.name,
         }
     }
@@ -334,6 +388,7 @@ impl ElementModel {
             ElementModel::Run(r) => Some(r.level),
             ElementModel::Wall(w) => Some(w.level),
             ElementModel::LegacyWall(w) => Some(w.level),
+            ElementModel::RoomWalls(r) => Some(r.level),
             ElementModel::Other(o) => o.level,
         }
     }
@@ -342,6 +397,7 @@ impl ElementModel {
         match self {
             ElementModel::Plate(_) | ElementModel::SketchPlate(_) => "floor_plate",
             ElementModel::Run(_) | ElementModel::Wall(_) | ElementModel::LegacyWall(_) => "wall",
+            ElementModel::RoomWalls(_) => "room_walls",
             ElementModel::Other(_) => "element",
         }
     }
@@ -354,8 +410,9 @@ impl ElementModel {
         }
     }
 
+    /// Walls of any kind, room walls included (the plan cut, picking).
     pub fn is_wall(&self) -> bool {
-        matches!(self, ElementModel::Run(_) | ElementModel::Wall(_) | ElementModel::LegacyWall(_))
+        matches!(self, ElementModel::Run(_) | ElementModel::Wall(_) | ElementModel::LegacyWall(_) | ElementModel::RoomWalls(_))
     }
 
     /// A single-segment wall's reference line and extent (`Wall` and
@@ -689,6 +746,22 @@ fn derive_run(doc: &Document, element: EntityId, name: &str, level: EntityId) ->
     })
 }
 
+fn derive_room_walls(doc: &Document, element: EntityId, name: &str, level: EntityId) -> Option<RoomWallsModel> {
+    let layout = first_input(doc, element, slot::ELEMENT_MEMBERS)?;
+    let data = vim_design_lib::room_layout::RoomLayoutData::from_params(&doc.entity(layout)?.params)?;
+    Some(RoomWallsModel {
+        element,
+        name: name.to_owned(),
+        level,
+        layout,
+        plane: first_input(doc, layout, slot::ROOM_LAYOUT_PLANE)?,
+        top: first_input(doc, layout, slot::ROOM_LAYOUT_TOP),
+        rooms: input_of(doc, layout, slot::ROOM_LAYOUT_ROOMS),
+        top_height: vim_design_lib::room_layout::layout_top_height(doc, layout).unwrap_or(data.height_m),
+        data,
+    })
+}
+
 fn derive_wall(doc: &Document, element: EntityId, name: &str, level: EntityId) -> Option<WallModel> {
     let wall = first_input(doc, element, slot::ELEMENT_MEMBERS)?;
     let Params::Wall { start, end, height_m, top_offset_m, profile, top_points } = &doc.entity(wall)?.params
@@ -734,6 +807,7 @@ pub fn derive(doc: &Document) -> Vec<ElementModel> {
                         .or_else(|| derive_run(doc, *id, name, l).map(ElementModel::Run))
                         .or_else(|| derive_wall(doc, *id, name, l).map(ElementModel::Wall))
                         .or_else(|| derive_legacy_wall(doc, *id, name, l).map(ElementModel::LegacyWall))
+                        .or_else(|| derive_room_walls(doc, *id, name, l).map(ElementModel::RoomWalls))
                 });
                 Some(recognized.unwrap_or_else(|| {
                     ElementModel::Other(OtherModel { element: *id, name: name.clone(), level })
@@ -1176,6 +1250,44 @@ mod tests {
         let before = doc.entity_count();
         assert!(ops::commit_run(&mut doc, ground, ground, &[[0.0, 0.0], [4.0, 0.0], [0.5, 0.1]], false, false, 0.2, fixed).is_err());
         assert_eq!(doc.entity_count(), before);
+    }
+
+    #[test]
+    fn rooms_share_one_layout_and_its_element_the_last_one_takes_them() {
+        let mut doc = Document::new();
+        let ground = ops::seed_new_project(&mut doc).expect("seed");
+        let settings = ops::LayoutSettings { thickness_m: 0.114, height_m: 2.7, top: None, top_offset_m: 0.0 };
+        let a = vim_design_lib::room::from_rectangle("Room 001", 0, [0.0, 0.0], [3.0, 3.0]).expect("a");
+        let b = vim_design_lib::room::from_rectangle("Room 002", 1, [3.0, 0.0], [6.0, 3.0]).expect("b");
+        let ra = ops::create_room(&mut doc, ground, ground, &a, settings).expect("room a");
+        let rb = ops::create_room(&mut doc, ground, ground, &b, settings).expect("room b");
+        let model = derive(&doc);
+        let walls: Vec<&RoomWallsModel> = model
+            .iter()
+            .filter_map(|e| match e {
+                ElementModel::RoomWalls(w) => Some(w),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(walls.len(), 1, "one layout, one Room walls element");
+        assert_eq!(walls[0].name, ops::ROOM_WALLS_NAME);
+        assert_eq!(walls[0].rooms, vec![ra, rb]);
+        let rs = rooms(&doc);
+        assert!(rs.iter().all(|r| r.layout == Some(walls[0].layout) && r.level == Some(ground)));
+        // One mesh: the shared boundary is one wall (7 wall segments).
+        let input = vim_design_lib::room_layout::inputs(&doc, walls[0].layout).expect("input");
+        let arr = vim_design_lib::room_layout::arrange(&input).expect("arrange");
+        assert_eq!(arr.segments.len(), 7);
+        let area: f64 = arr.footprint().expect("footprint").iter().flat_map(|s| s.iter()).map(|r| signed_area(r)).sum();
+        let v = volumes(&mut doc);
+        assert_eq!(v.len(), 1);
+        assert!((v[0].1 - area.abs() * 2.7).abs() < 1e-4, "volume {} vs {}", v[0].1, area.abs() * 2.7);
+        // Deleting both rooms takes the layout and the element with them.
+        ops::delete_room(&mut doc, ra).expect("delete a");
+        assert_eq!(derive(&doc).len(), 1);
+        ops::delete_room(&mut doc, rb).expect("delete b");
+        assert!(derive(&doc).is_empty() && rooms(&doc).is_empty());
+        assert!(ops::layout_on(&doc, ground).is_none());
     }
 
     #[test]

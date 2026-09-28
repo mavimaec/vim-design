@@ -81,7 +81,7 @@ impl AuthorApp {
         let can_copy = match context {
             Some("faces") => self.edit.as_ref().is_some_and(|s| s.mode == SelectMode::Faces && !s.selection.faces.is_empty()),
             Some("openings") => self.openings.as_ref().is_some_and(|o| o.selected.is_some()),
-            Some("element") => self.selection.is_some_and(|id| {
+            Some("element") => self.room_selection.is_some() || self.selection.is_some_and(|id| {
                 self.model
                     .iter()
                     .any(|e| e.element() == id && matches!(e, ElementModel::SketchPlate(_) | ElementModel::Run(_)))
@@ -114,6 +114,7 @@ impl AuthorApp {
                 Err(e) => rejected(&e),
             },
             Clip::Plate { .. } | Clip::Run { .. } => self.paste_element(&clip, px, py),
+            Clip::Room(data) => self.paste_room(data, px, py),
         }
     }
 
@@ -182,13 +183,19 @@ impl AuthorApp {
 
     fn copy_openings(&self) -> Result<Clip, String> {
         let (element, id) = self.openings.as_ref().and_then(|o| o.selected).ok_or("Select an opening to copy")?;
+        if let Some((_, o)) = self.room_opening(element, id) {
+            return Ok(Clip::Openings(vec![Self::room_opening_as_run(&o)]));
+        }
         let r = self.run_model(element).ok_or("Select an opening to copy")?;
         let o = r.data.openings.iter().find(|o| o.id == id).ok_or("Select an opening to copy")?;
         Ok(Clip::Openings(vec![*o]))
     }
 
     fn copy_element(&self) -> Result<Clip, String> {
-        let id = self.selection.ok_or("Select a floor plate or a wall to copy")?;
+        if let Some(r) = self.room_selection.and_then(|r| self.room_model(r)) {
+            return Ok(Clip::Room(r.data.clone()));
+        }
+        let id = self.selection.ok_or("Select a floor plate, a wall, or a room to copy")?;
         match self.model.iter().find(|e| e.element() == id) {
             Some(ElementModel::SketchPlate(p)) => Ok(Clip::Plate { sketch: p.sketch.clone(), name: p.name.clone() }),
             Some(ElementModel::Run(r)) => Ok(Clip::Run {
@@ -234,6 +241,39 @@ impl AuthorApp {
             self.select_new_faces(&before);
         }
         out
+    }
+
+    /// A copy of a room on the active plane, on top of its rooms; named
+    /// "Room NNN" when the source had a default name, else by the copy
+    /// rule ("Kitchen 2"). One step; the copy is selected.
+    fn paste_room(&mut self, data: &vim_design_lib::room::RoomData, px: f32, py: f32) -> String {
+        let Some(plane) = self.plane().filter(|_| self.can_author()) else { return none("Nothing to paste into") };
+        let clip = Clip::Room(data.clone());
+        let Some((_, d)) = self.paste_move(&clip, px, py) else { return none("Point at the plane to paste") };
+        let default = data.name.strip_prefix("Room ").is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+        let names: Vec<String> = self.rooms.iter().map(|r| r.data.name.clone()).collect();
+        let name = if default {
+            vim_design_lib::room::default_name(&self.doc)
+        } else {
+            clipboard::copy_name(&data.name, names.iter().map(String::as_str))
+        };
+        let top = self.rooms.iter().filter(|r| r.plane == plane).map(|r| r.data.precedence).max().map_or(0, |p| p + 1);
+        let mut copy = data.clone();
+        copy.name = name.clone();
+        copy.precedence = top;
+        for p in &mut copy.boundary {
+            p.uv = [p.uv[0] + d[0], p.uv[1] + d[1]];
+        }
+        match self.create_room_gesture(plane, &copy) {
+            Ok(id) => {
+                self.room_selection = Some(id);
+                self.selection = None;
+                self.refresh_styles();
+                self.notice = Some(format!("{name} pasted"));
+                serde_json::json!({ "result": "placed", "name": name, "room": id.0 as f64 }).to_string()
+            }
+            Err(e) => rejected(&e),
+        }
     }
 
     fn paste_element(&mut self, clip: &Clip, px: f32, py: f32) -> String {

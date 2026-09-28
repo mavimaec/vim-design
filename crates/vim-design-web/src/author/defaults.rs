@@ -70,8 +70,10 @@ pub struct Remembered {
     pub door: OpeningSize,
     /// The depth a niche starts with (the last niche depth chosen).
     pub niche_depth: f64,
-    /// Rooms preview: the wall thickness of a plane's first rooms.
+    /// Room walls: the thickness and fixed height of a plane's first
+    /// room's layout (the last chosen).
     pub room_wall_thickness: f64,
+    pub room_wall_height: f64,
 }
 
 impl Default for Remembered {
@@ -83,6 +85,7 @@ impl Default for Remembered {
             door: OpeningSize::DOOR,
             niche_depth: DEFAULT_NICHE_DEPTH_M,
             room_wall_thickness: crate::authoring::walls::PARTITION_THICKNESS_M,
+            room_wall_height: super::DEFAULT_WALL_HEIGHT_M,
         }
     }
 }
@@ -139,6 +142,7 @@ impl AuthorApp {
             "wallShape": self.wall_shape.name(),
             "roomShape": self.room_shape.name(),
             "roomWallThickness": r.room_wall_thickness,
+            "roomWallHeight": r.room_wall_height,
         })
         .to_string()
     }
@@ -189,6 +193,9 @@ impl AuthorApp {
         self.room_shape = shape_of(text("roomShape"), self.room_shape);
         if let Some(t) = num("roomWallThickness") {
             self.remembered.room_wall_thickness = t.clamp(MIN_WALL_THICKNESS_M, MAX_WALL_THICKNESS_M);
+        }
+        if let Some(h) = num("roomWallHeight") {
+            self.remembered.room_wall_height = h.clamp(MIN_WALL_HEIGHT_M, MAX_WALL_HEIGHT_M);
         }
     }
 }

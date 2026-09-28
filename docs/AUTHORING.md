@@ -278,19 +278,34 @@ element copy is named by the numbering rule ("Floor plate 2", "Kitchen 2"). Open
 on the tapped wall segment centred at the tap, each kept inside the clear span (refused
 with a toast when it does not fit).
 
-**Dock.** Select, Floor, Hole, Wall, Openings (and Rooms with `?rooms`). Snap moved to the
+**Dock.** Select, Floor, Hole, Wall, Openings, Rooms. Snap moved to the
 view pill: it is an input aid for every mode, and the pill is also visible inside the
 Edit Modes, where the dock is replaced.
 
-**Rooms (preview, `?rooms`).** A temporary app-side adapter (`authoring::rooms`) follows
-the library contract of §12 until the app switches to it: the Rooms tool (rectangle or
-polygon; "Room 001", then the next number), plan overlays (region fill, name + area
-label, the wall network as bands, a hidden wall dashed), a Rooms group per level in the
-Model tree (select, Bring forward / Send backward, the pencil), the room page (rename,
-order, the plane's room wall thickness and height, delete), Room Edit Mode (points and
-edges; "Hidden wall" on the selected edges), and openings in room walls (anchored to the
-covering room edge). Room changes join the one Undo / Redo. The preview draws no wall
-solids and keeps the rooms beside the session, not in the document.
+**Rooms** (the Rooms tool, §12). A room is a `Room` entity on the active construction
+plane: a rectangle or polygon, named "Room 001" and up, placed on top of the plane's
+rooms (it cuts into the ones it overlaps). The plane's first room creates its
+`RoomLayout` and a **"Room walls"** element that owns it — the one wall mesh of all the
+plane's rooms (a shared boundary is one wall), associated with the plane's root level;
+the last room deleted takes both with it. Rooms are NOT elements: they are listed in
+the Model tree under their plane's root level (Rooms group, top of the order first,
+with Bring forward / Send backward and the pencil); "Room walls" is listed under
+Walls. In plan a tap selects a wall first, then a room before the floor plate under
+it. Overlays come from `Engine::room_regions`: a fill per region and a label with its
+name and area, or its status ("in 2 pieces", "hidden behind Room 001", "invalid");
+hidden walls are dashed. The room page renames, restacks (exactly one place: the
+rooms get distinct precedences in the new order, one undo step), sets the room walls
+(thickness, default 0.114 m and remembered; height Fixed or Up to a plane with an
+offset), and deletes (its openings go). Selecting "Room walls" shows the same settings
+(no Delete: remove rooms, or hide walls). **Room Edit Mode** edits the boundary with
+`room::ops` (Points | Edges, drag, hold to insert, Delete); a corner at the same
+position as another room's corner moves with it (both rooms, one step), and
+"Hidden wall" hides the wall of the selected edges. Openings mode places, drags
+(`move_opening`), sizes, copies, and pastes openings on room walls, in plan or 3D:
+the tap anchors to the room edge covering the wall, inside one of its
+`opening_span`s. Each change is one command (drags and typing coalesce); undo,
+persistence, cascades (a level or workplane takes its rooms; a deleted top plane
+disconnects the walls at their height) are the document's.
 
 **Attachment.** Sketches and wall runs live on their construction plane, in the space
 of its root level, so a level elevation edit moves everything on it (and on its

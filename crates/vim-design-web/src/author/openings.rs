@@ -29,7 +29,7 @@ use crate::authoring::walls::WINDOW_MARGIN_M;
 /// An opening as the mode shows it: its segment line, visible rectangle,
 /// kind, whether it is a niche, and its run opening id (`None`: a void
 /// of a `Wall` not converted yet).
-type ShownOpening = (WallLine, [P2; 2], OpeningKind, bool, Option<u32>);
+pub(super) type ShownOpening = (WallLine, [P2; 2], OpeningKind, bool, Option<u32>);
 
 /// A paste of openings on a run: the run, its new data, and the new
 /// openings with their ids.
@@ -48,8 +48,6 @@ pub struct OpeningsSession {
     /// The opening just placed: while it is the selection, its size is
     /// also the remembered size of its kind.
     pub fresh: Option<(EntityId, u32)>,
-    /// Rooms preview: the selected room wall opening (its id).
-    pub room_selected: Option<u32>,
 }
 
 impl OpeningsSession {
@@ -143,9 +141,7 @@ impl AuthorApp {
             drag: None,
             faced: None,
             fresh: None,
-            room_selected: None,
         });
-        self.begin_room_session();
         self.refresh_styles();
         true
     }
@@ -167,17 +163,15 @@ impl AuthorApp {
             return false;
         }
         let changed = self.gestures.end_session(&self.doc);
-        let rooms_changed = self.end_room_session(true);
         self.leave_openings();
         self.sync("openings");
-        changed || rooms_changed
+        changed
     }
 
     /// ✗: undo back to the entry.
     pub fn openings_cancel(&mut self) {
         if self.openings.is_some() {
             self.gestures.cancel_session(&mut self.doc);
-            self.end_room_session(false);
             self.leave_openings();
             self.sync("openings cancelled");
         }
@@ -203,25 +197,24 @@ impl AuthorApp {
             self.select_opening(hit);
             return r#"{"result":"selected"}"#.to_owned();
         }
-        // Rooms preview: an opening in a room wall, or a room wall.
-        if let Some(id) = self.room_opening_at(px, py, tol) {
-            self.select_room_opening(Some(id));
-            return r#"{"result":"selected"}"#.to_owned();
-        }
         let wall = self.pick_wall(px, py, wall_tol);
-        if wall < 0.0 {
+        // Room walls: the opening anchors to the room edge under the tap.
+        if wall < 0.0 || self.room_walls(eid(wall)).is_some() {
             let preset = self.openings.as_ref().map_or(OpeningKind::Window, |o| o.preset);
-            match self.place_room_opening(preset, px, py, wall_tol) {
-                Some(Ok(id)) => {
-                    self.select_room_opening(Some(id));
-                    return serde_json::json!({ "result": "placed", "kind": kind_name(preset), "room": true }).to_string();
-                }
-                Some(Err(e)) => return rejected(&e),
-                None => {}
+            if let Some(hit) = self.room_wall_at(px, py, wall_tol) {
+                return match self.place_room_opening(preset, hit) {
+                    Ok(key) => {
+                        self.select_opening(key);
+                        if let Some(o) = self.openings.as_mut() {
+                            o.fresh = Some(key);
+                        }
+                        serde_json::json!({ "result": "placed", "kind": kind_name(preset), "room": true }).to_string()
+                    }
+                    Err(e) => rejected(&e),
+                };
             }
             if let Some(o) = self.openings.as_mut() {
                 o.selected = None;
-                o.room_selected = None;
             }
             return r#"{"result":"cleared"}"#.to_owned();
         }
@@ -270,6 +263,16 @@ impl AuthorApp {
     /// elsewhere the page navigates (false).
     pub fn openings_drag_begin(&mut self, px: f32, py: f32, tol: f32) -> bool {
         let Some((element, id)) = self.opening_at(px, py, tol) else { return false };
+        if let Some((w, o)) = self.room_opening(element, id) {
+            // A room wall opening moves along its edge.
+            let Some(line) = self.room_model(o.room).and_then(|r| self.room_edge_line(&w, &r.data, o.edge)) else { return false };
+            let Some(grab) = self.line_uv_at(&line, px, py) else { return false };
+            self.select_opening((element, id));
+            if let Some(s) = self.openings.as_mut() {
+                s.drag = Some(OpeningDrag { element, grab, orig: Self::room_opening_as_run(&o) });
+            }
+            return true;
+        }
         let Some(orig) = self.run_opening(element, id) else { return false };
         let Some(grab) = self.segment_uv_at(element, orig.segment, px, py) else { return false };
         self.select_opening((element, id));
@@ -283,6 +286,16 @@ impl AuthorApp {
     /// window also vertically), snapped and kept in the clear span.
     pub fn openings_drag_move(&mut self, px: f32, py: f32) -> String {
         let Some(d) = self.openings.as_ref().and_then(|o| o.drag) else { return none() };
+        if let Some((w, o)) = self.room_opening(d.element, d.orig.id) {
+            let Some(line) = self.room_model(o.room).and_then(|r| self.room_edge_line(&w, &r.data, o.edge)) else { return none() };
+            let Some(uv) = self.line_uv_at(&line, px, py) else { return none() };
+            let key = format!("opening_move_{}_{}", d.element.0, d.orig.id);
+            return match self.move_room_opening(d.element, d.orig.id, d.orig.offset_m + uv[0] - d.grab[0], &key) {
+                Ok(true) => r#"{"result":"moved"}"#.to_owned(),
+                Ok(false) => none(),
+                Err(e) => rejected(&e),
+            };
+        }
         let Some(uv) = self.segment_uv_at(d.element, d.orig.segment, px, py) else { return none() };
         let Some(r) = self.run_model(d.element).cloned() else { return none() };
         let plan = self.camera.mode == ViewMode::Plan;
@@ -320,13 +333,23 @@ impl AuthorApp {
     /// makes it go through, a positive one a niche that deep). Typing
     /// coalesces until [`AuthorApp::end_gesture`].
     pub fn openings_set(&mut self, width: f64, height: f64, sill: f64, depth: f64) -> String {
-        if let Some(id) = self.openings.as_ref().and_then(|o| o.room_selected) {
-            return match self.set_room_opening(id, width, height, sill, depth) {
-                Ok(_) => r#"{"result":"changed"}"#.to_owned(),
+        let Some((element, id)) = self.openings.as_ref().and_then(|o| o.selected) else { return none() };
+        if self.room_walls(element).is_some() {
+            let key = format!("opening_set_{}_{}", element.0, id);
+            return match self.set_room_opening(element, id, [width, height, sill, depth], &key) {
+                Ok(next) => {
+                    let as_run = Self::room_opening_as_run(&next);
+                    if self.openings.as_ref().is_some_and(OpeningsSession::is_fresh) {
+                        self.remembered.remember_opening(&as_run);
+                    }
+                    if let Some(d) = next.depth_m {
+                        self.remembered.niche_depth = d;
+                    }
+                    r#"{"result":"changed"}"#.to_owned()
+                }
                 Err(e) => rejected(&e),
             };
         }
-        let Some((element, id)) = self.openings.as_ref().and_then(|o| o.selected) else { return none() };
         let (Some(r), Some(current)) = (self.run_model(element).cloned(), self.run_opening(element, id)) else {
             return none();
         };
@@ -366,12 +389,14 @@ impl AuthorApp {
 
     /// Delete the selected opening (one undo step).
     pub fn openings_delete(&mut self) -> bool {
-        if let Some(id) = self.openings.as_ref().and_then(|o| o.room_selected) {
-            let ok = self.delete_room_opening(id);
-            self.select_room_opening(None);
+        let Some((element, id)) = self.openings.as_ref().and_then(|o| o.selected) else { return false };
+        if self.room_walls(element).is_some() {
+            let ok = self.delete_room_opening(element, id);
+            if let Some(o) = self.openings.as_mut() {
+                o.selected = None;
+            }
             return ok;
         }
-        let Some((element, id)) = self.openings.as_ref().and_then(|o| o.selected) else { return false };
         let Some(r) = self.run_model(element).cloned() else { return false };
         let Ok(data) = run_ops::delete_opening(&r.data, id) else { return false };
         self.store_run(&r, &data, None);
@@ -384,7 +409,7 @@ impl AuthorApp {
     /// Openings mode state for the page.
     pub fn openings_state_json(&self) -> String {
         let Some(o) = &self.openings else { return r#"{"active":false}"#.to_owned() };
-        let room_selected = o.room_selected.and_then(|id| self.room_opening_json(id));
+        let room_selected = o.selected.and_then(|(element, id)| self.room_opening_json(element, id));
         let selected = room_selected.or_else(|| o.selected.and_then(|(element, id)| {
             let r = self.run_model(element)?;
             let op = self.run_opening(element, id)?;
@@ -400,9 +425,9 @@ impl AuthorApp {
             "active": true,
             "preset": kind_name(o.preset),
             "selected": selected,
-            "count": self.opening_count() + self.rooms.openings.len(),
-            "canUndo": self.gestures.can_undo() || self.rooms_can_undo(),
-            "canRedo": self.gestures.can_redo() || self.rooms_can_redo(),
+            "count": self.opening_count(),
+            "canUndo": self.gestures.can_undo(),
+            "canRedo": self.gestures.can_redo(),
             "faced": o.faced.map(|(f, _)| f.0 as f64),
             "fresh": o.is_fresh(),
             "nicheDepth": self.remembered.niche_depth,
@@ -490,8 +515,16 @@ impl AuthorApp {
     /// first is selected.
     pub(super) fn paste_openings(&mut self, copies: &[Opening], px: f32, py: f32, wall_tol: f32) -> Result<(), String> {
         let wall = self.pick_wall(px, py, wall_tol);
-        if wall < 0.0 {
-            return Err("Tap a wall to paste the openings".to_owned());
+        if wall < 0.0 || self.room_walls(eid(wall)).is_some() {
+            let (walls, room, edge, along) = self.room_wall_at(px, py, wall_tol).ok_or("Tap a wall to paste the openings")?;
+            let (layout, data, ids) = self.room_openings_added(walls, room, edge, along, copies)?;
+            if !self.store_layout_openings(layout, data.openings, None) {
+                return Err("The room walls refused the openings".to_owned());
+            }
+            if let Some(id) = ids.first() {
+                self.select_opening((walls, *id));
+            }
+            return Ok(());
         }
         let element = self.ensure_run(eid(wall))?;
         let (r, data, placed) = self.pasted_openings(copies, element, px, py)?;
@@ -507,6 +540,22 @@ impl AuthorApp {
     /// fit).
     pub(super) fn openings_preview(&self, copies: &[Opening], px: f32, py: f32, wall_tol: f32) -> Option<Vec<Vec<[f32; 2]>>> {
         let element = eid(self.pick_wall(px, py, wall_tol));
+        if element.0 == 0 || self.room_walls(element).is_some() {
+            let (walls, room, edge, along) = self.room_wall_at(px, py, wall_tol)?;
+            let (_, data, ids) = self.room_openings_added(walls, room, edge, along, copies).ok()?;
+            let w = self.room_walls(walls)?.clone();
+            let line = self.room_edge_line(&w, &self.room_model(room)?.data, edge)?;
+            return Some(
+                data.openings
+                    .iter()
+                    .filter(|o| ids.contains(&o.id))
+                    .filter_map(|o| {
+                        let v0 = if o.kind == OpeningKind::Door { 0.0 } else { o.sill_m };
+                        self.opening_screen(&line, [[o.offset_m, v0], [o.offset_m + o.width_m, v0 + o.height_m]])
+                    })
+                    .collect(),
+            );
+        }
         let (r, _, placed) = self.pasted_openings(copies, element, px, py).ok()?;
         let segment = placed.first()?.1.segment;
         let line = self.segment_line(r.element, segment)?;
@@ -551,18 +600,9 @@ impl AuthorApp {
         self.refresh_styles();
     }
 
-    /// Select a room wall opening (the run opening selection clears).
-    fn select_room_opening(&mut self, id: Option<u32>) {
-        if let Some(o) = self.openings.as_mut() {
-            o.room_selected = id;
-            o.selected = None;
-        }
-    }
-
     fn select_opening(&mut self, hit: (EntityId, u32)) {
         let segment = self.run_opening(hit.0, hit.1).map(|o| o.segment);
         if let Some(o) = self.openings.as_mut() {
-            o.room_selected = None;
             o.selected = Some(hit);
             if let Some(s) = segment {
                 o.faced = Some((hit.0, s));
@@ -623,6 +663,7 @@ impl AuthorApp {
                 _ => {}
             }
         }
+        out.extend(self.room_openings_shown());
         out
     }
 

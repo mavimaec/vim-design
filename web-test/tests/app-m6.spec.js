@@ -2,8 +2,7 @@
 // just created is the selection (its panel values apply to it), the last
 // choices are remembered (also across a reload), copy / paste in each
 // mode, the partition default for new walls, the dock (Openings; Snap in
-// the view pill), and the rooms preview (?rooms). Both Playwright
-// projects.
+// the view pill). Rooms: app-rooms.spec.js. Both Playwright projects.
 
 import { test, expect } from "@playwright/test";
 import {
@@ -15,9 +14,6 @@ const profile = (page) => page.evaluate(() => JSON.parse(window.__author.app.edi
 const plates = async (page) => (await elements(page)).filter((e) => e.kind === "floor_plate");
 const clip = (page) => page.evaluate(() => JSON.parse(window.__author.app.clipboard_json()));
 const defaults = (page) => page.evaluate(() => JSON.parse(window.__author.app.session_defaults_json()));
-const rooms = (page) => page.evaluate(() => JSON.parse(window.__author.app.rooms_json()));
-const roomsHud = (page) => page.evaluate(() => JSON.parse(window.__author.app.rooms_hud_json()));
-const roomsState = (page) => page.evaluate(() => JSON.parse(window.__author.app.rooms_state_json()));
 
 /** Set the value of the face just drawn: the edit panel (desktop) or
  *  the drawing bar's stepper (phones). */
@@ -205,82 +201,5 @@ test("copy / paste: a whole floor plate in Select (named by the naming rule), an
   await shot(page, "m6-paste-faces");
   await page.locator("#paste-btn").click();
   await page.locator("#edit-confirm").click();
-  expect(errors).toEqual([]);
-});
-
-test("rooms preview (?rooms): draw named rooms, the shared wall is one wall, order decides overlaps, rename, hide a wall, an opening on a room wall", async ({ page }) => {
-  const errors = await openApp(page, "?rooms");
-  await expect(page.locator("#room-tool")).toBeVisible();
-  await tool(page, "room");
-  expect((await stats(page)).shape).toBe("rect");
-  await tapWorld(page, -3, -2);
-  await tapWorld(page, 0, 1);
-  await tapWorld(page, 0, -2);
-  await tapWorld(page, 3, 1);
-  let rs = await rooms(page);
-  expect(rs.map((r) => r.name)).toEqual(["Room 001", "Room 002"]);
-  for (const r of rs) expect(r.area).toBeCloseTo(9, 6);
-  let hud = await roomsHud(page);
-  expect(hud.walls, "7 walls: the shared edge is one").toHaveLength(7);
-  expect(hud.labels.map((l) => l.name).sort()).toEqual(["Room 001", "Room 002"]);
-  // A third room over both: on top, it cuts into them.
-  await tapWorld(page, -1, -1);
-  await tapWorld(page, 1, 0);
-  rs = await rooms(page);
-  expect(rs.map((r) => [r.name, r.rank, Math.round(r.area * 100) / 100])).toEqual([["Room 001", 3, 8], ["Room 002", 2, 8], ["Room 003", 1, 2]]);
-  await shot(page, "m6-rooms-plan");
-  if (!mobile()) await expect(page.locator("#tree-body [data-tree-room]")).toHaveCount(3);
-
-  // Select Room 001 in the plan: its page. Rename it; bring it forward.
-  await tool(page, "select");
-  await tapWorld(page, -2.5, 0.5);
-  await expect(page.locator("#sheet-title")).toHaveText("Room 001");
-  await page.locator("#room-name").fill("Kitchen");
-  await page.locator("#room-name").press("Enter");
-  expect((await rooms(page))[0].name).toBe("Kitchen");
-  // A new room goes on top: Kitchen is third; twice forward, it is first.
-  await page.locator("#room-forward").click();
-  expect((await rooms(page))[0].rank).toBe(2);
-  await page.locator("#room-forward").click();
-  rs = await rooms(page);
-  expect(rs[0]).toMatchObject({ name: "Kitchen", rank: 1 });
-  expect(rs[0].area).toBeCloseTo(9, 6);
-  expect(rs[2].area).toBeCloseTo(1, 6);
-  // Room steps join the one history.
-  await page.locator("#undo").click();
-  expect((await rooms(page))[0].rank).toBe(2);
-  await page.locator("#redo").click();
-  expect((await rooms(page))[0].rank).toBe(1);
-  await shot(page, "m6-room-page");
-
-  // Room Edit Mode: select the shared (east) edge, hide its wall.
-  await page.locator("#room-edit").click();
-  let es = await editState(page);
-  expect(es).toMatchObject({ active: true, target: "room", mode: "edges" });
-  await tapWorld(page, 0, 0.6);
-  es = await editState(page);
-  expect(es.room.selectedEdges).toBe(1);
-  await page.locator("#room-hidden").click();
-  es = await editState(page);
-  expect(es.room).toMatchObject({ hidden: 1, selectedHidden: true });
-  await shot(page, "m6-room-edit");
-  await page.locator("#edit-confirm").click();
-  hud = await roomsHud(page);
-  expect(hud.walls.filter((w) => w.hidden).length).toBeGreaterThan(0);
-
-  // Openings mode: a door on the kitchen's south wall, anchored to it.
-  await page.locator('.tool[data-tool="window"]').click();
-  await page.locator('[data-opening-preset="door"]').click();
-  await tapWorld(page, -1.5, -2);
-  let st = await roomsState(page);
-  expect(st.openings).toHaveLength(1);
-  expect(st.openings[0]).toMatchObject({ kind: "door", room: rs[0].id });
-  expect((await openingsState(page)).selected).toMatchObject({ kind: "door", wallName: "Kitchen wall" });
-  await page.locator("#edit-confirm").click();
-  // Persisted with the session: back after a reload.
-  await page.reload();
-  await page.waitForFunction(() => window.__author?.ready === true);
-  expect((await rooms(page)).map((r) => r.name)).toEqual(["Kitchen", "Room 002", "Room 003"]);
-  expect((await roomsState(page)).openings).toHaveLength(1);
   expect(errors).toEqual([]);
 });

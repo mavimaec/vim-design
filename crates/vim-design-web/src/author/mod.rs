@@ -243,16 +243,13 @@ pub struct AuthorApp {
     /// state; see `clipboard`).
     clipboard: Option<crate::authoring::clipboard::Clip>,
     paste_armed: bool,
-    /// Rooms preview (`?rooms`; see `rooms`): the adapter's rooms, the
-    /// selected room, the room history, a room session (Room Edit Mode or
-    /// Openings mode), the room in Room Edit Mode.
-    rooms_preview: bool,
-    rooms: crate::authoring::rooms::Rooms,
-    room_selection: Option<u32>,
-    room_history: rooms::RoomHistory,
-    room_session: Option<rooms::RoomSession>,
-    room_edit: Option<u32>,
-    rooms_revision: u64,
+    /// Rooms (see `rooms`): the derived rooms and the wall graph of each
+    /// layout (never authoritative), the selected room (session state; a
+    /// room is not an element), the room in Room Edit Mode.
+    rooms: Vec<crate::authoring::model::RoomModel>,
+    room_graphs: Vec<rooms::LayoutGraph>,
+    room_selection: Option<EntityId>,
+    room_edit: Option<EntityId>,
     /// The wall run just drawn (see `walls::fresh_run`).
     fresh_run: Option<EntityId>,
     /// Remembered settings for new items (see `defaults`).
@@ -335,13 +332,10 @@ impl AuthorApp {
             fresh_run: None,
             clipboard: None,
             paste_armed: false,
-            rooms_preview: false,
-            rooms: crate::authoring::rooms::Rooms::default(),
+            rooms: Vec::new(),
+            room_graphs: Vec::new(),
             room_selection: None,
-            room_history: rooms::RoomHistory::default(),
-            room_session: None,
             room_edit: None,
-            rooms_revision: 0,
             revision: 0,
             last_committed: 0,
             grid_key: None,
@@ -593,7 +587,7 @@ impl AuthorApp {
             "plate" => Tool::Plate,
             "hole" => Tool::Hole,
             "wall" => Tool::Wall,
-            "room" if self.rooms_preview => Tool::Room,
+            "room" => Tool::Room,
             _ => Tool::Select,
         };
         if tool != Tool::Select && !self.can_author() {
@@ -918,6 +912,7 @@ impl AuthorApp {
         let groups_of = |level: EntityId| -> Vec<serde_json::Value> {
             let mut floors = Vec::new();
             let mut walls = Vec::new();
+            let mut rooms = Vec::new();
             let mut other = Vec::new();
             for e in self.model.iter().filter(|e| e.level() == Some(level)) {
                 let (bucket, meta, edit) = match e {
@@ -941,6 +936,10 @@ impl AuthorApp {
                         let meta = format!("{:.2} m · h {:.2} m", w.length(), w.height);
                         (&mut walls, meta, true)
                     }
+                    ElementModel::RoomWalls(w) => {
+                        let meta = format!("{:.3} m · h {:.2} m", w.data.thickness_m, w.top_height);
+                        (&mut walls, meta, false)
+                    }
                     ElementModel::Other(_) => (&mut other, String::new(), false),
                 };
                 bucket.push(serde_json::json!({
@@ -952,7 +951,10 @@ impl AuthorApp {
                     "selected": self.selection == Some(e.element()),
                 }));
             }
-            [("floors", "Floors", floors), ("walls", "Walls", walls), ("other", "Other", other)]
+            // Rooms (not elements) under their plane's root level, top of
+            // each layout's order first, after the "Room walls" rows.
+            rooms.extend(self.room_tree_rows(level));
+            [("floors", "Floors", floors), ("walls", "Walls", walls), ("rooms", "Rooms", rooms), ("other", "Other", other)]
                 .into_iter()
                 .filter(|(_, _, items)| !items.is_empty())
                 .map(|(key, label, items)| serde_json::json!({ "key": key, "label": label, "items": items }))
@@ -1089,6 +1091,11 @@ impl AuthorApp {
     /// Delete an element with the orphan sweep (one undo step).
     pub fn delete_element(&mut self, id: f64) -> bool {
         let id = eid(id);
+        if self.room_walls(id).is_some() {
+            // The walls come from the rooms: delete or hide those instead.
+            self.notice = Some("Room walls come from their rooms: delete a room, or hide a wall in its Edit Mode".to_owned());
+            return false;
+        }
         let depth = self.doc.undo_depth();
         match ops::delete_element(&mut self.doc, id) {
             Ok(()) => {
@@ -1275,10 +1282,6 @@ impl AuthorApp {
         if self.edit.is_some() {
             return self.edit_undo();
         }
-        // A room change (preview) with no document step after it.
-        if self.rooms_undo() {
-            return true;
-        }
         if self.gestures.undo(&mut self.doc) {
             self.sync("undo");
             true
@@ -1291,9 +1294,6 @@ impl AuthorApp {
         if self.edit.is_some() {
             return self.edit_redo();
         }
-        if self.rooms_redo() {
-            return true;
-        }
         if self.gestures.redo(&mut self.doc) {
             self.sync("redo");
             true
@@ -1304,11 +1304,11 @@ impl AuthorApp {
 
     /// Inside Edit Mode these are bounded by the session's transaction.
     pub fn can_undo(&self) -> bool {
-        if self.edit.is_some() { self.edit_can_undo() } else { self.rooms_can_undo() || self.gestures.can_undo() }
+        if self.edit.is_some() { self.edit_can_undo() } else { self.gestures.can_undo() }
     }
 
     pub fn can_redo(&self) -> bool {
-        if self.edit.is_some() { self.edit_can_redo() } else { self.rooms_can_redo() || self.gestures.can_redo() }
+        if self.edit.is_some() { self.edit_can_redo() } else { self.gestures.can_redo() }
     }
 
     // -- Status ---------------------------------------------------------------
@@ -1368,6 +1368,8 @@ impl AuthorApp {
             "walls": self.model.iter().filter(|e| e.is_wall()).count(),
             "wallsOnLevel": self.model.iter().filter(|e| e.is_wall() && e.level() == self.active_level).count(),
             "editing": self.edit.is_some(),
+            "rooms": self.rooms.len(),
+            "roomSelected": self.room_selection.map(|r| r.0 as f64),
             "openings": self.openings.is_some(),
             "wall": {
                 "height": self.wall_height,
@@ -1703,8 +1705,8 @@ impl AuthorApp {
             SketchTool::Room => {
                 let mut vertices = self.level_vertices(sk.level);
                 let mut edges = self.level_edges(sk.level);
-                for r in self.rooms.rooms.iter().filter(|r| r.plane == sk.level) {
-                    let poly = r.polygon();
+                for r in self.rooms.iter().filter(|r| r.plane == sk.level) {
+                    let poly = r.data.polygon();
                     vertices.extend(poly.iter().copied());
                     edges.extend((0..poly.len()).map(|i| (poly[i], poly[(i + 1) % poly.len()])));
                 }
@@ -2067,6 +2069,20 @@ impl AuthorApp {
                 }
                 v
             }
+            ElementModel::RoomWalls(w) => {
+                let mut v = base;
+                let stats = self.pick.owner_stats(w.element);
+                if let (Some(obj), serde_json::Value::Object(walls)) = (v.as_object_mut(), self.room_walls_value(w)) {
+                    obj.extend(walls);
+                    obj.insert("footprintArea".into(), self.layout_footprint_area(w.layout).into());
+                    obj.insert("openingList".into(), self.room_openings_json(w).into());
+                    obj.insert("roomList".into(), serde_json::json!(w.rooms.iter().map(|r| r.0 as f64).collect::<Vec<_>>()));
+                    obj.insert("volume".into(), stats.map_or(0.0, |s| s.volume).into());
+                    obj.insert("triangles".into(), stats.map_or(0, |s| s.triangles).into());
+                    obj.insert("bbox".into(), stats.map_or(serde_json::Value::Null, |s| serde_json::json!(s.bbox)));
+                }
+                v
+            }
             ElementModel::Wall(w) => {
                 let mut v = base;
                 let stats = self.pick.owner_stats(w.element);
@@ -2165,6 +2181,8 @@ impl AuthorApp {
         self.gestures = Gestures::default();
         self.errors.clear();
         self.selection = None;
+        self.room_selection = None;
+        self.room_edit = None;
         self.sketch = None;
         self.tool = Tool::Select;
         self.edit = None;
@@ -2185,6 +2203,7 @@ impl AuthorApp {
         // "touched"), so the replacement itself triggers the derivation
         // (before the first sync, which colors meshes by element kind).
         self.model = model::derive(&self.doc);
+        self.derive_rooms();
         self.params_dirty = true;
         self.sync(op);
         self.revision += 1;
@@ -2244,6 +2263,7 @@ impl AuthorApp {
         let updates = self.engine.poll_updates(&self.doc);
         if !updates.params_changed.is_empty() {
             self.model = model::derive(&self.doc);
+            self.derive_rooms();
             self.params_dirty = true;
         }
 

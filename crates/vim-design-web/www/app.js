@@ -15,9 +15,6 @@
 
 const DOC_KEY = "vim-design/doc/v1";
 const SESSION_KEY = "vim-design/session/v1";
-/** Rooms preview (?rooms): the app-side rooms, beside the session. */
-const ROOMS_KEY = "vim-design/rooms-preview/v1";
-const ROOMS_PREVIEW = new URLSearchParams(location.search).has("rooms");
 /** Room region fills (by rank on the plane), translucent over the plan. */
 /** A room label moves at most this many rows to avoid another. */
 const ROOM_LABEL_TRIES = 7;
@@ -270,8 +267,6 @@ async function main() {
 
   loadingStatus.textContent = "Starting the renderer…";
   const app = await mod.AuthorApp.create("view");
-  app.set_rooms_preview(ROOMS_PREVIEW);
-  $("room-tool").hidden = !ROOMS_PREVIEW;
 
   // -- session state (non-critical; never in the document) -----------------
   let session = {};
@@ -347,11 +342,6 @@ async function main() {
   if (typeof session.activeLevel === "number") app.set_active_level(session.activeLevel);
   if (session.wall?.mode === "upto" && typeof session.wall.topPlane === "number") {
     app.set_wall_height_mode("upto", session.wall.topPlane, Number(session.wall.topOffset) || 0);
-  }
-  // Rooms preview: after the document (a room's plane must exist).
-  if (ROOMS_PREVIEW) {
-    const rooms = store.get(ROOMS_KEY);
-    if (rooms) app.load_rooms_json(rooms);
   }
   // After the document: a remembered top plane must exist to be kept.
   if (session.defaults && typeof session.defaults === "object") app.set_session_defaults(JSON.stringify(session.defaults));
@@ -451,7 +441,6 @@ async function main() {
     }
     const notice = app.take_notice();
     if (notice) toast(notice, { kind: "ok", ms: 1800 });
-    if (ROOMS_PREVIEW) syncRooms();
     sessionSave(); // the remembered settings for new items change with edits
     scheduleSave();
     requestRender();
@@ -775,24 +764,24 @@ async function main() {
       else toast("Tap a floor plate to cut holes into it", { ms: 1800 });
       return;
     }
-    let id = app.pick(p.dev[0], p.dev[1]);
-    if (id < 0) id = app.pick_wall(p.dev[0], p.dev[1], wallPickPx(p.type));
+    // A wall first; in plan a room before the floor plate under it.
+    const hit = JSON.parse(app.pick_select(p.dev[0], p.dev[1], wallPickPx(p.type)));
+    const room = hit.room ?? -1;
+    const id = hit.element ?? -1;
     const isDouble = lastTap && now - lastTap.t < DOUBLE_TAP_MS &&
       Math.hypot(p.x - lastTap.x, p.y - lastTap.y) < DOUBLE_TAP_PX;
-    if (id < 0 && isDouble && lastTap.empty) {
+    if (id < 0 && room < 0 && isDouble && lastTap.empty) {
       fitView();
       lastTap = null;
       sessionSave();
       requestRender();
       return;
     }
-    // Rooms preview: a tap inside a room (on no element) selects it.
-    const room = id < 0 && ROOMS_PREVIEW ? app.room_at(p.dev[0], p.dev[1]) : -1;
     lastTap = { t: now, x: p.x, y: p.y, empty: id < 0 && room < 0 };
     // A touch tap that opens the sheet arms the ghost-click shield.
     if (p.type !== "mouse") ghostTap = { x: p.x, y: p.y, t: performance.now() };
     if (room >= 0) { selectRoom(room); return; }
-    if (ROOMS_PREVIEW && app.room_selected() >= 0) { app.room_select(-1); if (sheetPage === "room") closeSheet(false); }
+    if (app.room_selected() >= 0) { app.room_select(-1); if (sheetPage === "room") closeSheet(false); }
     selectElement(id);
   }
 
@@ -874,7 +863,7 @@ async function main() {
     const opening = inOpenings();
     const ghost = armedPaste() && pasteHover != null;
     let roomsHud = { active: false };
-    if (ROOMS_PREVIEW) { try { roomsHud = JSON.parse(app.rooms_hud_json()); } catch { /* none */ } }
+    try { roomsHud = JSON.parse(app.rooms_hud_json()); } catch { /* none */ }
     const roomsOn = roomsHud.active && (roomsHud.regions.length > 0);
     if (!isDrawing() && !edit && !opening && rings.length === 0 && !ghost && !roomsOn) {
       if (hudActive) ctx.clearRect(0, 0, hud.width, hud.height);
@@ -1069,9 +1058,10 @@ async function main() {
     }
   }
 
-  /** Rooms preview, plan: region fills (by rank), the wall network as
-   *  bands (a hidden wall: a dashed line), openings, and a label per room
-   *  (name + area) that stays legible on phones. */
+  /** Rooms, plan: region fills (by rank), the hidden walls (dashed:
+   *  a conceptual division), and a label per room — name + area, or its
+   *  status ("hidden behind Room 001") — legible on phones. The walls
+   *  themselves are the room walls mesh. */
   function drawRoomsHud(ctx, h) {
     const path = (pts) => { pts.forEach(([x, y], i) => (i ? ctx.lineTo(x, y) : ctx.moveTo(x, y))); ctx.closePath(); };
     for (const r of h.regions) {
@@ -1085,37 +1075,17 @@ async function main() {
         ctx.stroke();
       }
     }
-    for (const w of h.walls) {
-      if (w.hidden) {
-        if (w.line.length < 4) continue;
-        ctx.beginPath();
-        ctx.moveTo(w.line[0], w.line[1]);
-        ctx.lineTo(w.line[2], w.line[3]);
-        ctx.setLineDash([6 * dpr, 5 * dpr]);
-        ctx.strokeStyle = "rgba(91,98,112,0.8)";
-        ctx.lineWidth = 1.5 * dpr;
-        ctx.stroke();
-        ctx.setLineDash([]);
-        continue;
-      }
-      if (w.pts.length < 3) continue;
+    ctx.setLineDash([6 * dpr, 5 * dpr]);
+    ctx.strokeStyle = "rgba(91,98,112,0.85)";
+    ctx.lineWidth = 1.5 * dpr;
+    for (const l of h.hidden) {
+      if (l.length < 4) continue;
       ctx.beginPath();
-      path(w.pts);
-      ctx.fillStyle = "rgba(91,98,112,0.9)";
-      ctx.fill();
-    }
-    for (const o of h.openings) {
-      if (o.pts.length < 3) continue;
-      ctx.beginPath();
-      path(o.pts);
-      ctx.fillStyle = "rgba(255,255,255,0.95)";
-      ctx.fill();
-      ctx.setLineDash(o.niche ? [4 * dpr, 3 * dpr] : []);
-      ctx.strokeStyle = o.kind === "door" ? "#16a34a" : HUD.accent;
-      ctx.lineWidth = (o.sel ? 3 : 1.6) * dpr;
+      ctx.moveTo(l[0], l[1]);
+      ctx.lineTo(l[2], l[3]);
       ctx.stroke();
-      ctx.setLineDash([]);
     }
+    ctx.setLineDash([]);
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
     // Labels never cover each other: a label that would overlap one
@@ -1123,13 +1093,18 @@ async function main() {
     const placed = [];
     ctx.font = `600 ${12.5 * dpr}px system-ui, -apple-system, Segoe UI, sans-serif`;
     for (const l of h.labels) {
-      const text = `${l.name} · ${fmtArea(l.area)}`;
+      // A room whose label point is off screen gets no label (a label
+      // pinned to the edge would sit on something else).
+      if (l.x < 0 || l.y < 0 || l.x > hud.width || l.y > hud.height) continue;
+      const text = l.status === "empty" || l.status === "invalid" ? `${l.name} · ${l.note}`
+        : l.note ? `${l.name} · ${fmtArea(l.area)} · ${l.note}` : `${l.name} · ${fmtArea(l.area)}`;
       const w = ctx.measureText(text).width + 16 * dpr, bh = 24 * dpr, gap = 3 * dpr;
       const free = (y) => !placed.some((b) => Math.abs(b.x - l.x) < (b.w + w) / 2 && Math.abs(b.y - y) < bh + gap);
       let y = l.y;
       for (let k = 1; !free(y) && k < ROOM_LABEL_TRIES; k++) y = l.y + (k % 2 ? 1 : -1) * Math.ceil(k / 2) * (bh + gap);
       placed.push({ x: l.x, y, w });
-      pill(ctx, l.x, y, text);
+      if (l.status === "invalid") pill(ctx, l.x, y, text, { bg: "rgba(254,236,236,0.97)", fg: "#b42318", border: "rgba(217,45,32,0.35)" });
+      else pill(ctx, l.x, y, text);
     }
   }
 
@@ -2239,6 +2214,10 @@ async function main() {
     } else if ((e.key === "Delete" || e.key === "Backspace") && app.selection() >= 0) {
       e.preventDefault();
       deleteElement(app.selection());
+    } else if ((e.key === "Delete" || e.key === "Backspace") && app.room_selected() >= 0) {
+      e.preventDefault();
+      const r = selectedRoom();
+      if (r) deleteRoom(r);
     }
     if (mod || e.altKey || inEditChrome()) return;
     const k = e.key.toLowerCase();
@@ -2247,7 +2226,7 @@ async function main() {
     else if (k === "h") setTool("hole");
     else if (k === "w") setTool("wall");
     else if (k === "n") beginOpenings(openingTool);
-    else if (k === "m" && ROOMS_PREVIEW) setTool("room");
+    else if (k === "m") setTool("room");
     else if (k === "r" && isDrawing()) { app.set_shape(stats.shape === "rect" ? "polygon" : "rect"); stats = JSON.parse(app.stats_json()); renderChrome(); requestRender(); }
     else if (k === "p") { app.set_view_mode("plan"); stats = JSON.parse(app.stats_json()); renderChrome(); requestRender(); }
     else if (k === "3") { app.set_view_mode("3d"); stats = JSON.parse(app.stats_json()); renderChrome(); requestRender(); }
@@ -2305,6 +2284,8 @@ async function main() {
       if (sheetPage === "properties") closeSheet(false);
       refresh();
       toast(`Deleted ${name}`);
+    } else {
+      refresh(); // shows why (a notice)
     }
   }
 
@@ -2325,7 +2306,7 @@ async function main() {
     sheetPage = page;
     sheet.hidden = false;
     document.body.classList.add("sheet-open");
-    sheet.classList.toggle("compact", page === "properties");
+    sheet.classList.toggle("compact", page === "properties" || page === "room");
     renderSheet();
   }
   function closeSheet(deselect = true) {
@@ -2392,6 +2373,10 @@ async function main() {
     } else if (sheetPage === "levels") updateLevels();
     else if (sheetPage === "project") updateProject();
     else if (sheetPage === "workplane") updateWorkplane();
+    else if (sheetPage === "room") {
+      if (!selectedRoom()) closeSheet(false);
+      else if (!sheetBody.contains(document.activeElement)) pageRoom();
+    }
     else if (sheetPage === "menu") pageMenu();
   }
 
@@ -2426,6 +2411,7 @@ async function main() {
     plane: '<path d="M3 15l9-5 9 5-9 5z"/>',
     add: '<path d="M12 5v14M5 12h14"/>',
     room: '<path d="M3 4h18v16H3z"/><path d="M12 4v6.5M12 14.5V20M3 12h5.5"/>',
+    room_walls: '<path d="M3 4h18v16H3z" stroke-width="3"/>',
     up: '<path d="M7 14l5-5 5 5"/>',
     down: '<path d="M7 10l5 5 5-5"/>',
   };
@@ -2490,9 +2476,7 @@ async function main() {
           }
         };
         addPlanes(lvl.planes ?? [], 1);
-        const levelRooms = ROOMS_PREVIEW ? JSON.parse(app.rooms_json()).filter((r) => r.level === lvl.id) : [];
-        if (count === 0 && levelRooms.length === 0) block.append(el("div", { class: "tree-empty", text: "No elements yet" }));
-        if (levelRooms.length) block.append(...roomTreeRows(container, lvl.id, levelRooms));
+        if (count === 0) block.append(el("div", { class: "tree-empty", text: "No elements yet" }));
         for (const g of lvl.groups) {
           const gkey = `group:${lvl.id}:${g.key}`;
           const gcollapsed = treeCollapsed.has(gkey);
@@ -2506,6 +2490,7 @@ async function main() {
           block.append(gh);
           if (gcollapsed) continue;
           for (const it of g.items) {
+            if (it.kind === "room") { block.append(roomTreeRow(container, it)); continue; }
             const canEdit = it.editable;
             const r = el("div", {
               class: `tree-row item${it.selected ? " selected" : ""}`, role: "button", tabindex: "0",
@@ -2722,24 +2707,13 @@ async function main() {
     toast(`Imported ${file.name}`, { kind: "ok" });
   });
 
-  // -- Rooms (preview, ?rooms) ------------------------------------------------------------
-  // App-side rooms over a temporary adapter (Rust `authoring::rooms`):
-  // the Rooms tool draws a boundary (polygon or rectangle); a room is
-  // selected from the plan or the Model tree; its page renames it,
-  // restacks it (a room higher in the order cuts into the ones below),
-  // and sets the plane's room wall settings; Room Edit Mode edits its
-  // boundary and hides the wall of chosen edges.
-  let roomsRevision = -1;
-  function syncRooms() {
-    const rev = app.rooms_revision();
-    if (rev === roomsRevision) return;
-    roomsRevision = rev;
-    store.set(ROOMS_KEY, app.rooms_state_json());
-    renderTreePanel();
-    if (sheetPage === "model") renderTree(sheetBody);
-    if (sheetPage === "room") pageRoom();
-    requestRender();
-  }
+  // -- Rooms ------------------------------------------------------------------------------
+  // Rooms are the library's Room entities on a construction plane; their
+  // walls come from the plane's RoomLayout, owned by a "Room walls"
+  // element. A room is selected from the plan or the Model tree; its
+  // page renames it, restacks it (a room higher in the order cuts into
+  // the ones below), sets its walls, and deletes it; Room Edit Mode edits
+  // its boundary and hides the wall of chosen edges.
   const selectedRoom = () => JSON.parse(app.rooms_json()).find((r) => r.selected) ?? null;
   function selectRoom(id) {
     app.room_select(id);
@@ -2747,9 +2721,17 @@ async function main() {
     // A room shows on its plane: make it the active one.
     if (r && JSON.parse(app.levels_json()).activePlane?.id !== r.plane) activatePlane(r.plane);
     openSheet("room", { root: true });
+    stats = JSON.parse(app.stats_json());
     renderTreePanel();
     renderViewCluster();
     requestRender();
+  }
+  function deleteRoom(r) {
+    if (app.room_delete(r.id)) {
+      if (sheetPage === "room") closeSheet(false);
+      refresh();
+      toast(`Deleted ${r.name}`);
+    }
   }
   function beginRoomEdit(id) {
     if (!app.room_edit_begin(id)) { toast("This room cannot be edited now", { kind: "error" }); return; }
@@ -2757,91 +2739,120 @@ async function main() {
     fitView();
     requestRender();
   }
-  function roomTreeRows(container, levelId, rooms) {
-    const gkey = `group:${levelId}:rooms`;
-    const collapsed = treeCollapsed.has(gkey);
-    const head = el("button", {
-      type: "button", class: "tree-group", "data-tree-group": "rooms",
-      html: `<span class="twist${collapsed ? " collapsed" : ""}">${svg(TREE_ICON.twist, "ico sm")}</span>` +
-        `<span>Rooms</span><span class="count">${rooms.length}</span>`,
+  /** A Model tree row of a room: select; Bring forward / Send backward;
+   *  the pencil (Room Edit Mode). */
+  function roomTreeRow(container, it) {
+    const row = el("div", {
+      class: `tree-row item room${it.selected ? " selected" : ""}`, role: "button", tabindex: "0", "data-tree-room": String(it.id),
+      html: `<span class="tree-kind">${svg(TREE_ICON.room)}</span><span class="tree-name"></span><span class="tree-meta"></span>` +
+        `<span class="tree-actions">` +
+        treeAction("data-room-up", "Bring forward: cut into the room below", TREE_ICON.up) +
+        treeAction("data-room-down", "Send backward", TREE_ICON.down) +
+        treeAction("data-room-edit", "Edit the boundary", TREE_ICON.pencil) + `</span>`,
     });
-    head.addEventListener("click", () => { toggleCollapsed(gkey); renderTree(container); });
-    if (collapsed) return [head];
-    // Top of the order first: the order decides which room cuts into which.
-    const rows = [...rooms].sort((a, b) => a.plane - b.plane || a.rank - b.rank).map((r) => {
-      const row = el("div", {
-        class: `tree-row item room${r.selected ? " selected" : ""}`, role: "button", tabindex: "0", "data-tree-room": String(r.id),
-        html: `<span class="tree-kind">${svg(TREE_ICON.room)}</span><span class="tree-name"></span><span class="tree-meta"></span>` +
-          `<span class="tree-actions">` +
-          treeAction("data-room-up", "Bring forward: cut into the room below", TREE_ICON.up) +
-          treeAction("data-room-down", "Send backward", TREE_ICON.down) +
-          treeAction("data-room-edit", "Edit the boundary", TREE_ICON.pencil) + `</span>`,
-      });
-      row.querySelector(".tree-name").textContent = r.name;
-      row.querySelector(".tree-meta").textContent = fmtArea(r.area);
-      row.querySelector("[data-room-up]").disabled = r.rank <= 1;
-      row.querySelector("[data-room-down]").disabled = r.rank >= r.ofRank;
-      row.addEventListener("click", (e) => {
-        if (e.target.closest("[data-room-up]")) { app.room_restack(r.id, true); refresh(); return; }
-        if (e.target.closest("[data-room-down]")) { app.room_restack(r.id, false); refresh(); return; }
-        if (e.target.closest("[data-room-edit]")) {
-          if (sheetPage === "model" || sheetPage === "room") closeSheet(false);
-          beginRoomEdit(r.id);
-          return;
-        }
-        if (sheetPage === "model") closeSheet(false);
-        selectRoom(r.id);
-      });
-      return row;
+    row.querySelector(".tree-name").textContent = it.name;
+    row.querySelector(".tree-meta").textContent = it.meta;
+    row.querySelector("[data-room-up]").disabled = it.rank <= 1;
+    row.querySelector("[data-room-down]").disabled = it.rank >= it.ofRank;
+    row.addEventListener("click", (e) => {
+      if (e.target.closest("[data-room-up]")) { app.room_restack(it.id, true); refresh(); return; }
+      if (e.target.closest("[data-room-down]")) { app.room_restack(it.id, false); refresh(); return; }
+      if (e.target.closest("[data-room-edit]")) {
+        if (sheetPage === "model" || sheetPage === "room") closeSheet(false);
+        beginRoomEdit(it.id);
+        return;
+      }
+      if (sheetPage === "model") closeSheet(false);
+      selectRoom(it.id);
     });
-    return [head, ...rows];
+    return row;
+  }
+  /** The wall settings of a room layout: thickness, height mode (Fixed:
+   *  a height; Up to: a plane and an offset). One undo step each; typing
+   *  and slider drags coalesce. */
+  function roomWallsGroups(w) {
+    const layoutNow = () => JSON.parse(app.room_layout_json(w.layout)) ?? w;
+    const set = (t, mode, plane, offset, h) => {
+      const reason = app.set_room_layout(w.layout, t, mode, plane, offset, h);
+      if (reason) toast(reason, { kind: "error" });
+    };
+    const planes = JSON.parse(app.wall_settings_json()).planes;
+    const seg = el("div", { class: "seg small", id: "room-wall-mode" });
+    for (const [m, label] of [["fixed", "Fixed"], ["upto", "Up to"]]) {
+      seg.append(el("button", {
+        type: "button", text: label, "data-wall-mode": m, class: w.mode === m ? "on" : "",
+        onclick: () => {
+          if (m === w.mode) return;
+          if (m === "fixed") set(NaN, "fixed", -1, NaN, NaN);
+          else set(NaN, "upto", planeAbove(planes, w.baseElevation) ?? -1, 0, NaN);
+          app.end_gesture();
+          refresh();
+          renderSheet();
+        },
+      }));
+    }
+    const groups = [
+      measureGroup({
+        title: "Wall thickness", label: "Centered on the room edges", id: "room-wall-thickness", value: w.thickness,
+        min: 0.05, max: 0.6, step: WALL_THICKNESS_STEP_M, decimals: WALL_THICKNESS_DECIMALS,
+        apply: (v) => set(v, "", -1, NaN, NaN), current: () => layoutNow().thickness,
+      }),
+    ];
+    const rows = [el("div", { class: "field" }, el("span", { class: "field-label", text: "Height" }), seg)];
+    if (w.mode === "upto") {
+      const picker = el("select", { class: "plane-picker", id: "room-wall-top", "aria-label": "Room wall top plane" });
+      planeOptions(picker, planes, w.topPlane);
+      picker.addEventListener("change", () => { set(NaN, "upto", Number(picker.value), NaN, NaN); app.end_gesture(); refresh(); renderSheet(); });
+      rows.push(
+        el("div", { class: "field" }, el("span", { class: "field-label", text: "Top at" }), picker),
+        el("div", { class: "field" }, el("span", { class: "field-label", text: "Wall height" }),
+          el("span", { class: "value", id: "room-wall-effective", text: fmtM(w.effectiveHeight) })),
+      );
+      groups.push(group("Room wall height", ...rows), measureGroup({
+        title: "Top offset", label: "From the top plane", id: "room-wall-offset", value: w.topOffset,
+        min: -WALL_TOP_OFFSET_RANGE_M, max: WALL_TOP_OFFSET_RANGE_M, step: WALL_TOP_OFFSET_STEP_M,
+        apply: (v) => set(NaN, "upto", layoutNow().topPlane ?? -1, v, NaN), current: () => layoutNow().topOffset,
+      }));
+    } else {
+      groups.push(group("Room wall height", ...rows), measureGroup({
+        title: "Height", label: "Above the plane", id: "room-wall-height", value: w.height,
+        min: 0.5, max: 6.0, step: WALL_HEIGHT_STEP_M,
+        apply: (v) => set(NaN, "", -1, NaN, v), current: () => layoutNow().height,
+      }));
+    }
+    if (w.issues?.length) groups.push(el("div", { class: "empty-note warn", id: "room-wall-issues", text: w.issues.join(" · ") }));
+    return groups;
   }
   function pageRoom() {
     const r = selectedRoom();
     if (!r) { closeSheet(false); return; }
     $("sheet-title").textContent = r.name;
     const nameInput = el("input", { type: "text", class: "wide", id: "room-name", value: r.name, autocomplete: "off" });
-    nameInput.addEventListener("change", () => {
-      if (!app.room_rename(r.id, nameInput.value)) nameInput.value = selectedRoom()?.name ?? r.name;
-      refresh();
-    });
-    const layout = JSON.parse(app.room_layout_json());
+    nameInput.addEventListener("input", () => { app.room_rename(r.id, nameInput.value); refresh(); });
+    nameInput.addEventListener("change", () => { app.end_gesture(); nameInput.value = selectedRoom()?.name ?? r.name; });
+    const walls = r.layout != null ? JSON.parse(app.room_layout_json(r.layout)) : null;
+    const note = r.note ? ` · ${r.note}` : "";
     const children = [
       group(null, el("div", { class: "field" }, el("label", { for: "room-name", text: "Name" }), nameInput)),
       el("div", { class: "stat-grid" },
         stat("Area", "room-area", fmtArea(r.area)),
         stat("Order", "room-rank", `${r.rank} of ${r.ofRank}`)),
-      el("div", { class: "empty-note", style: "padding:0 4px 10px;text-align:left",
-        text: `${r.edges} edges · ${r.hiddenEdges} hidden wall${r.hiddenEdges === 1 ? "" : "s"}. A room higher in the order cuts into the rooms it overlaps.` }),
+      el("div", { class: "empty-note", id: "room-note", style: "padding:0 4px 10px;text-align:left",
+        text: `${r.edges} edges · ${r.hiddenEdges} hidden wall${r.hiddenEdges === 1 ? "" : "s"}${note}. A room higher in the order cuts into the rooms it overlaps.` }),
       el("button", {
         type: "button", class: "btn primary block", id: "room-edit", style: "margin-bottom:10px",
         html: `${svg(TREE_ICON.pencil)} Edit boundary`, onclick: () => { closeSheet(false); beginRoomEdit(r.id); },
       }),
       el("div", { class: "room-order" },
-        el("button", { type: "button", class: "btn", id: "room-forward", text: "Bring forward", disabled: r.rank <= 1 ? "" : null,
+        el("button", { type: "button", class: "btn", id: "room-forward", text: "Bring forward", disabled: r.rank <= 1,
           onclick: () => { app.room_restack(r.id, true); refresh(); } }),
-        el("button", { type: "button", class: "btn", id: "room-backward", text: "Send backward", disabled: r.rank >= r.ofRank ? "" : null,
+        el("button", { type: "button", class: "btn", id: "room-backward", text: "Send backward", disabled: r.rank >= r.ofRank,
           onclick: () => { app.room_restack(r.id, false); refresh(); } })),
     ];
-    if (layout) {
-      children.push(
-        measureGroup({
-          title: "Room walls", label: "Thickness (this plane)", id: "room-wall-thickness", value: layout.thickness,
-          min: 0.05, max: 0.6, step: WALL_THICKNESS_STEP_M, decimals: WALL_THICKNESS_DECIMALS,
-          apply: (v) => app.set_room_layout(v, "", -1, NaN, NaN),
-          current: () => JSON.parse(app.room_layout_json()).thickness,
-        }),
-        measureGroup({
-          title: "Room wall height", label: "Above the plane", id: "room-wall-height", value: layout.height,
-          min: 0.5, max: 6.0, step: WALL_HEIGHT_STEP_M,
-          apply: (v) => app.set_room_layout(NaN, "fixed", -1, NaN, v),
-          current: () => JSON.parse(app.room_layout_json()).height,
-        }),
-      );
-    }
+    if (walls) children.push(...roomWallsGroups(walls));
     children.push(el("button", {
-      type: "button", class: "btn danger block", id: "room-delete", text: "Delete room",
-      onclick: () => { const name = r.name; if (app.room_delete(r.id)) { closeSheet(false); refresh(); toast(`Deleted ${name}`); } },
+      type: "button", class: "btn subtle-danger block", id: "room-delete", html: `${icon("trash")} Delete room`,
+      onclick: () => deleteRoom(r),
     }));
     sheetBody.replaceChildren(...children.filter(Boolean));
   }
@@ -2869,7 +2880,7 @@ async function main() {
 
   // -- Properties ------------------------------------------------------------------------
   let propsFor = null;
-  const KIND_LABEL = { floor_plate: "Floor plate", wall: "Wall", element: "Element" };
+  const KIND_LABEL = { floor_plate: "Floor plate", wall: "Wall", room_walls: "Room walls", element: "Element" };
   // A numeric property edited by stepper, text field, and slider. One
   // undo step per edit gesture: typing and dragging coalesce until the
   // field commits; each stepper tap is its own step.
@@ -2986,6 +2997,23 @@ async function main() {
             html: `${icon("plus")} Door`, onclick: () => beginOpenings("door"),
           })),
       );
+    }
+    if (e.kind === "room_walls") {
+      // The walls of a plane's rooms: their settings; no delete (they
+      // come from the rooms).
+      children.push(
+        el("div", { class: "empty-note", id: "prop-room-walls-note", style: "padding:0 4px 10px;text-align:left",
+          text: `The walls of ${e.rooms} room${e.rooms === 1 ? "" : "s"} on this plane. Change a room's boundary, or hide a wall, in the room's Edit Mode.` }),
+        el("div", { class: "stat-grid" },
+          stat("Footprint", "prop-area", fmtArea(e.footprintArea)),
+          stat("Openings", "prop-window-count", String(e.openings))),
+        ...roomWallsGroups(e),
+        el("div", { class: "btn-row", style: "margin-bottom:10px" },
+          el("button", { type: "button", class: "btn", id: "prop-add-window", html: `${icon("plus")} Window`, onclick: () => beginOpenings("window") }),
+          el("button", { type: "button", class: "btn", id: "prop-add-door", html: `${icon("plus")} Door`, onclick: () => beginOpenings("door") })),
+      );
+      sheetBody.replaceChildren(...children);
+      return;
     }
     children.push(el("button", {
       type: "button", class: "btn subtle-danger block", id: "prop-delete",
@@ -3135,6 +3163,8 @@ async function main() {
     const e = JSON.parse(app.selected_json());
     if (!e) { closeSheet(false); return; }
     if (e.id !== propsFor) { pageProperties(); return; }
+    // Room walls: re-render unless the user is typing in the sheet.
+    if (e.kind === "room_walls") { if (!sheetBody.contains(document.activeElement)) pageProperties(); return; }
     $("sheet-title").textContent = e.name;
     const name = $("prop-name");
     if (name) guardAssign(name, e.name);

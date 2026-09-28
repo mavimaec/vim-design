@@ -863,6 +863,114 @@ pub fn convert_legacy_plate(doc: &mut Document, plate: &PlateModel) -> Result<En
 
 /// Next free "Floor plate N" name, derived from the document (never a
 /// stored counter: undo/redo/reload keep it honest).
+/// Settings of a plane's new room layout (its first room).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LayoutSettings {
+    pub thickness_m: f64,
+    pub height_m: f64,
+    pub top: Option<EntityId>,
+    pub top_offset_m: f64,
+}
+
+/// Name of a plane's "Room walls" element: the first one plain, then
+/// numbered by the copy rule ("Room walls 2").
+pub const ROOM_WALLS_NAME: &str = "Room walls";
+
+/// The room layout on `plane`, if any.
+pub fn layout_on(doc: &Document, plane: EntityId) -> Option<EntityId> {
+    doc.entities().find_map(|(id, r)| {
+        let on = matches!(r.params, Params::RoomLayout { .. })
+            && r.inputs.get(slot::ROOM_LAYOUT_PLANE).and_then(|s| s.referenced().next()) == Some(plane);
+        on.then_some(*id)
+    })
+}
+
+/// The element that owns a layout.
+pub fn layout_element(doc: &Document, layout: EntityId) -> Option<EntityId> {
+    doc.dependents(layout).ok()?.into_iter().find(|d| doc.entity(*d).is_some_and(|e| e.kind() == EntityKind::Element))
+}
+
+/// A new room on `plane`, added to the plane's layout; the plane's first
+/// room creates the layout (with `settings`) and its "Room walls"
+/// element, associated with `level`. Several commands: the caller makes
+/// them one gesture.
+pub fn create_room(
+    doc: &mut Document,
+    plane: EntityId,
+    level: EntityId,
+    room: &vim_design_lib::room::RoomData,
+    settings: LayoutSettings,
+) -> Result<EntityId, String> {
+    let layout = match layout_on(doc, plane) {
+        Some(l) => l,
+        None => {
+            let layout = one(
+                doc,
+                Command::CreateRoomLayout {
+                    plane,
+                    top: settings.top,
+                    rooms: Vec::new(),
+                    thickness_m: settings.thickness_m,
+                    height_m: settings.height_m,
+                    top_offset_m: settings.top_offset_m,
+                    openings: Vec::new(),
+                },
+            )?;
+            let names = element_names(doc);
+            let name = if names.iter().any(|n| n == ROOM_WALLS_NAME) {
+                super::clipboard::copy_name(ROOM_WALLS_NAME, names.iter().map(String::as_str))
+            } else {
+                ROOM_WALLS_NAME.to_owned()
+            };
+            one(doc, Command::CreateElement { name, members: vec![layout], level })?;
+            layout
+        }
+    };
+    one(
+        doc,
+        Command::CreateRoom {
+            plane,
+            name: room.name.clone(),
+            precedence: room.precedence,
+            boundary: room.boundary.clone(),
+            hidden_edges: room.hidden_edges.clone(),
+            layout: Some(layout),
+        },
+    )
+}
+
+/// Delete a room (its layout's openings on its edges go); the plane's
+/// last room takes the layout and its "Room walls" element with it.
+/// Several commands: the caller makes them one gesture.
+pub fn delete_room(doc: &mut Document, room: EntityId) -> Result<(), String> {
+    let layout = super::model::rooms(doc).into_iter().find(|r| r.room == room).and_then(|r| r.layout);
+    ok(doc, Command::DeleteRoom { id: room })?;
+    if let Some(layout) = layout
+        && vim_design_lib::room_layout::inputs(doc, layout).is_some_and(|i| i.rooms.is_empty())
+    {
+        if let Some(element) = layout_element(doc, layout) {
+            ok(doc, Command::DeleteElement { id: element, sweep_orphans: false })?;
+        }
+        ok(doc, Command::DeleteRoomLayout { id: layout })?;
+    }
+    Ok(())
+}
+
+/// An `UpdateRoomLayout` of the openings only.
+pub fn update_layout_openings(layout: EntityId, openings: Vec<vim_design_lib::room_layout::RoomOpening>, coalesce: bool) -> Command {
+    Command::UpdateRoomLayout {
+        id: layout,
+        plane: None,
+        top: None,
+        rooms: None,
+        thickness_m: None,
+        height_m: None,
+        top_offset_m: None,
+        openings: Some(openings),
+        coalesce,
+    }
+}
+
 /// Every element's name.
 pub fn element_names(doc: &Document) -> Vec<String> {
     doc.entities()
