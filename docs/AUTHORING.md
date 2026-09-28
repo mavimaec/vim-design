@@ -817,6 +817,12 @@ state.
   level when it moves. When the next story is at or below the cut, the top is raised to
   the cut and `top_raised` is set. Geometry on a workplane uses its root level's span
   (`plan_span::resolve_for_plane`).
+- **Upper floor plates stay inside the lower story's span (decided 2026-09-28).** A
+  floor plate hangs below its level (a 0.3 m plate on Level 2 at 3.0 m occupies
+  2.7–3.0 m), so with the `NextStory` default it lies inside Ground's span and reads as
+  Ground's ceiling (opaque); walls and anything above the next story are see-through.
+  The user chose this behaviour; to make upper plates see-through, set an `Offset` top
+  below the plate.
 - **Validity.** The commands reject (`InvalidPlanSpan`) a non-finite value, an opacity
   outside 0..=1, a bottom not below the cut, and a cut not below a fixed (`Offset`) top
   (`plan_span::validate`). A second `PlanSpan` on a level is rejected with
