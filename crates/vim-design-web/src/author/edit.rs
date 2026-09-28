@@ -36,6 +36,7 @@ use crate::authoring::edit::{Edit, EditError, FaceKind, ProfileModel, ProfileVie
 use crate::authoring::geom::P2;
 use crate::authoring::model::{self, ElementModel, WallModel, WallRunModel};
 use crate::authoring::ops;
+use crate::authoring::rooms::RoomProfile;
 use crate::authoring::runs::{RunModel, reversed, run_error};
 use crate::authoring::sketch::{Shape, Sketch, SketchTool};
 use crate::authoring::snap::SnapResult;
@@ -45,6 +46,8 @@ use crate::authoring::snap::SnapResult;
 pub enum EditProfile {
     Sketch(Profile),
     Run(RunModel),
+    /// Rooms preview: a room's boundary.
+    Room(RoomProfile),
 }
 
 impl Default for EditProfile {
@@ -57,7 +60,7 @@ impl EditProfile {
     pub(super) fn run(&self) -> Option<&RunModel> {
         match self {
             EditProfile::Run(r) => Some(r),
-            EditProfile::Sketch(_) => None,
+            EditProfile::Sketch(_) | EditProfile::Room(_) => None,
         }
     }
 
@@ -65,6 +68,7 @@ impl EditProfile {
         match self {
             EditProfile::Sketch(s) => s.faces.is_empty(),
             EditProfile::Run(r) => r.data.points.is_empty(),
+            EditProfile::Room(r) => r.room.boundary.is_empty(),
         }
     }
 }
@@ -74,6 +78,7 @@ impl ProfileModel for EditProfile {
         match self {
             EditProfile::Sketch(s) => s.view(),
             EditProfile::Run(r) => r.view(),
+            EditProfile::Room(r) => r.view(),
         }
     }
 
@@ -81,6 +86,7 @@ impl ProfileModel for EditProfile {
         match self {
             EditProfile::Sketch(s) => s.apply(edit).map(EditProfile::Sketch),
             EditProfile::Run(r) => r.apply(edit).map(EditProfile::Run),
+            EditProfile::Room(r) => r.apply(edit).map(EditProfile::Room),
         }
     }
 }
@@ -95,8 +101,8 @@ pub struct RunEdit {
 }
 
 /// Limits for face thickness and void depth (meters).
-const MIN_FACE_THICKNESS_M: f64 = 0.01;
-const MAX_FACE_THICKNESS_M: f64 = 5.0;
+pub(super) const MIN_FACE_THICKNESS_M: f64 = 0.01;
+pub(super) const MAX_FACE_THICKNESS_M: f64 = 5.0;
 
 /// What a pointer gesture in Edit Mode is doing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -131,6 +137,8 @@ pub enum EditTarget {
     Plane,
     /// A wall run: its polyline on the base plane, in plan.
     Run,
+    /// Rooms preview: a room's boundary on its plane, in plan.
+    Room,
 }
 
 /// Pointer state of a move drag: where it was pressed on the plane, and
@@ -182,7 +190,8 @@ impl AuthorApp {
         };
         self.edit_sketch = Some(p.sketch_entity);
         self.edit_entry_element = Some(id);
-        self.start_edit(EditSession::new(EditProfile::Sketch(p.sketch.clone()), p.plane_level, Some(id), p.name.clone()));
+        let session = self.floor_session(EditProfile::Sketch(p.sketch.clone()), p.plane_level, Some(id), p.name.clone());
+        self.start_edit(session);
         true
     }
 
@@ -197,8 +206,7 @@ impl AuthorApp {
         self.gestures.begin_session(&self.doc);
         self.edit_sketch = None;
         self.edit_entry_element = None;
-        let mut session = EditSession::new(EditProfile::default(), plane, None, name);
-        session.new_thickness = self.plate_thickness;
+        let session = self.floor_session(EditProfile::default(), plane, None, name);
         self.start_edit(session);
         self.edit_set_tool("solid");
         true
@@ -372,6 +380,11 @@ impl AuthorApp {
         let Some(session) = self.edit.take() else {
             return r#"{"result":"none"}"#.to_owned();
         };
+        if self.edit_target == EditTarget::Room {
+            let changed = self.end_room_session(true);
+            self.leave_edit();
+            return serde_json::json!({ "result": "confirmed", "changed": changed, "name": session.name }).to_string();
+        }
         let empty = session.model.is_empty();
         let mut deleted = false;
         if empty && self.edit_entry_element.is_none() {
@@ -407,6 +420,11 @@ impl AuthorApp {
     /// Leave Edit Mode discarding the changes: the document returns to
     /// its state at entry.
     pub fn edit_cancel(&mut self) {
+        if self.edit_target == EditTarget::Room && self.edit.take().is_some() {
+            self.end_room_session(false);
+            self.leave_edit();
+            return;
+        }
         if self.edit.take().is_some() {
             self.gestures.cancel_session(&mut self.doc);
             self.leave_edit();
@@ -432,7 +450,9 @@ impl AuthorApp {
         let Some(level) = self.edit.as_ref().map(|s| s.level) else {
             return false;
         };
-        let run = self.edit_target == EditTarget::Run;
+        let run = self.edit_target != EditTarget::Plane;
+        let room = self.edit_target == EditTarget::Room;
+        let tool = if room { "select" } else { tool };
         self.edit_tool = match tool {
             "solid" if !run => EditTool::Solid,
             "void" if !run => EditTool::Void,
@@ -613,6 +633,9 @@ impl AuthorApp {
     }
 
     pub fn edit_undo(&mut self) -> bool {
+        if self.edit_target == EditTarget::Room {
+            return self.edit.is_some() && self.rooms_undo();
+        }
         if self.edit.is_none() || !self.gestures.undo(&mut self.doc) {
             return false;
         }
@@ -622,6 +645,9 @@ impl AuthorApp {
     }
 
     pub fn edit_redo(&mut self) -> bool {
+        if self.edit_target == EditTarget::Room {
+            return self.edit.is_some() && self.rooms_redo();
+        }
         if self.edit.is_none() || !self.gestures.redo(&mut self.doc) {
             return false;
         }
@@ -639,11 +665,15 @@ impl AuthorApp {
         let t = t.clamp(MIN_FACE_THICKNESS_M, MAX_FACE_THICKNESS_M);
         let Some(s) = self.edit.as_mut() else { return r#"{"result":"none"}"#.to_owned() };
         let solids = selected_faces(s, false);
-        if solids.is_empty() {
+        let fresh = s.is_fresh();
+        if solids.is_empty() || fresh {
+            // The default for new faces; the just-drawn faces follow it.
             s.new_thickness = t;
             if self.edit_target == EditTarget::Plane {
                 self.plate_thickness = t; // remembered for the next new plate
             }
+        }
+        if solids.is_empty() {
             return r#"{"result":"default"}"#.to_owned();
         }
         self.edit_apply(&Edit::SetKind { faces: solids, kind: FaceKind::Solid { thickness: t } }, Some("thickness"), "changed")
@@ -658,9 +688,13 @@ impl AuthorApp {
         let d = depth.clamp(MIN_FACE_THICKNESS_M, MAX_FACE_THICKNESS_M);
         let Some(s) = self.edit.as_mut() else { return r#"{"result":"none"}"#.to_owned() };
         let voids = selected_faces(s, true);
-        if voids.is_empty() {
+        if voids.is_empty() || s.is_fresh() {
             s.new_void_depth = d;
             s.new_void_through = false;
+            self.remembered.void_depth = d;
+            self.remembered.void_through = false;
+        }
+        if voids.is_empty() {
             return r#"{"result":"default"}"#.to_owned();
         }
         self.edit_apply(&Edit::SetKind { faces: voids, kind: FaceKind::Void { depth: Some(d) } }, Some("depth"), "changed")
@@ -670,8 +704,11 @@ impl AuthorApp {
     pub fn edit_set_through(&mut self, through: bool) -> String {
         let Some(s) = self.edit.as_mut() else { return r#"{"result":"none"}"#.to_owned() };
         let voids = selected_faces(s, true);
-        if voids.is_empty() {
+        if voids.is_empty() || s.is_fresh() {
             s.new_void_through = through;
+            self.remembered.void_through = through;
+        }
+        if voids.is_empty() {
             return r#"{"result":"default"}"#.to_owned();
         }
         let depth = s
@@ -712,7 +749,13 @@ impl AuthorApp {
                 _ => None,
             })
             .collect();
-        let target = if kinds.is_empty() { "new" } else { "selection" };
+        let target = if kinds.is_empty() {
+            "new"
+        } else if s.is_fresh() {
+            "fresh" // the just-drawn faces: their values are also the defaults
+        } else {
+            "selection"
+        };
         let solid = if kinds.is_empty() {
             Some(serde_json::json!({ "count": 0, "thickness": s.new_thickness, "mixed": false }))
         } else {
@@ -748,7 +791,12 @@ impl AuthorApp {
             "canDelete": !s.selection.is_empty(),
             "canUndo": self.edit_can_undo(),
             "canRedo": self.edit_can_redo(),
-            "target": if self.edit_target == EditTarget::Run { "run" } else { "floor" },
+            "target": match self.edit_target {
+                EditTarget::Run => "run",
+                EditTarget::Room => "room",
+                EditTarget::Plane => "floor",
+            },
+            "room": self.room_edit_state_json(),
             "run": self.run_state_json(),
             "faces": s.model.view().faces.len(),
             "panel": { "target": target, "solid": solid, "void": void },
@@ -841,15 +889,24 @@ impl AuthorApp {
             Some(crate::authoring::edit::session::Drag { preview: Ok(p), .. }) => p.run(),
             _ => s.model.run(),
         };
-        let footprint: Vec<Vec<[f32; 2]>> = run
+        let mut footprint: Vec<Vec<[f32; 2]>> = run
             .map(|r| crate::authoring::runs::footprint(&r.data).iter().map(|ring| ring.iter().filter_map(|p| proj(*p)).collect()).collect())
             .unwrap_or_default();
+        // A room: its boundary as the filled outline (edges and points on top).
+        let room = match (&s.drag, &s.model) {
+            (Some(crate::authoring::edit::session::Drag { preview: Ok(EditProfile::Room(p)), .. }), _) | (_, EditProfile::Room(p)) => Some(p),
+            _ => None,
+        };
+        if let Some(p) = room {
+            footprint = vec![p.room.polygon().iter().filter_map(|q| proj(*q)).collect()];
+        }
         serde_json::json!({
             "active": true,
             "mode": s.mode.name(),
             "footprint": footprint,
-            "closed": run.is_some_and(|r| r.data.closed),
-            "faces": if run.is_some() { Vec::new() } else { faces_json },
+            "closed": run.is_some_and(|r| r.data.closed) || room.is_some(),
+            "room": room.is_some(),
+            "faces": if run.is_some() || room.is_some() { Vec::new() } else { faces_json },
             "edges": edges_json,
             "points": points_json,
             "marquee": s.marquee.as_ref().map(|m| m.rect),
@@ -1018,15 +1075,16 @@ impl AuthorApp {
     }
 
     pub(super) fn edit_can_undo(&self) -> bool {
-        self.gestures.can_undo()
+        if self.edit_target == EditTarget::Room { self.rooms_can_undo() } else { self.gestures.can_undo() }
     }
 
     pub(super) fn edit_can_redo(&self) -> bool {
-        self.gestures.can_redo()
+        if self.edit_target == EditTarget::Room { self.rooms_can_redo() } else { self.gestures.can_redo() }
     }
 
-    fn start_edit(&mut self, session: EditSession<EditProfile>) {
+    pub(super) fn start_edit(&mut self, session: EditSession<EditProfile>) {
         self.selection = None;
+        self.paste_armed = false; // a paste belongs to the mode it was armed in
         self.tool = Tool::Select;
         self.sketch = None;
         self.edit_tool = EditTool::Select;
@@ -1036,7 +1094,8 @@ impl AuthorApp {
     }
 
     fn leave_edit(&mut self) {
-        if self.edit_target == EditTarget::Run {
+        self.paste_armed = false;
+        if matches!(self.edit_target, EditTarget::Run | EditTarget::Room) {
             if let Some(c) = self.prev_camera.take() {
                 self.camera = c;
             }
@@ -1057,6 +1116,10 @@ impl AuthorApp {
     /// undo, or redo). A sketch undone away leaves an empty profile; redo
     /// brings the same entity back.
     fn reload_edit_model(&mut self) {
+        if self.edit_target == EditTarget::Room {
+            self.reload_room_edit();
+            return;
+        }
         if self.edit_target == EditTarget::Run {
             let run = self.run_edit.and_then(|e| self.run_model(e.element)).map(|r| RunModel { data: r.data.clone(), height: r.top_height });
             if let (Some(run), Some(s)) = (run, self.edit.as_mut()) {
@@ -1123,6 +1186,9 @@ impl AuthorApp {
             let Some(edit) = self.run_edit else { return r#"{"result":"none"}"#.to_owned() };
             return self.submit_run_edit(ops::update_run(edit.run, &run.data, false), key, ok);
         }
+        if let EditProfile::Room(p) = next {
+            return self.store_room_edit(p.room, ok);
+        }
         let EditProfile::Sketch(next) = next else { return r#"{"result":"none"}"#.to_owned() };
         let (plane, name) = (s.level, s.name.clone());
         let level = self.root_level(plane).unwrap_or(plane);
@@ -1180,10 +1246,41 @@ impl AuthorApp {
                 Edit::AddFace { outline, kind }
             }
         };
+        let adding = matches!(edit, Edit::AddFace { .. });
+        let before: std::collections::BTreeSet<u32> = s.model.view().faces.iter().map(|f| f.id).collect();
         let out = self.edit_apply(&edit, None, "committed");
         if let Some(sk) = self.sketch.as_mut() {
             sk.points.clear();
         }
+        if adding && out.contains(r#""result":"committed""#) {
+            self.select_new_faces(&before);
+        }
         out
+    }
+
+    /// After a face was added: the faces not in `before` become the
+    /// selection (the panel then targets them — "fresh").
+    pub(super) fn select_new_faces(&mut self, before: &std::collections::BTreeSet<u32>) {
+        let Some(s) = self.edit.as_mut() else { return };
+        let fresh: std::collections::BTreeSet<u32> =
+            s.model.view().faces.iter().map(|f| f.id).filter(|id| !before.contains(id)).collect();
+        if !fresh.is_empty() {
+            s.select_fresh(fresh);
+        }
+    }
+
+    /// A floor plate session with the remembered defaults for new faces.
+    fn floor_session(
+        &self,
+        profile: EditProfile,
+        plane: EntityId,
+        element: Option<EntityId>,
+        name: String,
+    ) -> EditSession<EditProfile> {
+        let mut session = EditSession::new(profile, plane, element, name);
+        session.new_thickness = self.plate_thickness;
+        session.new_void_depth = self.remembered.void_depth;
+        session.new_void_through = self.remembered.void_through;
+        session
     }
 }

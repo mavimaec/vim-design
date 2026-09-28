@@ -8,7 +8,7 @@
 import { test, expect } from "@playwright/test";
 import {
   mobile, shot, openApp, stats, elements, walls, editState, camera, openings, openingsState, savedBytes,
-  worldToClient, tapClient, tapWorld, tool, shape, drawPlate, drawRoom, cdpTouch, dragClient, longPressClient,
+  worldToClient, tapClient, tapWorld, tool, shape, drawPlate, drawRoom, cdpTouch, dragClient, longPressClient, PARTITION_M,
 } from "./lib/app-helpers.js";
 
 const plates = async (page) => (await elements(page)).filter((e) => e.kind === "floor_plate");
@@ -295,7 +295,7 @@ test("wall Edit Mode in plan: the run's points and segments — move, insert, de
   await page.locator("#prop-edit").click();
   let es = await editState(page);
   expect(es).toMatchObject({ active: true, target: "run", mode: "points" });
-  expect(es.run).toMatchObject({ segments: 4, points: 4, closed: true, thickness: 0.2 });
+  expect(es.run).toMatchObject({ segments: 4, points: 4, closed: true, thickness: PARTITION_M });
   expect((await stats(page)).view).toBe("plan");
   expect((await page.evaluate(() => window.__author.editHud())).footprint).toHaveLength(2);
 
@@ -357,7 +357,7 @@ test("wall Edit Mode in plan: the run's points and segments — move, insert, de
   await page.locator("#edit-confirm").click();
   expect((await walls(page)).every((w) => Math.abs(w.thickness - 0.25) < 1e-9)).toBe(true);
   await page.locator("#undo").click();
-  expect((await walls(page)).every((w) => Math.abs(w.thickness - 0.2) < 1e-9)).toBe(true);
+  expect((await walls(page)).every((w) => Math.abs(w.thickness - PARTITION_M) < 1e-9)).toBe(true);
   await page.locator("#undo").click();
   expect(await savedBytes(page)).toBe(before);
   expect((await stats(page)).errors).toEqual([]);

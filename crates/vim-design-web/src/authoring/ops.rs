@@ -251,6 +251,21 @@ fn create_run(doc: &mut Document, base: EntityId, top: Option<EntityId>, run: Wa
     )
 }
 
+/// A wall run element from existing run data (a paste): the run on
+/// `base` (up to `top` when given) and its element, named `name`.
+pub fn create_run_element(
+    doc: &mut Document,
+    base: EntityId,
+    level: EntityId,
+    top: Option<EntityId>,
+    run: WallRunData,
+    name: &str,
+) -> Result<EntityId, String> {
+    vim_design_lib::wall_run::validate(&run).map_err(|e| super::runs::run_error(e).message().to_owned())?;
+    let id = create_run(doc, base, top, run)?;
+    one(doc, Command::CreateElement { name: name.to_owned(), members: vec![id], level })
+}
+
 /// An `UpdateWallRun` of the run's data (points, closed, thickness,
 /// openings, profiles).
 pub fn update_run(id: EntityId, run: &WallRunData, coalesce: bool) -> Command {
@@ -848,6 +863,16 @@ pub fn convert_legacy_plate(doc: &mut Document, plate: &PlateModel) -> Result<En
 
 /// Next free "Floor plate N" name, derived from the document (never a
 /// stored counter: undo/redo/reload keep it honest).
+/// Every element's name.
+pub fn element_names(doc: &Document) -> Vec<String> {
+    doc.entities()
+        .filter_map(|(_, r)| match &r.params {
+            Params::Element { name } => Some(name.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
 pub fn next_element_name(doc: &Document, prefix: &str) -> String {
     let max = doc
         .entities()

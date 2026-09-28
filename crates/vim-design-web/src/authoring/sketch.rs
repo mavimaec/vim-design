@@ -20,6 +20,8 @@ pub enum SketchTool {
     Profile,
     /// Edit Mode: a two-point line that splits the faces it crosses.
     Split,
+    /// Rooms (preview): a room boundary on the plane.
+    Room,
 }
 
 impl SketchTool {
@@ -30,6 +32,7 @@ impl SketchTool {
             SketchTool::Wall => "wall",
             SketchTool::Profile => "profile",
             SketchTool::Split => "split",
+            SketchTool::Room => "room",
         }
     }
 }

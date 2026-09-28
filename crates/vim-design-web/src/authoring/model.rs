@@ -1179,6 +1179,16 @@ mod tests {
     }
 
     #[test]
+    fn partition_walls_of_the_default_thickness_mesh() {
+        let mut doc = Document::new();
+        let ground = ops::seed_new_project(&mut doc).expect("seed");
+        let fixed = ops::WallHeight { height_m: 2.7, top: None, top_offset_m: 0.0 };
+        ops::commit_run(&mut doc, ground, ground, &[[-3.0, -2.0], [1.0, -2.0], [2.0, 0.0]], false, false, 0.114, fixed)
+            .expect("run");
+        assert_eq!(volumes(&mut doc).len(), 1);
+    }
+
+    #[test]
     fn m4_wall_chains_convert_to_one_run_keeping_openings_in_place() {
         use crate::authoring::runs::chain_of;
         use crate::authoring::walls;

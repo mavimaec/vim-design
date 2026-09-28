@@ -113,6 +113,13 @@ impl ProfileModel for Sketch {
                 }
                 sketch::validate_structure(&s).map(|_| s)
             }
+            Edit::AddFaces(faces) => {
+                let mut next = self.clone();
+                for (outline, kind) in faces {
+                    next = ops::add_face(&next, outline, (*kind).into()).map_err(edit_error)?;
+                }
+                Ok(next)
+            }
             Edit::Extend { .. } | Edit::SetClosed(_) => {
                 return Err(EditError::NoEffect("That edit applies to wall runs only"));
             }

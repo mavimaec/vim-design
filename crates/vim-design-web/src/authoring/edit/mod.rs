@@ -131,6 +131,8 @@ pub enum Edit {
     Extend { at_end: bool, uv: P2 },
     /// Wall runs: close the loop or open it.
     SetClosed(bool),
+    /// Several new faces at once (a paste): one edit.
+    AddFaces(Vec<(Vec<P2>, FaceKind)>),
 }
 
 /// Why an edit was refused. `message` is the short toast text.

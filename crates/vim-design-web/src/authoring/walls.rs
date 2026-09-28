@@ -25,6 +25,12 @@ use super::geom::{
     self, EPS, Invalid, P2, dist, normalized_ccw, self_intersects, validate_outline,
 };
 
+/// Default wall thickness: an interior partition — a 2x4 wood stud (89
+/// mm actual) with one 12.7 mm (1/2") gypsum board on each face: 89 + 2
+/// × 12.7 = 114.4 mm. New walls and room walls start with it; existing
+/// walls keep their stored thickness.
+pub const PARTITION_THICKNESS_M: f64 = 0.114;
+
 /// Shortest wall segment accepted after joins are applied (meters).
 pub const MIN_WALL_LENGTH_M: f64 = 0.05;
 /// Clearance a wall keeps above its highest opening when its height is

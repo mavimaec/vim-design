@@ -53,8 +53,10 @@ pub(super) fn update_wall(id: EntityId, coalesce: bool) -> Command {
 #[wasm_bindgen]
 impl AuthorApp {
     /// Settings for NEW walls (meters; `flip` puts the thickness on the
-    /// right of the drawing direction).
+    /// right of the drawing direction). The wall run just drawn (still
+    /// selected, no new point yet) takes the changed values too.
     pub fn set_wall_settings(&mut self, height: f64, thickness: f64, flip: bool) {
+        let before = (self.wall_height, self.wall_thickness, self.wall_flip);
         if height.is_finite() {
             self.wall_height = height.clamp(MIN_WALL_HEIGHT_M, MAX_WALL_HEIGHT_M);
         }
@@ -62,6 +64,29 @@ impl AuthorApp {
             self.wall_thickness = thickness.clamp(MIN_WALL_THICKNESS_M, MAX_WALL_THICKNESS_M);
         }
         self.wall_flip = flip;
+        let Some(id) = self.fresh_run() else { return };
+        let fid = id.0 as f64;
+        if (self.wall_thickness - before.1).abs() > 1e-12 {
+            self.set_wall_thickness(fid, self.wall_thickness);
+        }
+        if (self.wall_height - before.0).abs() > 1e-12 && self.wall_top.is_none() {
+            self.set_wall_height(fid, self.wall_height);
+        }
+        if flip != before.2
+            && let Some(r) = self.run_model(id).cloned()
+        {
+            // The material to the other side: the run reversed.
+            let depth = self.doc.undo_depth();
+            self.submit(ops::update_run(r.run, &crate::authoring::runs::reversed(&r.data), false));
+            self.gestures.one_shot(depth);
+            self.sync("wall flip");
+        }
+    }
+
+    /// The wall run just drawn, while it is the selection and the Wall
+    /// tool has no new point: the drawbar's settings apply to it.
+    pub fn fresh_wall(&self) -> f64 {
+        self.fresh_run().map_or(-1.0, |e| e.0 as f64)
     }
 
     pub fn wall_settings_json(&self) -> String {
@@ -82,9 +107,19 @@ impl AuthorApp {
     /// Height mode for new walls: "fixed" (the height setting) or "upto"
     /// (up to `plane` plus `offset`).
     pub fn set_wall_height_mode(&mut self, mode: &str, plane: f64, offset: f64) {
+        let before = (self.wall_top, self.wall_top_offset);
         self.wall_top = (mode == "upto").then(|| eid(plane)).filter(|p| self.root_level(*p).is_some());
         if offset.is_finite() {
             self.wall_top_offset = offset.clamp(-MAX_WALL_HEIGHT_M, MAX_WALL_HEIGHT_M);
+        }
+        if (self.wall_top, self.wall_top_offset) == before {
+            return;
+        }
+        if let Some(id) = self.fresh_run() {
+            let plane = self.wall_top.map_or(-1.0, |p| p.0 as f64);
+            if self.set_wall_top(id.0 as f64, plane, self.wall_top_offset) < 0.0 {
+                self.notice = Some("The new wall cannot take this height".to_owned());
+            }
         }
     }
 
@@ -318,6 +353,12 @@ fn run_update(
 }
 
 impl AuthorApp {
+    pub(super) fn fresh_run(&self) -> Option<EntityId> {
+        let id = self.fresh_run?;
+        let idle = self.sketch.as_ref().is_some_and(|s| s.points.is_empty());
+        (self.tool == super::Tool::Wall && idle && self.selection == Some(id) && self.run_model(id).is_some()).then_some(id)
+    }
+
     /// A wall run's height mode (see [`AuthorApp::set_wall_top`]).
     fn set_run_top(&mut self, r: &WallRunModel, plane: f64, offset: f64) -> f64 {
         let top = (plane >= 0.0).then(|| eid(plane));

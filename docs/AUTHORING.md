@@ -239,9 +239,9 @@ to insert a point, Delete (a point merges its segments; an edge merges its point
 the first), Extend from an end, Closed / Open, and the run's thickness, side, and height
 mode. Each edit is one `wall_run::ops` call and one `UpdateWallRun`.
 
-**Openings mode** (the Window tool, with its Window | Door choice): tap any wall, in plan
-or 3D, to place the preset (window 1.2 × 1.2 m at a 0.9 m sill; door 0.9 × 2.1 m, cut
-through the bottom edge) centred on the tap along that segment; tap an opening to
+**Openings mode** (the Openings tool, with its Window | Door choice): tap any wall, in
+plan or 3D, to place the preset (at first a window 1.2 × 1.2 m at a 0.9 m sill and a door
+0.9 × 2.1 m, cut through the bottom edge; then the last size chosen per kind) centred on the tap along that segment; tap an opening to
 select it; drag it along the segment (a window also up and down) on a 0.1 m grid,
 inside the segment's clear span (clear of the corner joins); set its width, height,
 sill, and Through or niche depth; Delete. "Wall" faces the segment worked on. Each
@@ -253,6 +253,44 @@ then the connected chain of `Wall`s (end to end, or butt joined) becomes ONE run
 corner to corner, on the first wall's height mode, its rectangular voids openings in
 place (`wall_run::from_walls`); a wall of another height keeps its shape as its
 segment's profile. They still display, select, and delete before that.
+
+**The item just created is the selection.** A face drawn in a floor's Edit Mode (solid
+or void), an opening just placed, and a wall run just drawn are selected, so the panel's
+values change them at once (the panel says "New void · depth", "New window · Wall 1",
+"Changes apply to Wall 1 and the next walls"). Those values are also the defaults for
+the next item. A wall run stays "fresh" until the next point or another tool; on phones,
+while a face tool stays armed, the drawing bar carries the new face's stepper.
+
+**Remembered settings** (session state, saved with the page's session): floor
+thickness; void depth and Through; wall thickness, height, side, height mode, top plane,
+and offset; window and door width / height / sill / niche per kind, and the niche depth;
+the outline shape per tool (floor, wall, room); the room wall thickness. New walls start
+at 0.114 m: a 2x4 stud (89 mm) with 12.7 mm gypsum board on both faces
+(`walls::PARTITION_THICKNESS_M`); the wall thickness steps by 5 mm.
+
+**Copy / Paste** (the pill under the view pill on phones, above it on desktop; Ctrl/Cmd+C
+and V). A copy belongs to the mode it was taken in: faces (a floor's Edit Mode), the
+selected opening (Openings mode), or a whole floor plate or wall run (Select). Paste ARMS
+a placement: a preview follows the pointer, each tap places one copy (one undo step), and
+it stays armed until Esc, the Paste button, another tool, or leaving the mode. Faces and
+elements land with their bounding-box centre at the tap, moved by whole snap steps; an
+element copy is named by the numbering rule ("Floor plate 2", "Kitchen 2"). Openings land
+on the tapped wall segment centred at the tap, each kept inside the clear span (refused
+with a toast when it does not fit).
+
+**Dock.** Select, Floor, Hole, Wall, Openings (and Rooms with `?rooms`). Snap moved to the
+view pill: it is an input aid for every mode, and the pill is also visible inside the
+Edit Modes, where the dock is replaced.
+
+**Rooms (preview, `?rooms`).** A temporary app-side adapter (`authoring::rooms`) follows
+the library contract of §12 until the app switches to it: the Rooms tool (rectangle or
+polygon; "Room 001", then the next number), plan overlays (region fill, name + area
+label, the wall network as bands, a hidden wall dashed), a Rooms group per level in the
+Model tree (select, Bring forward / Send backward, the pencil), the room page (rename,
+order, the plane's room wall thickness and height, delete), Room Edit Mode (points and
+edges; "Hidden wall" on the selected edges), and openings in room walls (anchored to the
+covering room edge). Room changes join the one Undo / Redo. The preview draws no wall
+solids and keeps the rooms beside the session, not in the document.
 
 **Attachment.** Sketches and wall runs live on their construction plane, in the space
 of its root level, so a level elevation edit moves everything on it (and on its
@@ -565,3 +603,121 @@ it as a segment profile. `WallRunData::into_params` gives the `Params`.
 **Compatibility.** `WallRun`, `RunFace`, `DeleteWorkplaneCascade`, and the wall-run
 commands were appended at the end of their serialized enums; the saved fixtures of the
 earlier milestones (v1, v2, v3) load, evaluate, and resave byte-identically.
+
+## 12. Rooms and room layouts
+
+A **`Room`** is a named area on a construction plane. Rooms are data: the walls come
+from the plane's **`RoomLayout`**, which owns the arrangement of its rooms and generates
+ONE wall network from it. A boundary that two rooms share is one wall; T and X junctions
+are exact.
+
+```rust
+// Params::Room {
+//     name: String,               // default "Room 001", "Room 002", ... (room::default_name)
+//     precedence: i32,            // a higher room cuts into a lower one
+//     boundary: Vec<RunPoint>,    // closed, counter-clockwise; interior on the left of each edge
+//     hidden_edges: Vec<u32>,     // edges (start point ids) that generate no wall
+// }
+// slot 0 = plane (required): Level | Workplane
+//
+// Params::RoomLayout {
+//     thickness_m: f64,           // DEFAULT_PARTITION_THICKNESS_M = 0.114 for new layouts
+//     height_m: f64,              // the top reference when `top` is unwired
+//     top_offset_m: f64,          // added to the top plane when `top` is wired
+//     openings: Vec<RoomOpening>,
+// }
+// RoomOpening { id, room: EntityId, edge: u32, offset_m, sill_m, width_m, height_m,
+//               kind: Window | Door, depth_m: Option<f64> }
+// slot 0 = plane (required); slot 1 = top (optional); slot 2 = rooms (multi: Room)
+```
+
+- **Default thickness.** `DEFAULT_PARTITION_THICKNESS_M` (0.114 m, in `wall` and
+  re-exported by `room_layout`) is a stud-and-gypsum partition: a 2x4 stud (89 mm actual)
+  with one 12.7 mm gypsum board on each face. The app uses it for new walls and layouts.
+- **Effective regions.** Rooms are ranked by precedence (higher first; ties by entity
+  id). A room's effective region is its boundary minus the boundaries of all rooms ranked
+  above it, so regions never overlap: where rooms overlap, the higher room's shape cuts
+  into the lower one. A region can be `Whole`, in `Pieces(n)`, `Empty` (entirely under
+  higher rooms), or `Invalid` (the room fails `room::validate`: a self-crossing, zero-area,
+  or clockwise boundary). `Engine::room_regions(layout)` gives every room's region
+  (polygons with holes, area, status) for overlays and labels.
+- **Wall graph.** The edges of all effective regions, split at every vertex on them and
+  deduplicated. Each segment knows the room edges that cover it (collinear overlap). A
+  segment is hidden (no wall) when ANY covering room edge is hidden: hiding the shared
+  edge in either room removes the wall, and both rooms stay distinct rooms (a dining
+  nook open to the kitchen). A segment where a higher room cuts into a lower one is
+  covered by the higher room's edge.
+- **Footprint.** Walls are centered on the visible segments, `thickness_m` wide: one
+  rectangle per segment, square at both ends, plus a kite at every outside corner (a gap
+  wider than a half turn between two consecutive walls at a node) up to the miter point
+  of the two wall faces, or a bevel when that point is farther than `MITER_LIMIT` (4) half
+  thicknesses from the node. Inside corners, straight runs, T and X junctions need no
+  filler: the rectangles meet exactly, at any angle. A wall end with no other wall at its
+  node (next to a hidden edge) is square. The pieces are united with `i_overlay`.
+  Limits: at a sharp inside corner the two wall faces meet `h / sin(gap / 2)` from the
+  node; walls shorter than that keep their square ends there (the footprint is still the
+  union of the two walls, only the inside corner stays open).
+- **Openings** are anchored to a room edge (`room`, `edge`, `offset_m` from the edge start
+  to the opening's left edge). `room_layout::opening_span(input, room, edge)` gives the
+  spans of the edge where an opening can go: where visible wall covers the edge, clear of
+  the other walls at its junctions (`h (1 + |cos a|) / sin a` for a wall at angle `a`, half
+  the thickness at a right angle). A window is `sill_m .. sill_m + height_m`; a door starts
+  0.1 m below the plane and cuts the whole wall bottom. `depth_m: None` goes through;
+  `Some(d)` is a niche `d` deep from the face on the ROOM's side (the interior, left of
+  the room edge). An opening on a missing edge or outside every span is left out, the
+  layout reports it (`LayoutIssue::OpeningDoesNotFit`), and the rest evaluates.
+- **Height layers.** Heights 0, H, and every opening's bottom and top (clamped to the
+  wall) split the wall into layers; each layer is the footprint minus the openings active
+  in it, one prism per plan piece. The direct planar mesher removes the faces between
+  layers. A 6-room layout with 10 openings evaluates in about 1.3 ms and meshes in about
+  2.2 ms (release).
+- **Faces.** `RoomWall { room, edge, part }`: `Inside` is the face toward that room edge's
+  room (a shared wall has an `Inside` face for each room), `Outside` a face toward no room
+  (named by the first covering room edge in rank order), `End` a wall end or bevel,
+  `Opening { opening }` the reveals, `NicheBack { opening }`. Horizontal faces are
+  `LayoutCap { z_um, up }` (wall tops, bottoms, sills, heads).
+- **Per-entity state.** An invalid room or a misfit opening makes the layout a per-entity
+  error WITH a current value (`Engine::room_layout_issues`); the mesh shows everything
+  else. A non-positive H is an ordinary evaluation error (the previous mesh stays).
+- **Factoring and cascades** as for walls: a layout without a top on a root level (or a
+  workplane under it) is level-local, so dragging that level is transform-only; with a
+  top it is evaluated in world space. Deleting the plane deletes the layout and its
+  rooms; deleting only the top plane disconnects the layout (`height_m` becomes its
+  current H). Rooms and layouts are `Element` members (a room adds no geometry) and the
+  orphan sweep collects them.
+
+Commands:
+
+| Command | Effect |
+|---|---|
+| `CreateRoom { plane, name, precedence, boundary, hidden_edges, layout: Option }` | with `layout`, also adds the room to it (one undo step); `InvalidRoom` when structurally invalid |
+| `UpdateRoom { id, plane, name, precedence, boundary, hidden_edges (all Option), coalesce }` | openings on an edge the edit changes keep their plan position on the edge that now contains them (same step) |
+| `DeleteRoom { id }` | leaves its layout, the layout's openings on its edges go, then the room (one step; rejected while an element holds it) |
+| `CreateRoomLayout { plane, top, rooms, thickness_m, height_m, top_offset_m, openings }` | `InvalidRoomLayout` for a bad size, a duplicate or invalid opening, an opening on a room outside the layout, or a room on another plane or already in a layout |
+| `UpdateRoomLayout { id, plane, top: Option<Option>, rooms, thickness_m, height_m, top_offset_m, openings (all Option), coalesce }` | validated like a create |
+| `DeleteRoomLayout { id }` | the rooms stay |
+
+**Editing** (pure, typed errors):
+
+- `room::from_polygon(name, precedence, points)` and `room::from_rectangle(name,
+  precedence, a, b)` make a valid counter-clockwise room (ids 0, 1, 2, ...);
+  `room::default_name(doc)` gives the next "Room NNN".
+- `room::ops` (`RoomError`, each result checked with `room::validate`): `move_points`,
+  `set_point`, `move_edges`, `insert_point(room, edge, offset_m) -> (room, id)` (the new
+  edge keeps the split edge's hidden flag), `delete_points` (neighbouring edges merge),
+  `delete_edges` (the end point merges into the FIRST point), `set_hidden(room, edges,
+  hidden)`.
+- `room_layout::ops` on a `LayoutInput` (`room_layout::inputs(doc, layout)`):
+  `add_room(rooms, room)`, `remove_room(input, room) -> (rooms, data)` (with its
+  openings), `ranking`, `bring_forward` / `send_backward` (the precedence that moves a
+  room one place, or `None` at the end), `bring_to_front` / `send_to_back`,
+  `add_opening -> (data, id)`, `move_opening(input, id, [along, up])` (clamped into the
+  nearest span; a window's sill at the base, a door stays on it), `set_opening`,
+  `delete_opening`. Opening operations check the layout's structure and that the touched
+  opening fits.
+- `room_layout::validate(input)`: every room valid and every opening fitting.
+
+**Compatibility.** `Room`, `RoomLayout`, `RoomWall`, `LayoutCap`, and the room commands
+were appended at the end of their serialized enums; fixture v4 (wall runs with openings
+and a gable, sketch plates, workplanes, `Wall`s) was saved before this change and, with
+v1 to v3, loads, evaluates, and resaves byte-identically.

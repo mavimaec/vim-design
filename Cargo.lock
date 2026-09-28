@@ -1649,6 +1649,7 @@ name = "vim-design-web"
 version = "0.1.0"
 dependencies = [
  "glam",
+ "i_overlay",
  "js-sys",
  "rayon",
  "serde_json",

@@ -4,11 +4,13 @@
 //! sketch state machine. The wasm-only apps (`author`, `demo`) drive it
 //! from browser input.
 
+pub mod clipboard;
 pub mod edit;
 pub mod geom;
 pub mod model;
 pub mod openings;
 pub mod ops;
+pub mod rooms;
 pub mod runs;
 pub mod sketch;
 pub mod snap;

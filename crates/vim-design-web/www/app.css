@@ -173,6 +173,7 @@ input { font: inherit; color: inherit; }
 .tool.on { color: var(--accent-ink); background: var(--accent); box-shadow: 0 2px 8px rgba(47, 111, 237, 0.35); }
 .tool.toggle.on { color: var(--accent); background: var(--accent-soft); box-shadow: none; }
 .tool:disabled { opacity: 0.4; cursor: default; }
+.tool[hidden] { display: none; }
 .tool-sep { width: 1px; height: 32px; background: var(--line); margin: 0 3px; }
 
 /* ---- hint + toasts ------------------------------------------------------------ */
@@ -574,7 +575,7 @@ body.drawing #edit-panel { display: none; }
 .swatch.solid { background: rgba(47, 111, 237, 0.35); border: 1.5px solid var(--accent); }
 .swatch.void { border: 1.5px dashed var(--accent); }
 .edit-slider { width: 100%; margin: 6px 0 2px; accent-color: var(--accent); }
-#edit-through { height: 40px; }
+#edit-through { height: 40px; padding: 0 9px; }
 /* A through void: the depth reads as inactive; setting one turns
    "Through" off. */
 .edit-row.dim .stepper, .edit-row.dim .edit-slider { opacity: 0.45; }
@@ -667,10 +668,15 @@ body.editing #tree-panel { display: none !important; }
 #wall-height-mode { flex-wrap: wrap; }
 /* Edit chromes: floor plates, wall runs, openings share the bar, the
    dock, and the panel; each shows its own tools and rows. */
-.run-only, .openings-only { display: none !important; }
-body.edit-run .run-only, body.edit-openings .openings-only { display: flex !important; }
-.edit-row.run-only, .edit-row.openings-only { flex-direction: column; }
-body.edit-run .floor-only, body.edit-openings .floor-only, body.edit-openings .profile-only { display: none !important; }
+.run-only, .openings-only, .room-only { display: none !important; }
+body.edit-run .run-only, body.edit-openings .openings-only, body.edit-room .room-only { display: flex !important; }
+.edit-row.run-only, .edit-row.openings-only, .edit-row.room-only { flex-direction: column; }
+body.edit-run .floor-only, body.edit-room .floor-only, body.edit-openings .floor-only, body.edit-openings .profile-only { display: none !important; }
+/* Rooms preview: the Model tree's room rows and the room page. */
+.tree-row.room .tree-kind { color: var(--accent); }
+.tree-row.room .tree-actions { display: inline-flex; gap: 2px; }
+.room-order { display: flex; gap: 8px; margin-bottom: 10px; }
+.room-order .btn { flex: 1; }
 @media (max-width: 520px) {
   #wall-height-mode .stepper-label { display: none; }
   .plane-picker { max-width: 150px; }
@@ -750,6 +756,27 @@ body.edit-run .floor-only, body.edit-openings .floor-only, body.edit-openings .p
 .cluster-btn .ico { width: 20px; height: 20px; }
 .cluster-btn:hover { background: var(--surface-2); }
 .cluster-btn:active, .cluster-btn.on { background: var(--accent-soft); color: var(--accent); }
+.cluster-btn:disabled { opacity: 0.4; }
+/* Copy / Paste: a second pill under the view pill (phones), above it
+   (desktop). An armed paste is solid accent. */
+#clip-cluster {
+  position: fixed; z-index: 22;
+  right: calc(var(--gap) + var(--sr));
+  top: calc(var(--gap) + var(--st) + var(--top-h) + 58px);
+  display: flex; flex-direction: row; gap: 2px; padding: 3px;
+  background: var(--surface); border-radius: 14px; box-shadow: var(--shadow);
+  backdrop-filter: saturate(1.4) blur(10px); -webkit-backdrop-filter: saturate(1.4) blur(10px);
+  user-select: none; -webkit-user-select: none;
+}
+#clip-cluster[hidden] { display: none; }
+#paste-btn.armed { background: var(--accent); color: var(--accent-ink); }
+/* The item just created is the selection: the panel says so. */
+#edit-panel.target-fresh #edit-panel-title { color: var(--accent); }
+.draw-target { font-size: 12.5px; font-weight: 650; color: var(--accent); padding: 0 4px 4px; }
+.draw-target[hidden] { display: none; }
+#fresh-stepper[hidden] { display: none; }
+#fresh-stepper .stepper-label { display: inline; font-size: 11px; font-weight: 700; color: var(--accent); padding: 0 2px 0 6px; }
+body.has-clip .tri-badge { top: calc(var(--gap) + var(--st) + var(--top-h) + 110px); }
 .render-menu {
   position: fixed; z-index: 23;
   right: calc(var(--gap) + var(--sr));
@@ -776,11 +803,14 @@ body.edit-run .floor-only, body.edit-openings .floor-only, body.edit-openings .p
 @media (min-width: 760px) {
   /* Desktop: bottom right, beside the properties panel when it is open. */
   #view-cluster { top: auto; bottom: calc(var(--gap) + var(--sb)); flex-direction: row; }
+  #clip-cluster { top: auto; bottom: calc(var(--gap) + var(--sb) + 56px); }
+  body.sheet-open #clip-cluster { right: calc(var(--gap) + var(--sr) + 372px + 10px); }
+  body.has-clip .tri-badge { top: auto; }
   .render-menu { top: auto; right: calc(var(--gap) + var(--sr)); bottom: calc(var(--gap) + var(--sb) + 60px); }
-  .tri-badge { top: auto; right: calc(var(--gap) + var(--sr) + 112px); bottom: calc(var(--gap) + var(--sb) + 14px); }
+  .tri-badge { top: auto; right: calc(var(--gap) + var(--sr) + 160px); bottom: calc(var(--gap) + var(--sb) + 14px); }
   body.sheet-open #view-cluster { right: calc(var(--gap) + var(--sr) + 372px + 10px); }
   body.sheet-open .render-menu { right: calc(var(--gap) + var(--sr) + 372px + 10px); }
-  body.sheet-open .tri-badge { right: calc(var(--gap) + var(--sr) + 372px + 10px + 112px); }
+  body.sheet-open .tri-badge { right: calc(var(--gap) + var(--sr) + 372px + 10px + 160px); }
 }
 .edit-row.run-only, .edit-row.openings-only { gap: 6px; align-items: stretch; }
 .edit-row.run-only[hidden], .edit-row.openings-only[hidden] { display: none !important; }
@@ -788,7 +818,8 @@ body.edit-run .floor-only, body.edit-openings .floor-only, body.edit-openings .p
 #opening-depth-stepper.dim { opacity: 0.45; }
 @media (max-width: 759px) {
   /* The hint leaves the view pill its corner. */
-  .hint { left: calc(var(--gap) + var(--sl)); transform: none; max-width: calc(100vw - 2 * var(--gap) - 108px); }
+  .hint { left: calc(var(--gap) + var(--sl)); transform: none; max-width: calc(100vw - 2 * var(--gap) - 160px); }
   #toasts { top: calc(var(--gap) + var(--st) + var(--top-h) + 60px); }
   body.editing .tri-badge, .render-menu:not([hidden]) ~ .tri-badge { top: calc(var(--gap) + var(--st) + var(--top-h) + 58px); }
+  body.has-clip .tri-badge { top: calc(var(--gap) + var(--st) + var(--top-h) + 110px); }
 }

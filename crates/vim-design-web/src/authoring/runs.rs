@@ -225,7 +225,7 @@ impl ProfileModel for RunModel {
                 run_ops::extend(run, if *at_end { RunEnd::End } else { RunEnd::Start }, *uv).map(|(r, _)| r)
             }
             Edit::SetClosed(closed) => run_ops::set_closed(run, *closed),
-            Edit::AddFace { .. } | Edit::SplitFaces { .. } | Edit::DeleteFaces(_) | Edit::SetKind { .. } => {
+            Edit::AddFace { .. } | Edit::AddFaces(_) | Edit::SplitFaces { .. } | Edit::DeleteFaces(_) | Edit::SetKind { .. } => {
                 return Err(EditError::NoEffect("That edit does not apply to a wall's plan"));
             }
         };

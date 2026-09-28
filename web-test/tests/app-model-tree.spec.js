@@ -352,7 +352,11 @@ test("workplanes: add in the tree, rename, nest, draw a ceiling on one; it follo
   let [topped] = await walls(page);
   expect(topped).toMatchObject({ mode: "upto", topPlane: ceiling.id });
   expect(topped.height).toBeCloseTo(2.4, 9);
+  // Leaving the tool ends the fresh wall: the drawbar is for new walls again.
+  await tool(page, "select");
+  await tool(page, "wall");
   await page.locator('#wall-mode-toggle button[data-wall-mode="fixed"]').click();
+  expect((await walls(page))[0]).toMatchObject({ mode: "upto", topPlane: ceiling.id });
   await tool(page, "select");
 
   // Delete the ceiling: the honest cascade prompt, one undo restores all.
@@ -406,6 +410,9 @@ test("walls up to a plane: new walls and properties; the top level drags the hei
   expect(room).toMatchObject({ run: true, mode: "upto", topPlane: level2.id, topOffset: -0.5, legacy: false, segments: 4 });
   expect(room.height).toBeCloseTo(2.5, 9);
   await shot(page, "wall-height-mode");
+  // (The drawbar would now change the fresh run: leave the tool first.)
+  await tool(page, "select");
+  await tool(page, "wall");
 
   // A top plane below the base is refused.
   await page.locator("#wall-top-plane").selectOption(String(ground.id));

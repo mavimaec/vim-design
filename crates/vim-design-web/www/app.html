@@ -210,6 +210,13 @@
         </div>
       </div>
     </div>
+    <!-- Rooms preview: a room's boundary; hide the wall of selected edges. -->
+    <div class="edit-row room-only" id="room-edit-row">
+      <div class="edit-row-line">
+        <span class="edit-row-label" id="room-edit-label">Walls of the selected edges</span>
+        <button id="room-hidden" class="chip-toggle" type="button" aria-pressed="false" title="No wall on the selected edges: a conceptual room division">Hidden wall</button>
+      </div>
+    </div>
     <div class="edit-row floor-only" id="edit-solid-row">
       <div class="edit-row-line">
         <span class="edit-row-label"><i class="swatch solid"></i>Thickness</span>
@@ -266,14 +273,14 @@
       <svg class="ico" viewBox="0 0 24 24"><path d="M3 20V9l5-3v11z"/><path d="M8 17l13-4V4L8 6"/><path d="M3 20l5-3"/></svg>
       <span>Wall</span>
     </button>
-    <button class="tool" type="button" data-tool="window" data-tools="window door" title="Windows and doors: tap a wall (N)">
-      <svg class="ico" viewBox="0 0 24 24"><rect x="4" y="3.5" width="16" height="17" rx="1"/><path d="M12 3.5v17M4 12h16"/></svg>
-      <span>Window</span>
+    <button class="tool" type="button" data-tool="window" data-tools="window door" title="Openings: windows and doors — tap a wall (N)">
+      <svg class="ico" viewBox="0 0 24 24"><rect x="2.5" y="5" width="9" height="8.5" rx="0.8"/><path d="M7 5v8.5M2.5 9.25h9"/><path d="M14 20.5V4h7v16.5"/><path d="M1.5 20.5h21"/><circle cx="19" cy="12.5" r="0.9" class="fill"/></svg>
+      <span>Openings</span>
     </button>
-    <div class="tool-sep" aria-hidden="true"></div>
-    <button id="snap-toggle" class="tool toggle" type="button" title="Snapping" aria-pressed="true">
-      <svg class="ico" viewBox="0 0 24 24"><path d="M6 3v8a6 6 0 0012 0V3"/><path d="M6 7h3.5M14.5 7H18"/></svg>
-      <span>Snap</span>
+    <!-- Rooms (preview, ?rooms): named room boundaries that generate walls. -->
+    <button class="tool" type="button" data-tool="room" id="room-tool" title="Rooms: draw a room boundary (M)" hidden>
+      <svg class="ico" viewBox="0 0 24 24"><path d="M3 4h18v16H3z"/><path d="M12 4v6.5M12 14.5V20M3 12h5.5"/><path d="M15 16h3" class="thin"/></svg>
+      <span>Rooms</span>
     </button>
   </nav>
 
@@ -288,6 +295,23 @@
       <svg class="ico" viewBox="0 0 24 24"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/><path d="M4 7.5l8 4.5 8-4.5M12 12v9"/></svg>
       <span>View</span>
     </button>
+    <!-- Snapping is an input aid for every mode (also inside Edit Modes,
+         where the tool dock is hidden), so it lives with the view controls. -->
+    <button id="snap-toggle" class="cluster-btn" type="button" title="Snapping" aria-pressed="true">
+      <svg class="ico" viewBox="0 0 24 24"><path d="M6 3v8a6 6 0 0012 0V3"/><path d="M6 7h3.5M14.5 7H18"/></svg>
+      <span>Snap</span>
+    </button>
+  </div>
+  <!-- Copy / Paste: shown where the mode has something to copy or paste. -->
+  <div id="clip-cluster" role="group" aria-label="Copy and paste" hidden>
+    <button id="copy-btn" class="cluster-btn" type="button" title="Copy the selection (Ctrl+C)">
+      <svg class="ico" viewBox="0 0 24 24"><rect x="8.5" y="8.5" width="12" height="12" rx="2"/><path d="M15.5 5.5V5a1.5 1.5 0 00-1.5-1.5H5A1.5 1.5 0 003.5 5v9A1.5 1.5 0 005 15.5h.5"/></svg>
+      <span>Copy</span>
+    </button>
+    <button id="paste-btn" class="cluster-btn" type="button" title="Paste: tap where the copy goes (Ctrl+V)" aria-pressed="false">
+      <svg class="ico" viewBox="0 0 24 24"><path d="M9 4.5H6.5A1.5 1.5 0 005 6v13.5A1.5 1.5 0 006.5 21h11a1.5 1.5 0 001.5-1.5V6a1.5 1.5 0 00-1.5-1.5H15"/><rect x="9" y="3" width="6" height="3" rx="1"/><path d="M12 10v7M9 14l3 3 3-3"/></svg>
+      <span>Paste</span>
+    </button>
   </div>
   <div id="render-menu" class="render-menu" role="menu" hidden>
     <button type="button" role="menuitemradio" data-render="shaded">Shaded</button>
@@ -299,6 +323,8 @@
   <div id="hint" class="hint" hidden></div>
 
   <section id="drawbar" hidden aria-label="Drawing">
+    <!-- The wall just drawn is selected: these settings change it too. -->
+    <div id="draw-target" class="draw-target" hidden></div>
     <div class="drawbar-row" id="shape-row">
       <div class="seg small" id="shape-toggle" role="tablist" aria-label="Shape">
         <button type="button" data-shape="polygon" title="Polygon">
@@ -312,6 +338,16 @@
         <svg class="ico sm" viewBox="0 0 24 24"><path d="M7 4v16M17 4v16"/><path d="M10 9l-3-3-3 3M14 15l3 3 3-3"/></svg>
         <span>Flip side</span>
       </button>
+      <!-- Phones, Edit Mode: the face just drawn (the selection) — its
+           thickness or depth, also the next faces' (the edit panel's
+           place is taken by this bar while a drawing tool is armed). -->
+      <label class="stepper" id="fresh-stepper" hidden title="The face just drawn, and the next ones">
+        <span class="stepper-label" id="fresh-label">New</span>
+        <button type="button" data-edit-step="thickness" data-step="-1" aria-label="Less">−</button>
+        <input id="fresh-input" type="text" inputmode="decimal" aria-label="New face (m)" />
+        <span class="unit">m</span>
+        <button type="button" data-edit-step="thickness" data-step="1" aria-label="More">+</button>
+      </label>
       <label class="stepper" id="thickness-stepper" title="Thickness of new floor plates">
         <span class="stepper-label">Thick</span>
         <button type="button" data-step="-1" aria-label="Thinner">−</button>

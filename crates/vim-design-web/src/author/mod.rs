@@ -23,10 +23,13 @@
 //!   scale.
 
 mod camera;
+mod clipboard;
+mod defaults;
 mod edit;
 mod pick;
 mod openings;
 mod planes;
+mod rooms;
 mod walls;
 
 use std::collections::{BTreeMap, HashMap};
@@ -98,7 +101,8 @@ const PLATE_DEPTH_BIAS: f32 = 2e-5;
 const PICK_TIE_M: f32 = 0.005;
 /// Default wall height, thickness, and limits (meters).
 const DEFAULT_WALL_HEIGHT_M: f64 = 2.7;
-const DEFAULT_WALL_THICKNESS_M: f64 = 0.2;
+/// New walls: an interior partition (see `PARTITION_THICKNESS_M`).
+const DEFAULT_WALL_THICKNESS_M: f64 = crate::authoring::walls::PARTITION_THICKNESS_M;
 const MIN_WALL_HEIGHT_M: f64 = 0.1;
 const MAX_WALL_HEIGHT_M: f64 = 50.0;
 const MIN_WALL_THICKNESS_M: f64 = 0.02;
@@ -114,6 +118,8 @@ enum Tool {
     Plate,
     Hole,
     Wall,
+    /// Rooms (preview, `?rooms`): a room boundary.
+    Room,
 }
 
 impl Tool {
@@ -123,6 +129,7 @@ impl Tool {
             Tool::Plate => "plate",
             Tool::Hole => "hole",
             Tool::Wall => "wall",
+            Tool::Room => "room",
         }
     }
 }
@@ -198,6 +205,7 @@ pub struct AuthorApp {
     /// Outline shape per drawing tool family.
     shape: Shape,
     wall_shape: Shape,
+    room_shape: Shape,
     sketch: Option<Sketch>,
     /// Settings for NEW walls.
     wall_height: f64,
@@ -231,6 +239,24 @@ pub struct AuthorApp {
     snap_enabled: bool,
     snap_step: f64,
     plate_thickness: f64,
+    /// Copy / paste: the copy, and whether a paste is armed (session
+    /// state; see `clipboard`).
+    clipboard: Option<crate::authoring::clipboard::Clip>,
+    paste_armed: bool,
+    /// Rooms preview (`?rooms`; see `rooms`): the adapter's rooms, the
+    /// selected room, the room history, a room session (Room Edit Mode or
+    /// Openings mode), the room in Room Edit Mode.
+    rooms_preview: bool,
+    rooms: crate::authoring::rooms::Rooms,
+    room_selection: Option<u32>,
+    room_history: rooms::RoomHistory,
+    room_session: Option<rooms::RoomSession>,
+    room_edit: Option<u32>,
+    rooms_revision: u64,
+    /// The wall run just drawn (see `walls::fresh_run`).
+    fresh_run: Option<EntityId>,
+    /// Remembered settings for new items (see `defaults`).
+    remembered: defaults::Remembered,
     /// Bumped on every committed document change and on replacement —
     /// the page persists when it changes.
     revision: u64,
@@ -252,6 +278,9 @@ impl AuthorApp {
     /// Montreal, levels Ground + Level 2). The page then loads the
     /// persisted document, if any, via [`AuthorApp::load_document`].
     pub async fn create(canvas_id: String) -> Result<AuthorApp, JsValue> {
+        // A panic reaches the console with its message (wasm otherwise
+        // reports only "unreachable").
+        std::panic::set_hook(Box::new(|info| web_sys::console::error_1(&JsValue::from_str(&format!("panic: {info}")))));
         let document = web_sys::window()
             .and_then(|w| w.document())
             .ok_or_else(|| JsValue::from_str("no DOM document"))?;
@@ -282,6 +311,7 @@ impl AuthorApp {
             tool: Tool::Select,
             shape: Shape::Polygon,
             wall_shape: Shape::Polygon,
+            room_shape: Shape::Rect,
             sketch: None,
             wall_height: DEFAULT_WALL_HEIGHT_M,
             wall_thickness: DEFAULT_WALL_THICKNESS_M,
@@ -300,7 +330,18 @@ impl AuthorApp {
             view_insets: [0.0; 4],
             snap_enabled: true,
             snap_step: 0.25,
-            plate_thickness: 0.3,
+            plate_thickness: crate::authoring::edit::session::DEFAULT_SOLID_THICKNESS_M,
+            remembered: defaults::Remembered::default(),
+            fresh_run: None,
+            clipboard: None,
+            paste_armed: false,
+            rooms_preview: false,
+            rooms: crate::authoring::rooms::Rooms::default(),
+            room_selection: None,
+            room_history: rooms::RoomHistory::default(),
+            room_session: None,
+            room_edit: None,
+            rooms_revision: 0,
             revision: 0,
             last_committed: 0,
             grid_key: None,
@@ -552,15 +593,22 @@ impl AuthorApp {
             "plate" => Tool::Plate,
             "hole" => Tool::Hole,
             "wall" => Tool::Wall,
+            "room" if self.rooms_preview => Tool::Room,
             _ => Tool::Select,
         };
         if tool != Tool::Select && !self.can_author() {
             return false;
         }
         self.tool = tool;
+        self.paste_armed = false; // another tool ends a paste
+        // The wall just drawn stays selected only while its tool is armed.
+        if self.fresh_run.take().is_some_and(|f| self.selection == Some(f)) {
+            self.selection = None;
+        }
         self.sketch = match (tool, self.plane()) {
             (Tool::Plate, Some(level)) => Some(Sketch::new(SketchTool::Plate, self.shape, level)),
             (Tool::Wall, Some(level)) => Some(Sketch::new(SketchTool::Wall, self.wall_shape, level)),
+            (Tool::Room, Some(level)) => Some(Sketch::new(SketchTool::Room, self.room_shape, level)),
             _ => None,
         };
         if tool != Tool::Select {
@@ -580,6 +628,7 @@ impl AuthorApp {
         let shape = if shape == "rect" { Shape::Rect } else { Shape::Polygon };
         match self.tool {
             Tool::Wall => self.wall_shape = shape,
+            Tool::Room => self.room_shape = shape,
             _ => self.shape = shape,
         }
         if let Some(s) = self.sketch.as_mut() {
@@ -952,6 +1001,9 @@ impl AuthorApp {
     pub fn select(&mut self, id: f64) {
         let id = eid(id);
         self.selection = self.model.iter().any(|e| e.element() == id).then_some(id);
+        if self.selection.is_some() {
+            self.room_selection = None;
+        }
         self.refresh_styles();
     }
 
@@ -1223,6 +1275,10 @@ impl AuthorApp {
         if self.edit.is_some() {
             return self.edit_undo();
         }
+        // A room change (preview) with no document step after it.
+        if self.rooms_undo() {
+            return true;
+        }
         if self.gestures.undo(&mut self.doc) {
             self.sync("undo");
             true
@@ -1235,6 +1291,9 @@ impl AuthorApp {
         if self.edit.is_some() {
             return self.edit_redo();
         }
+        if self.rooms_redo() {
+            return true;
+        }
         if self.gestures.redo(&mut self.doc) {
             self.sync("redo");
             true
@@ -1245,11 +1304,11 @@ impl AuthorApp {
 
     /// Inside Edit Mode these are bounded by the session's transaction.
     pub fn can_undo(&self) -> bool {
-        if self.edit.is_some() { self.edit_can_undo() } else { self.gestures.can_undo() }
+        if self.edit.is_some() { self.edit_can_undo() } else { self.rooms_can_undo() || self.gestures.can_undo() }
     }
 
     pub fn can_redo(&self) -> bool {
-        if self.edit.is_some() { self.edit_can_redo() } else { self.gestures.can_redo() }
+        if self.edit.is_some() { self.edit_can_redo() } else { self.rooms_can_redo() || self.gestures.can_redo() }
     }
 
     // -- Status ---------------------------------------------------------------
@@ -1314,6 +1373,10 @@ impl AuthorApp {
                 "height": self.wall_height,
                 "thickness": self.wall_thickness,
                 "flip": self.wall_flip,
+                // The run just drawn: the drawbar also edits it.
+                "fresh": self.fresh_run().and_then(|id| self.run_model(id)).map(|r| serde_json::json!({
+                    "id": r.element.0 as f64, "name": r.name,
+                })),
             },
             "snap": { "enabled": self.snap_enabled, "step": self.snap_step },
             "errors": errors,
@@ -1386,6 +1449,11 @@ impl AuthorApp {
     /// The box Fit frames: the focus elements' bounds.
     fn focus_bbox(&self) -> Option<([f64; 3], [f64; 3])> {
         let ids = self.focus_ids();
+        if ids.is_empty()
+            && let Some(b) = self.room_focus_bbox()
+        {
+            return Some(b); // rooms preview: the room edited or selected
+        }
         let mut out: Option<([f64; 3], [f64; 3])> = None;
         for s in ids.iter().filter_map(|id| self.pick.owner_stats(*id)) {
             let [min, max] = s.bbox;
@@ -1468,6 +1536,7 @@ impl AuthorApp {
     fn current_shape(&self) -> Shape {
         match self.tool {
             Tool::Wall => self.wall_shape,
+            Tool::Room => self.room_shape,
             _ => self.shape,
         }
     }
@@ -1630,6 +1699,17 @@ impl AuthorApp {
                 align: Vec::new(),
                 step: self.snap_step,
             },
+            // Rooms snap to the plane's geometry and to the other rooms.
+            SketchTool::Room => {
+                let mut vertices = self.level_vertices(sk.level);
+                let mut edges = self.level_edges(sk.level);
+                for r in self.rooms.rooms.iter().filter(|r| r.plane == sk.level) {
+                    let poly = r.polygon();
+                    vertices.extend(poly.iter().copied());
+                    edges.extend((0..poly.len()).map(|i| (poly[i], poly[(i + 1) % poly.len()])));
+                }
+                SnapSources { vertices, edges, align: Vec::new(), step: self.snap_step }
+            }
         }
     }
 
@@ -1744,7 +1824,7 @@ impl AuthorApp {
     fn sketch_status(&self) -> Option<sketch::SketchStatus> {
         let sk = self.sketch.as_ref()?;
         Some(match sk.tool {
-            SketchTool::Plate | SketchTool::Profile | SketchTool::Split => {
+            SketchTool::Plate | SketchTool::Profile | SketchTool::Split | SketchTool::Room => {
                 sketch::status(sk, &SketchContext::Plate)
             }
             SketchTool::Hole => {
@@ -1832,15 +1912,27 @@ impl AuthorApp {
                 let msg = if segs == 1 { "Wall created".to_owned() } else { format!("Wall created: {segs} segments") };
                 (msg, Some(element), "draw walls")
             }),
+            SketchTool::Room => self
+                .commit_room(sketch.level, &outline)
+                .map(|(_, name)| (format!("{name} created"), None, "draw room")),
             SketchTool::Profile | SketchTool::Split => Err("not a document sketch".to_owned()),
         };
         match result {
             Ok((notice, element, op)) => {
-                self.gestures.one_shot(depth);
+                if sketch.tool != SketchTool::Room {
+                    self.gestures.one_shot(depth); // a room is a room step (preview)
+                }
                 if let Some(s) = self.sketch.as_mut() {
                     s.points.clear();
                 }
                 self.sync(op);
+                if sketch.tool == SketchTool::Wall {
+                    // The new run is the selection: the drawbar's settings
+                    // apply to it until the next point.
+                    self.selection = element;
+                    self.fresh_run = element;
+                    self.refresh_styles();
+                }
                 self.notice = Some(notice.clone());
                 serde_json::json!({
                     "result": "committed",

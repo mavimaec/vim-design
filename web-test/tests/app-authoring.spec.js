@@ -18,6 +18,8 @@ import { mkdirSync, readFileSync } from "node:fs";
 
 const APP_URL = "http://localhost:8791/";
 const DOC_KEY = "vim-design/doc/v1";
+/** New walls' default thickness: a stud partition (see app-helpers.js). */
+const PARTITION_M = 0.114;
 const here = path.dirname(fileURLToPath(import.meta.url));
 const screenshotDir = path.join(here, "..", "screenshots");
 mkdirSync(screenshotDir, { recursive: true });
@@ -672,9 +674,11 @@ test("walls: a closed loop traced on a plate is ONE wall run growing inward (mit
   const [room] = ws;
   expect(room).toMatchObject({ name: "Wall 1", run: true, closed: true, segments: 4 });
   expect(room.height).toBeCloseTo(2.7, 9);
-  expect(room.thickness).toBeCloseTo(0.2, 9);
+  // New walls default to a stud partition.
+  const T = PARTITION_M;
+  expect(room.thickness).toBeCloseTo(T, 9);
   // Inward on the plate edge, mitered: the band inside the outline.
-  expect(room.footprintArea).toBeCloseTo(6 * 4 - 5.6 * 3.6, 6);
+  expect(room.footprintArea).toBeCloseTo(6 * 4 - (6 - 2 * T) * (4 - 2 * T), 6);
   expect(room.volume).toBeCloseTo(room.footprintArea * 2.7, 3);
   expect(room.points.every(([x, y]) => Math.abs(Math.abs(x) - 3) < 1e-9 && Math.abs(Math.abs(y) - 2) < 1e-9)).toBe(true);
 
@@ -691,7 +695,7 @@ test("walls: a closed loop traced on a plate is ONE wall run growing inward (mit
   ws = await walls(page);
   expect(ws).toHaveLength(2);
   expect(ws[1]).toMatchObject({ name: "Wall 2", closed: false, segments: 2, points: [[-4, 3], [0, 3], [0, 4.5]] });
-  expect(ws[1].footprintArea).toBeCloseTo(4 * 0.2 + 1.3 * 0.2, 6);
+  expect(ws[1].footprintArea).toBeCloseTo(4 * T + (1.5 - T) * T, 6);
   await tool(page, "select");
   await shot(page, "walls");
   expect((await stats(page)).errors).toEqual([]);
@@ -707,15 +711,16 @@ test("wall properties: height and thickness edits with undo, flip side, delete",
   await shape(page, "rect");
   await tapWorld(page, -2, -1.5);
   await tapWorld(page, 2, 1.5);
+  const T = PARTITION_M;
   let [room] = await walls(page);
-  expect(room.footprintArea).toBeCloseTo(4.4 * 3.4 - 12, 6);
+  expect(room.footprintArea).toBeCloseTo((4 + 2 * T) * (3 + 2 * T) - 12, 6);
   await page.locator("#undo").click();
   await page.locator("#flip-toggle").click();
   expect((await stats(page)).wall.flip).toBe(false);
   await tapWorld(page, -2, -1.5);
   await tapWorld(page, 2, 1.5);
   [room] = await walls(page);
-  expect(room.footprintArea).toBeCloseTo(12 - 3.6 * 2.6, 6);
+  expect(room.footprintArea).toBeCloseTo(12 - (4 - 2 * T) * (3 - 2 * T), 6);
 
   // Select the run by tapping its thin band in plan.
   await tool(page, "select");
@@ -744,7 +749,7 @@ test("wall properties: height and thickness edits with undo, flip side, delete",
   expect(thick.points).toEqual(room.points);
   expect(thick.footprintArea).toBeCloseTo(12 - 3.4 * 2.4, 6);
   await page.locator("#undo").click();
-  expect((await byId()).thickness).toBeCloseTo(0.2, 9);
+  expect((await byId()).thickness).toBeCloseTo(T, 9);
 
   await page.locator("#prop-delete").click();
   expect(await walls(page)).toHaveLength(0);

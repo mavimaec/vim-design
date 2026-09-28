@@ -15,6 +15,13 @@
 
 const DOC_KEY = "vim-design/doc/v1";
 const SESSION_KEY = "vim-design/session/v1";
+/** Rooms preview (?rooms): the app-side rooms, beside the session. */
+const ROOMS_KEY = "vim-design/rooms-preview/v1";
+const ROOMS_PREVIEW = new URLSearchParams(location.search).has("rooms");
+/** Room region fills (by rank on the plane), translucent over the plan. */
+/** A room label moves at most this many rows to avoid another. */
+const ROOM_LABEL_TRIES = 7;
+const ROOM_FILLS = ["rgba(47,111,237,0.13)", "rgba(18,161,80,0.13)", "rgba(245,158,11,0.15)", "rgba(168,85,247,0.13)", "rgba(236,72,153,0.12)"];
 const SAVE_DEBOUNCE_MS = 300;
 const SNAP_STEPS = [0.1, 0.25, 0.5, 1.0];
 // Snap capture radius per pointer type (CSS px): fingers are imprecise.
@@ -32,7 +39,11 @@ const WALL_PICK_PX = { mouse: 12, pen: 16, touch: 28 };
 // Stepper increments (meters).
 const PLATE_THICKNESS_STEP_M = 0.05;
 const WALL_HEIGHT_STEP_M = 0.1;
-const WALL_THICKNESS_STEP_M = 0.05;
+/** Wall thickness moves in 5 mm steps (the default partition is 0.114 m)
+ *  and shows to the millimetre. */
+const WALL_THICKNESS_STEP_M = 0.005;
+const WALL_THICKNESS_DECIMALS = 3;
+const roundWallThickness = (v) => Math.round(v * 1000) / 1000;
 // Double tap/click on empty space = zoom to fit.
 const DOUBLE_TAP_MS = 330;
 const DOUBLE_TAP_PX = 30;
@@ -64,6 +75,7 @@ const VOID_DEPTH_STEP_M = 0.05;
 const WALL_TOP_OFFSET_STEP_M = 0.05;
 /** Openings mode: the size steppers' step, and a new niche's depth (m). */
 const OPENING_STEP_M = 0.1;
+/** Fallback niche depth (the remembered one comes from Rust). */
 const OPENING_NICHE_DEPTH_M = 0.1;
 /** Workplane offset stepper step and slider range (meters). */
 const WORKPLANE_OFFSET_STEP_M = 0.05;
@@ -258,6 +270,8 @@ async function main() {
 
   loadingStatus.textContent = "Starting the renderer…";
   const app = await mod.AuthorApp.create("view");
+  app.set_rooms_preview(ROOMS_PREVIEW);
+  $("room-tool").hidden = !ROOMS_PREVIEW;
 
   // -- session state (non-critical; never in the document) -----------------
   let session = {};
@@ -281,6 +295,8 @@ async function main() {
           thickness: app.plate_thickness_setting(),
           shape: app.shape(),
           wall: JSON.parse(app.wall_settings_json()),
+          // Every remembered setting for new items (Rust owns the list).
+          defaults: JSON.parse(app.session_defaults_json()),
           camera: app.camera_json(),
           treeOpen,
           treeCollapsed: [...treeCollapsed],
@@ -332,6 +348,13 @@ async function main() {
   if (session.wall?.mode === "upto" && typeof session.wall.topPlane === "number") {
     app.set_wall_height_mode("upto", session.wall.topPlane, Number(session.wall.topOffset) || 0);
   }
+  // Rooms preview: after the document (a room's plane must exist).
+  if (ROOMS_PREVIEW) {
+    const rooms = store.get(ROOMS_KEY);
+    if (rooms) app.load_rooms_json(rooms);
+  }
+  // After the document: a remembered top plane must exist to be kept.
+  if (session.defaults && typeof session.defaults === "object") app.set_session_defaults(JSON.stringify(session.defaults));
   if (restored && session.camera) {
     app.set_camera_json(session.camera);
   } else {
@@ -428,6 +451,8 @@ async function main() {
     }
     const notice = app.take_notice();
     if (notice) toast(notice, { kind: "ok", ms: 1800 });
+    if (ROOMS_PREVIEW) syncRooms();
+    sessionSave(); // the remembered settings for new items change with edits
     scheduleSave();
     requestRender();
     return stats;
@@ -448,10 +473,12 @@ async function main() {
   // Openings mode (placing windows and doors): its own Edit Mode.
   let openingsState = { active: false };
   const inOpenings = () => openingsState.active === true;
+  /** The depth a niche starts with: the last one chosen (Rust remembers it). */
+  const nicheDepth = () => openingsState.nicheDepth ?? OPENING_NICHE_DEPTH_M;
   /** Any Edit Mode chrome: a profile (floor, wall run) or openings. */
   const inEditChrome = () => editing() || inOpenings();
   const isDrawing = () =>
-    (stats.tool === "wall" && !inEditChrome()) ||
+    (["wall", "room"].includes(stats.tool) && !inEditChrome()) ||
     (editing() && ["solid", "void", "split"].includes(editState.tool));
 
   const pointers = new Map(); // id -> {x, y, type} (client px)
@@ -549,7 +576,10 @@ async function main() {
       return;
     }
     if (e.button !== 0) return;
-    if (isDrawing()) {
+    if (app.paste_armed()) {
+      // A tap places the copy; a drag still navigates.
+      mode = "paste-press";
+    } else if (isDrawing()) {
       mode = "place";
       touchPlacing = e.pointerType !== "mouse";
       app.sketch_hover(dev[0], dev[1], tolPx(e.pointerType));
@@ -576,7 +606,10 @@ async function main() {
     if (!p) {
       // Hover (mouse/pen without buttons).
       hoverType = e.pointerType;
-      if (isDrawing() && e.pointerType !== "touch") {
+      if (armedPaste() && e.pointerType !== "touch") {
+        pasteHover = dev;
+        requestRender();
+      } else if (isDrawing() && e.pointerType !== "touch") {
         app.sketch_hover(dev[0], dev[1], tolPx(e.pointerType));
         requestRender();
       } else if (editing() && e.pointerType !== "touch") {
@@ -633,7 +666,7 @@ async function main() {
     if (mode === "pan") {
       app.pan(prevDev[0], prevDev[1], dev[0], dev[1]);
       requestRender();
-    } else if (mode === "press" && press.moved) {
+    } else if ((mode === "press" || mode === "paste-press") && press.moved) {
       mode = "nav";
       canvas.classList.add("grabbing");
     }
@@ -675,6 +708,8 @@ async function main() {
         app.sketch_leave();
       }
       if (press.type === "touch") app.sketch_leave();
+    } else if (mode === "paste-press" && press && !cancelled) {
+      pastePlace(press);
     } else if ((mode === "press" || mode === "open-press") && press && !cancelled) {
       handleTap(press);
     } else if (mode === "open-drag") {
@@ -751,9 +786,13 @@ async function main() {
       requestRender();
       return;
     }
-    lastTap = { t: now, x: p.x, y: p.y, empty: id < 0 };
+    // Rooms preview: a tap inside a room (on no element) selects it.
+    const room = id < 0 && ROOMS_PREVIEW ? app.room_at(p.dev[0], p.dev[1]) : -1;
+    lastTap = { t: now, x: p.x, y: p.y, empty: id < 0 && room < 0 };
     // A touch tap that opens the sheet arms the ghost-click shield.
     if (p.type !== "mouse") ghostTap = { x: p.x, y: p.y, t: performance.now() };
+    if (room >= 0) { selectRoom(room); return; }
+    if (ROOMS_PREVIEW && app.room_selected() >= 0) { app.room_select(-1); if (sheetPage === "room") closeSheet(false); }
     selectElement(id);
   }
 
@@ -784,6 +823,7 @@ async function main() {
     } else if (res.result === "added" && res.reason) {
       toast(res.reason, { kind: "error" });
     }
+    stats = JSON.parse(app.stats_json()); // a new point ends the fresh wall
     renderChrome();
     requestRender();
   }
@@ -832,7 +872,11 @@ async function main() {
     const ctx = hctx;
     const edit = editing();
     const opening = inOpenings();
-    if (!isDrawing() && !edit && !opening && rings.length === 0) {
+    const ghost = armedPaste() && pasteHover != null;
+    let roomsHud = { active: false };
+    if (ROOMS_PREVIEW) { try { roomsHud = JSON.parse(app.rooms_hud_json()); } catch { /* none */ } }
+    const roomsOn = roomsHud.active && (roomsHud.regions.length > 0);
+    if (!isDrawing() && !edit && !opening && rings.length === 0 && !ghost && !roomsOn) {
       if (hudActive) ctx.clearRect(0, 0, hud.width, hud.height);
       hudActive = false;
       lastHud = { active: false };
@@ -840,8 +884,10 @@ async function main() {
     }
     hudActive = true;
     ctx.clearRect(0, 0, hud.width, hud.height);
+    if (roomsOn) drawRoomsHud(ctx, roomsHud);
     if (edit) drawEditHud(ctx);
     if (opening) drawOpeningsHud(ctx);
+    if (ghost) drawPasteGhost(ctx);
     drawRings(ctx);
     if (!isDrawing()) {
       lastHud = { active: false };
@@ -1023,6 +1069,89 @@ async function main() {
     }
   }
 
+  /** Rooms preview, plan: region fills (by rank), the wall network as
+   *  bands (a hidden wall: a dashed line), openings, and a label per room
+   *  (name + area) that stays legible on phones. */
+  function drawRoomsHud(ctx, h) {
+    const path = (pts) => { pts.forEach(([x, y], i) => (i ? ctx.lineTo(x, y) : ctx.moveTo(x, y))); ctx.closePath(); };
+    for (const r of h.regions) {
+      ctx.beginPath();
+      for (const ring of r.rings) if (ring.length >= 3) path(ring);
+      ctx.fillStyle = r.sel ? "rgba(47,111,237,0.26)" : ROOM_FILLS[r.color % ROOM_FILLS.length];
+      ctx.fill("evenodd");
+      if (r.sel) {
+        ctx.strokeStyle = HUD.accent;
+        ctx.lineWidth = 2 * dpr;
+        ctx.stroke();
+      }
+    }
+    for (const w of h.walls) {
+      if (w.hidden) {
+        if (w.line.length < 4) continue;
+        ctx.beginPath();
+        ctx.moveTo(w.line[0], w.line[1]);
+        ctx.lineTo(w.line[2], w.line[3]);
+        ctx.setLineDash([6 * dpr, 5 * dpr]);
+        ctx.strokeStyle = "rgba(91,98,112,0.8)";
+        ctx.lineWidth = 1.5 * dpr;
+        ctx.stroke();
+        ctx.setLineDash([]);
+        continue;
+      }
+      if (w.pts.length < 3) continue;
+      ctx.beginPath();
+      path(w.pts);
+      ctx.fillStyle = "rgba(91,98,112,0.9)";
+      ctx.fill();
+    }
+    for (const o of h.openings) {
+      if (o.pts.length < 3) continue;
+      ctx.beginPath();
+      path(o.pts);
+      ctx.fillStyle = "rgba(255,255,255,0.95)";
+      ctx.fill();
+      ctx.setLineDash(o.niche ? [4 * dpr, 3 * dpr] : []);
+      ctx.strokeStyle = o.kind === "door" ? "#16a34a" : HUD.accent;
+      ctx.lineWidth = (o.sel ? 3 : 1.6) * dpr;
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    // Labels never cover each other: a label that would overlap one
+    // already placed moves to the nearest free row above or below.
+    const placed = [];
+    ctx.font = `600 ${12.5 * dpr}px system-ui, -apple-system, Segoe UI, sans-serif`;
+    for (const l of h.labels) {
+      const text = `${l.name} · ${fmtArea(l.area)}`;
+      const w = ctx.measureText(text).width + 16 * dpr, bh = 24 * dpr, gap = 3 * dpr;
+      const free = (y) => !placed.some((b) => Math.abs(b.x - l.x) < (b.w + w) / 2 && Math.abs(b.y - y) < bh + gap);
+      let y = l.y;
+      for (let k = 1; !free(y) && k < ROOM_LABEL_TRIES; k++) y = l.y + (k % 2 ? 1 : -1) * Math.ceil(k / 2) * (bh + gap);
+      placed.push({ x: l.x, y, w });
+      pill(ctx, l.x, y, text);
+    }
+  }
+
+  /** The armed paste: the copy's outlines where a tap would place it. */
+  function drawPasteGhost(ctx) {
+    let g;
+    try { g = JSON.parse(app.paste_ghost_json(pasteHover[0], pasteHover[1], wallPickPx(hoverType ?? "mouse"))); } catch { return; }
+    ctx.lineJoin = "round";
+    for (const it of g.items) {
+      if (it.pts.length < 2) continue;
+      ctx.beginPath();
+      it.pts.forEach(([x, y], i) => (i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)));
+      if (it.closed) ctx.closePath();
+      if (it.closed) { ctx.fillStyle = "rgba(47,111,237,0.14)"; ctx.fill(); }
+      ctx.setLineDash([6 * dpr, 4 * dpr]);
+      ctx.strokeStyle = HUD.accent;
+      ctx.lineWidth = 2 * dpr;
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+  }
+
   /** Edit Mode overlay: the profile's faces (solid filled, void
    *  dotted), edges, point handles, hover/selection, marquee, snap; a
    *  wall run's footprint (mitered). */
@@ -1185,6 +1314,7 @@ async function main() {
     return `${tap} the first point to close the loop, or Finish`;
   }
   function hintText() {
+    if (armedPaste() && !inOpenings()) return pasteHint(COARSE ? "Tap" : "Click");
     if (!stats.canAuthor) return "Add a level to start drawing (Menu → Levels)";
     const tap = COARSE ? "Tap" : "Click";
     if (editing() && editState.tool === "select") {
@@ -1200,11 +1330,13 @@ async function main() {
     }
     if (inOpenings()) {
       if (openingsState.selected) return COARSE ? "Drag the opening along its wall · set its size below" : `Drag the opening along its wall · ${tap.toLowerCase()} another wall to place more`;
+      if (armedPaste()) return pasteHint(tap);
+      const size = openingsState.presetSize ?? PRESETS;
       if (openingsState.preset === "door") {
-        const d = PRESETS.door;
+        const d = size.door;
         return `${tap} a wall to place a door (${fmtDim(d.width)} × ${fmtDim(d.height)} m)`;
       }
-      const w = PRESETS.window;
+      const w = size.window;
       return `${tap} a wall to place a window (${fmtDim(w.width)} × ${fmtDim(w.height)} m, sill ${fmtDim(w.sill)} m)`;
     }
     if (editing() && editState.tool === "extend") {
@@ -1228,7 +1360,7 @@ async function main() {
       if (ws.mode !== "upto") return base;
       return ws.effectiveHeight == null ? "The wall top must be above its base: pick a higher plane" : `${base} · ${fmtM(ws.effectiveHeight)} high`;
     }
-    const what = { hole: "hole", window: "window" }[stats.tool] ?? "floor plate";
+    const what = { hole: "hole", window: "window", room: "room" }[stats.tool] ?? "floor plate";
     if (stats.shape === "rect") {
       return n === 0 ? `Drag, or ${tap.toLowerCase()} two opposite corners of the ${what}` : `${tap} the opposite corner`;
     }
@@ -1277,9 +1409,12 @@ async function main() {
       $("flip-toggle").classList.toggle("on", stats.wall.flip);
       $("flip-toggle").setAttribute("aria-pressed", String(stats.wall.flip));
       $("wall-settings").hidden = !wall;
+      const freshWall = wall ? stats.wall.fresh : null;
+      $("draw-target").hidden = !freshWall;
+      if (freshWall) $("draw-target").textContent = `Changes apply to ${freshWall.name} and the next walls`;
       renderWallHeightMode(wall);
-      for (const [id, v] of [["wall-height-input", stats.wall.height], ["wall-thickness-input", stats.wall.thickness]]) {
-        if (document.activeElement !== $(id)) $(id).value = v.toFixed(2);
+      for (const [id, v, dp] of [["wall-height-input", stats.wall.height, 2], ["wall-thickness-input", stats.wall.thickness, WALL_THICKNESS_DECIMALS]]) {
+        if (document.activeElement !== $(id)) $(id).value = v.toFixed(dp);
       }
       const ti = $("thickness-input");
       if (document.activeElement !== ti) ti.value = app.plate_thickness_setting().toFixed(2);
@@ -1423,10 +1558,58 @@ async function main() {
     sessionSave();
   });
 
+  // Copy / Paste -------------------------------------------------------------------
+  // A copy belongs to the mode it came from (faces, openings, or whole
+  // elements); Paste arms a placement there: the copy follows the
+  // pointer and each tap places one, until Esc or another tool.
+  let clipState = { canCopy: false, canPaste: false, armed: false };
+  let pasteHover = null; // device px of the pointer while a paste is armed
+  const armedPaste = () => clipState.armed === true;
+  function renderClip() {
+    clipState = JSON.parse(app.clipboard_json());
+    const show = clipState.canCopy || clipState.canPaste;
+    $("clip-cluster").hidden = !show;
+    document.body.classList.toggle("has-clip", show);
+    $("copy-btn").disabled = !clipState.canCopy;
+    $("paste-btn").disabled = !clipState.canPaste;
+    $("paste-btn").classList.toggle("armed", armedPaste());
+    $("paste-btn").setAttribute("aria-pressed", String(armedPaste()));
+    $("paste-btn").title = clipState.label ? `Paste ${clipState.label}: tap where it goes (Ctrl+V)` : "Paste (Ctrl+V)";
+    if (!armedPaste()) pasteHover = null;
+  }
+  function pasteHint(tap) {
+    return `${tap} where the copy goes (${clipState.label}) · ${COARSE ? "tap Paste" : "Esc"} to stop`;
+  }
+  function copySelection() {
+    const r = JSON.parse(app.copy());
+    if (r.result === "copied") toast(`Copied: ${r.label}`, { ms: 1400 });
+    else toast(r.reason, { kind: "error" });
+    renderChrome();
+  }
+  function togglePaste() {
+    if (app.paste_armed()) {
+      app.paste_cancel();
+    } else {
+      const r = JSON.parse(app.paste());
+      if (r.result !== "armed") { toast(r.reason, { kind: "error" }); return; }
+      // Taps now place the copy: a drawing tool in Edit Mode stands down.
+      if (editing() && editState.tool !== "select") app.edit_set_tool("select");
+    }
+    refresh();
+  }
+  function pastePlace(p) {
+    const r = JSON.parse(app.paste_place(p.dev[0], p.dev[1], wallPickPx(p.type)));
+    if (r.result === "rejected" || r.result === "none") toast(r.reason, { kind: "error" });
+    refresh();
+  }
+  $("copy-btn").addEventListener("click", () => copySelection());
+  $("paste-btn").addEventListener("click", () => togglePaste());
+
   // Render mode: shaded, shaded + wireframe, wireframe (the triangle
   // edges: the real mesh topology). Session state.
   const RENDER_LABEL = { shaded: "Shaded", "shaded-wire": "Shaded + wireframe", wire: "Wireframe" };
   function renderViewCluster() {
+    renderClip();
     const mode = app.render_mode();
     $("render-btn").classList.toggle("on", mode !== "shaded");
     $("render-btn").title = `Render mode: ${RENDER_LABEL[mode]}`;
@@ -1527,7 +1710,7 @@ async function main() {
       if (b.dataset.wall === "height") {
         setWallSettings({ height: Math.round((stats.wall.height + step * WALL_HEIGHT_STEP_M) * 100) / 100 });
       } else {
-        setWallSettings({ thickness: Math.round((stats.wall.thickness + step * WALL_THICKNESS_STEP_M) * 100) / 100 });
+        setWallSettings({ thickness: roundWallThickness(stats.wall.thickness + step * WALL_THICKNESS_STEP_M) });
       }
     });
   }
@@ -1656,13 +1839,16 @@ async function main() {
   }
   function renderEditChrome() {
     openingsState = JSON.parse(app.openings_state_json());
+    $("fresh-stepper").hidden = true; // shown again below for fresh faces
     const on = inEditChrome();
     document.body.classList.toggle("editing", on);
     $("edit-bar").hidden = !on;
     $("edit-dock").hidden = !on;
     $("edit-panel").hidden = !on;
     const run = editing() && editState.target === "run";
+    const roomEdit = editing() && editState.target === "room";
     document.body.classList.toggle("edit-run", run);
+    document.body.classList.toggle("edit-room", roomEdit);
     document.body.classList.toggle("edit-openings", inOpenings());
     if (!on) return;
     for (const b of document.querySelectorAll("#edit-view-toggle button")) {
@@ -1679,14 +1865,21 @@ async function main() {
     }
     $("edit-delete").disabled = !editState.canDelete;
     if (run) { renderRunPanel(); return; }
+    if (roomEdit) { renderRoomPanel(); return; }
     // Thickness panel: the selected faces, or the defaults for new faces.
     const panel = editState.panel;
-    const sel = panel.target === "selection";
+    const fresh = panel.target === "fresh";
+    const sel = panel.target === "selection" || fresh;
     $("edit-panel").classList.toggle("target-new", !sel);
-    $("edit-panel-title").textContent = sel
-      ? `${editState.selection} face${editState.selection === 1 ? "" : "s"} selected`
+    $("edit-panel").classList.toggle("target-fresh", fresh);
+    // The faces just drawn are the selection: the panel sets them (and
+    // the defaults for the next ones).
+    const freshNoun = !fresh ? "" : panel.solid && panel.void ? "New faces"
+      : panel.void ? (panel.void.through ? "New void · through" : "New void · depth") : "New face · thickness";
+    $("edit-panel-title").textContent = fresh ? freshNoun
+      : sel ? `${editState.selection} face${editState.selection === 1 ? "" : "s"} selected`
       : "New faces";
-    $("edit-panel-note").textContent = sel ? "" : "select faces to change them";
+    $("edit-panel-note").textContent = fresh ? "also used for the next ones" : sel ? "" : "select faces to change them";
     const solid = panel.solid, voidP = panel.void;
     $("edit-solid-row").hidden = !solid;
     $("edit-void-row").hidden = !voidP;
@@ -1704,7 +1897,31 @@ async function main() {
     }
     const shapeRow = $("shape-toggle");
     shapeRow.hidden = editState.tool === "split";
+    renderFreshStepper(fresh ? panel : null);
   }
+  /** Phones: the drawing bar's stepper for the face just drawn (one kind
+   *  only; mixed faces use the panel after the tool is put down). */
+  function renderFreshStepper(panel) {
+    const st = $("fresh-stepper");
+    const kind = !panel || innerWidth >= TREE_DEFAULT_OPEN_MIN_PX ? null
+      : panel.solid && !panel.void ? "thickness" : panel.void && !panel.solid ? "depth" : null;
+    st.hidden = !kind;
+    if (!kind) return;
+    for (const b of st.querySelectorAll("button")) b.dataset.editStep = kind;
+    $("fresh-label").textContent = kind === "thickness" ? "New face" : "New void";
+    const through = kind === "depth" && panel.void.through;
+    const v = kind === "thickness" ? panel.solid.thickness : panel.void.depth;
+    guardValue($("fresh-input"), through ? "" : v.toFixed(2));
+    $("fresh-input").placeholder = through ? "thru" : "";
+  }
+  $("fresh-input").addEventListener("change", (e) => {
+    const v = parseNum(e.target.value);
+    const kind = $("fresh-stepper").querySelector("button").dataset.editStep;
+    if (Number.isFinite(v)) editResult(kind === "thickness" ? app.edit_set_thickness(v) : app.edit_set_depth(v));
+    app.edit_end_gesture();
+    refreshEdit();
+  });
+
   /** The wall run panel: thickness, side, closed, height mode. */
   function renderRunPanel() {
     const r = editState.run;
@@ -1712,7 +1929,7 @@ async function main() {
     $("edit-panel").classList.remove("target-new");
     $("edit-panel-title").textContent = `Wall run · ${r.segments} segment${r.segments === 1 ? "" : "s"}`;
     $("edit-panel-note").textContent = `${r.points} points · ${r.closed ? "closed" : "open"}`;
-    guardValue($("run-thickness"), r.thickness.toFixed(2));
+    guardValue($("run-thickness"), r.thickness.toFixed(WALL_THICKNESS_DECIMALS));
 
     $("run-closed").classList.toggle("on", r.closed);
     $("run-closed").setAttribute("aria-pressed", String(r.closed));
@@ -1740,8 +1957,12 @@ async function main() {
     const sel = o.selected;
     $("edit-panel").classList.toggle("target-new", !sel);
     const noun = sel ? (sel.kind === "door" ? "Door" : "Window") : null;
-    $("edit-panel-title").textContent = sel ? `${noun} in ${sel.wallName}` : `${o.count} opening${o.count === 1 ? "" : "s"}`;
-    $("edit-panel-note").textContent = sel ? `${fmtM(sel.offset)} from the wall start` : "tap an opening to change it";
+    // The opening just placed: its size is also the next one's.
+    $("edit-panel").classList.toggle("target-fresh", !!o.fresh);
+    $("edit-panel-title").textContent = !sel ? `${o.count} opening${o.count === 1 ? "" : "s"}`
+      : o.fresh ? `New ${noun.toLowerCase()} · ${sel.wallName}` : `${noun} in ${sel.wallName}`;
+    $("edit-panel-note").textContent = !sel ? "tap an opening to change it"
+      : o.fresh ? `size used for the next ${noun.toLowerCase()}s` : `${fmtM(sel.offset)} from the wall start`;
     for (const row of document.querySelectorAll("#edit-panel .edit-row.openings-only")) row.hidden = !sel;
     if (!sel) return;
     guardValue($("opening-width"), sel.width.toFixed(2));
@@ -1752,7 +1973,7 @@ async function main() {
     $("opening-through").classList.toggle("on", through);
     $("opening-through").setAttribute("aria-pressed", String(through));
     $("opening-depth-stepper").classList.toggle("dim", through);
-    guardValue($("opening-depth"), (sel.depth ?? OPENING_NICHE_DEPTH_M).toFixed(2));
+    guardValue($("opening-depth"), (sel.depth ?? nicheDepth()).toFixed(2));
   }
   let lastReason = "";
   /** A drag's refusal, once per message. */
@@ -1817,7 +2038,8 @@ async function main() {
       if (!r) return;
       const f = b.dataset.runStep;
       const cur = { thickness: r.thickness, height: r.height, offset: r.topOffset }[f];
-      const v = Math.round((cur + Number(b.dataset.step) * RUN_STEP[f]) * 100) / 100;
+      const next = cur + Number(b.dataset.step) * RUN_STEP[f];
+      const v = f === "thickness" ? roundWallThickness(next) : Math.round(next * 100) / 100;
       runSet(f === "thickness" ? { thickness: v } : f === "height" ? { mode: "fixed", height: v } : { mode: "upto", offset: v });
       app.edit_end_gesture();
     });
@@ -1865,7 +2087,7 @@ async function main() {
       const sel = openingsState.selected;
       if (!sel) return;
       const f = b.dataset.openingStep;
-      const cur = f === "depth" ? (sel.depth ?? OPENING_NICHE_DEPTH_M) : sel[f];
+      const cur = f === "depth" ? (sel.depth ?? nicheDepth()) : sel[f];
       openingSet({ [f]: Math.round((cur + Number(b.dataset.step) * OPENING_STEP_M) * 100) / 100 });
       app.end_gesture();
     });
@@ -1879,7 +2101,7 @@ async function main() {
   }
   $("opening-through").addEventListener("click", () => {
     const sel = openingsState.selected;
-    if (sel) openingSet({ depth: sel.depth == null ? OPENING_NICHE_DEPTH_M : -1 });
+    if (sel) openingSet({ depth: sel.depth == null ? nicheDepth() : -1 });
     app.end_gesture();
   });
 
@@ -1968,6 +2190,24 @@ async function main() {
       return;
     }
     if (!$("dialog-backdrop").hidden) return;
+    if (mod && !e.shiftKey && !e.altKey && (e.key === "c" || e.key === "C")) {
+      if (!clipState.canCopy) return;
+      e.preventDefault();
+      copySelection();
+      return;
+    }
+    if (mod && !e.shiftKey && !e.altKey && (e.key === "v" || e.key === "V")) {
+      if (!clipState.canPaste) return;
+      e.preventDefault();
+      if (!app.paste_armed()) togglePaste();
+      return;
+    }
+    if (e.key === "Escape" && app.paste_armed()) {
+      e.preventDefault();
+      app.paste_cancel();
+      refresh();
+      return;
+    }
     if (inOpenings()) {
       if (e.key === "Enter") { e.preventDefault(); editConfirm(); }
       else if (e.key === "Escape") { e.preventDefault(); app.openings_tap(-1e9, -1e9, 0, 0); refresh(); }
@@ -2007,6 +2247,7 @@ async function main() {
     else if (k === "h") setTool("hole");
     else if (k === "w") setTool("wall");
     else if (k === "n") beginOpenings(openingTool);
+    else if (k === "m" && ROOMS_PREVIEW) setTool("room");
     else if (k === "r" && isDrawing()) { app.set_shape(stats.shape === "rect" ? "polygon" : "rect"); stats = JSON.parse(app.stats_json()); renderChrome(); requestRender(); }
     else if (k === "p") { app.set_view_mode("plan"); stats = JSON.parse(app.stats_json()); renderChrome(); requestRender(); }
     else if (k === "3") { app.set_view_mode("3d"); stats = JSON.parse(app.stats_json()); renderChrome(); requestRender(); }
@@ -2076,7 +2317,7 @@ async function main() {
   let sheetStack = [];
   const PAGE_TITLES = {
     menu: "Menu", levels: "Levels", project: "Project location", about: "About",
-    properties: "Properties", model: "Model", workplane: "Workplane",
+    properties: "Properties", model: "Model", workplane: "Workplane", room: "Room",
   };
   function openSheet(page, { root = false } = {}) {
     if (root) sheetStack = [];
@@ -2096,6 +2337,10 @@ async function main() {
     sheetBody.replaceChildren();
     if (was === "properties" && deselect && app.selection() >= 0) {
       app.select(-1);
+      requestRender();
+    }
+    if (was === "room" && deselect && app.room_selected() >= 0) {
+      app.room_select(-1);
       requestRender();
     }
     renderTreePanel();
@@ -2131,6 +2376,7 @@ async function main() {
       menu: pageMenu, levels: pageLevels, project: pageProject, about: pageAbout, properties: pageProperties,
       model: () => renderTree(sheetBody),
       workplane: pageWorkplane,
+      room: pageRoom,
     };
     (pages[sheetPage] ?? (() => {}))();
   }
@@ -2179,6 +2425,9 @@ async function main() {
     twist: '<path d="M7 10l5 5 5-5"/>',
     plane: '<path d="M3 15l9-5 9 5-9 5z"/>',
     add: '<path d="M12 5v14M5 12h14"/>',
+    room: '<path d="M3 4h18v16H3z"/><path d="M12 4v6.5M12 14.5V20M3 12h5.5"/>',
+    up: '<path d="M7 14l5-5 5 5"/>',
+    down: '<path d="M7 10l5 5 5-5"/>',
   };
   /** A small action button inside a tree row. */
   const treeAction = (attr, title, paths) =>
@@ -2241,7 +2490,9 @@ async function main() {
           }
         };
         addPlanes(lvl.planes ?? [], 1);
-        if (count === 0) block.append(el("div", { class: "tree-empty", text: "No elements yet" }));
+        const levelRooms = ROOMS_PREVIEW ? JSON.parse(app.rooms_json()).filter((r) => r.level === lvl.id) : [];
+        if (count === 0 && levelRooms.length === 0) block.append(el("div", { class: "tree-empty", text: "No elements yet" }));
+        if (levelRooms.length) block.append(...roomTreeRows(container, lvl.id, levelRooms));
         for (const g of lvl.groups) {
           const gkey = `group:${lvl.id}:${g.key}`;
           const gcollapsed = treeCollapsed.has(gkey);
@@ -2471,16 +2722,162 @@ async function main() {
     toast(`Imported ${file.name}`, { kind: "ok" });
   });
 
+  // -- Rooms (preview, ?rooms) ------------------------------------------------------------
+  // App-side rooms over a temporary adapter (Rust `authoring::rooms`):
+  // the Rooms tool draws a boundary (polygon or rectangle); a room is
+  // selected from the plan or the Model tree; its page renames it,
+  // restacks it (a room higher in the order cuts into the ones below),
+  // and sets the plane's room wall settings; Room Edit Mode edits its
+  // boundary and hides the wall of chosen edges.
+  let roomsRevision = -1;
+  function syncRooms() {
+    const rev = app.rooms_revision();
+    if (rev === roomsRevision) return;
+    roomsRevision = rev;
+    store.set(ROOMS_KEY, app.rooms_state_json());
+    renderTreePanel();
+    if (sheetPage === "model") renderTree(sheetBody);
+    if (sheetPage === "room") pageRoom();
+    requestRender();
+  }
+  const selectedRoom = () => JSON.parse(app.rooms_json()).find((r) => r.selected) ?? null;
+  function selectRoom(id) {
+    app.room_select(id);
+    const r = selectedRoom();
+    // A room shows on its plane: make it the active one.
+    if (r && JSON.parse(app.levels_json()).activePlane?.id !== r.plane) activatePlane(r.plane);
+    openSheet("room", { root: true });
+    renderTreePanel();
+    renderViewCluster();
+    requestRender();
+  }
+  function beginRoomEdit(id) {
+    if (!app.room_edit_begin(id)) { toast("This room cannot be edited now", { kind: "error" }); return; }
+    enterEditChrome();
+    fitView();
+    requestRender();
+  }
+  function roomTreeRows(container, levelId, rooms) {
+    const gkey = `group:${levelId}:rooms`;
+    const collapsed = treeCollapsed.has(gkey);
+    const head = el("button", {
+      type: "button", class: "tree-group", "data-tree-group": "rooms",
+      html: `<span class="twist${collapsed ? " collapsed" : ""}">${svg(TREE_ICON.twist, "ico sm")}</span>` +
+        `<span>Rooms</span><span class="count">${rooms.length}</span>`,
+    });
+    head.addEventListener("click", () => { toggleCollapsed(gkey); renderTree(container); });
+    if (collapsed) return [head];
+    // Top of the order first: the order decides which room cuts into which.
+    const rows = [...rooms].sort((a, b) => a.plane - b.plane || a.rank - b.rank).map((r) => {
+      const row = el("div", {
+        class: `tree-row item room${r.selected ? " selected" : ""}`, role: "button", tabindex: "0", "data-tree-room": String(r.id),
+        html: `<span class="tree-kind">${svg(TREE_ICON.room)}</span><span class="tree-name"></span><span class="tree-meta"></span>` +
+          `<span class="tree-actions">` +
+          treeAction("data-room-up", "Bring forward: cut into the room below", TREE_ICON.up) +
+          treeAction("data-room-down", "Send backward", TREE_ICON.down) +
+          treeAction("data-room-edit", "Edit the boundary", TREE_ICON.pencil) + `</span>`,
+      });
+      row.querySelector(".tree-name").textContent = r.name;
+      row.querySelector(".tree-meta").textContent = fmtArea(r.area);
+      row.querySelector("[data-room-up]").disabled = r.rank <= 1;
+      row.querySelector("[data-room-down]").disabled = r.rank >= r.ofRank;
+      row.addEventListener("click", (e) => {
+        if (e.target.closest("[data-room-up]")) { app.room_restack(r.id, true); refresh(); return; }
+        if (e.target.closest("[data-room-down]")) { app.room_restack(r.id, false); refresh(); return; }
+        if (e.target.closest("[data-room-edit]")) {
+          if (sheetPage === "model" || sheetPage === "room") closeSheet(false);
+          beginRoomEdit(r.id);
+          return;
+        }
+        if (sheetPage === "model") closeSheet(false);
+        selectRoom(r.id);
+      });
+      return row;
+    });
+    return [head, ...rows];
+  }
+  function pageRoom() {
+    const r = selectedRoom();
+    if (!r) { closeSheet(false); return; }
+    $("sheet-title").textContent = r.name;
+    const nameInput = el("input", { type: "text", class: "wide", id: "room-name", value: r.name, autocomplete: "off" });
+    nameInput.addEventListener("change", () => {
+      if (!app.room_rename(r.id, nameInput.value)) nameInput.value = selectedRoom()?.name ?? r.name;
+      refresh();
+    });
+    const layout = JSON.parse(app.room_layout_json());
+    const children = [
+      group(null, el("div", { class: "field" }, el("label", { for: "room-name", text: "Name" }), nameInput)),
+      el("div", { class: "stat-grid" },
+        stat("Area", "room-area", fmtArea(r.area)),
+        stat("Order", "room-rank", `${r.rank} of ${r.ofRank}`)),
+      el("div", { class: "empty-note", style: "padding:0 4px 10px;text-align:left",
+        text: `${r.edges} edges · ${r.hiddenEdges} hidden wall${r.hiddenEdges === 1 ? "" : "s"}. A room higher in the order cuts into the rooms it overlaps.` }),
+      el("button", {
+        type: "button", class: "btn primary block", id: "room-edit", style: "margin-bottom:10px",
+        html: `${svg(TREE_ICON.pencil)} Edit boundary`, onclick: () => { closeSheet(false); beginRoomEdit(r.id); },
+      }),
+      el("div", { class: "room-order" },
+        el("button", { type: "button", class: "btn", id: "room-forward", text: "Bring forward", disabled: r.rank <= 1 ? "" : null,
+          onclick: () => { app.room_restack(r.id, true); refresh(); } }),
+        el("button", { type: "button", class: "btn", id: "room-backward", text: "Send backward", disabled: r.rank >= r.ofRank ? "" : null,
+          onclick: () => { app.room_restack(r.id, false); refresh(); } })),
+    ];
+    if (layout) {
+      children.push(
+        measureGroup({
+          title: "Room walls", label: "Thickness (this plane)", id: "room-wall-thickness", value: layout.thickness,
+          min: 0.05, max: 0.6, step: WALL_THICKNESS_STEP_M, decimals: WALL_THICKNESS_DECIMALS,
+          apply: (v) => app.set_room_layout(v, "", -1, NaN, NaN),
+          current: () => JSON.parse(app.room_layout_json()).thickness,
+        }),
+        measureGroup({
+          title: "Room wall height", label: "Above the plane", id: "room-wall-height", value: layout.height,
+          min: 0.5, max: 6.0, step: WALL_HEIGHT_STEP_M,
+          apply: (v) => app.set_room_layout(NaN, "fixed", -1, NaN, v),
+          current: () => JSON.parse(app.room_layout_json()).height,
+        }),
+      );
+    }
+    children.push(el("button", {
+      type: "button", class: "btn danger block", id: "room-delete", text: "Delete room",
+      onclick: () => { const name = r.name; if (app.room_delete(r.id)) { closeSheet(false); refresh(); toast(`Deleted ${name}`); } },
+    }));
+    sheetBody.replaceChildren(...children.filter(Boolean));
+  }
+  /** Room Edit Mode chrome: the boundary's points and edges, and the
+   *  "Hidden wall" toggle of the selected edges. */
+  function renderRoomPanel() {
+    const r = editState.room;
+    if (!r) return;
+    $("edit-panel").classList.remove("target-new", "target-fresh");
+    $("edit-caption").textContent = "Editing room";
+    $("edit-panel-title").textContent = `${r.name} · ${fmtArea(r.area)}`;
+    $("edit-panel-note").textContent = r.selectedEdges ? `${r.selectedEdges} edge${r.selectedEdges === 1 ? "" : "s"} selected` : "select edges to hide their wall";
+    const btn = $("room-hidden");
+    btn.disabled = r.selectedEdges === 0;
+    btn.classList.toggle("on", r.selectedHidden);
+    btn.setAttribute("aria-pressed", String(r.selectedHidden));
+  }
+  $("room-hidden").addEventListener("click", () => {
+    const r = editState.room;
+    if (!r) return;
+    const res = JSON.parse(app.room_set_hidden(!r.selectedHidden));
+    if (res.result === "rejected") toast(res.reason, { kind: "error" });
+    refresh();
+  });
+
   // -- Properties ------------------------------------------------------------------------
   let propsFor = null;
   const KIND_LABEL = { floor_plate: "Floor plate", wall: "Wall", element: "Element" };
   // A numeric property edited by stepper, text field, and slider. One
   // undo step per edit gesture: typing and dragging coalesce until the
   // field commits; each stepper tap is its own step.
-  function measureGroup({ title, label, id, value, min, max, step, apply, current }) {
-    const input = el("input", { type: "text", inputmode: "decimal", id, value: value.toFixed(2) });
+  function measureGroup({ title, label, id, value, min, max, step, apply, current, decimals = 2 }) {
+    const unit = 10 ** decimals;
+    const input = el("input", { type: "text", inputmode: "decimal", id, value: value.toFixed(decimals) });
     const slider = el("input", {
-      type: "range", min: String(min), max: String(max), step: "0.01", id: `${id}-slider`,
+      type: "range", min: String(min), max: String(max), step: String(1 / unit), id: `${id}-slider`,
       style: "width:100%;accent-color:var(--accent)",
     });
     slider.value = String(value);
@@ -2490,10 +2887,10 @@ async function main() {
       refresh();
     };
     input.addEventListener("input", () => set(parseNum(input.value)));
-    input.addEventListener("change", () => { app.end_gesture(); input.value = current().toFixed(2); });
+    input.addEventListener("change", () => { app.end_gesture(); input.value = current().toFixed(decimals); });
     slider.addEventListener("input", () => set(parseFloat(slider.value)));
     slider.addEventListener("change", () => app.end_gesture());
-    const bump = (d) => { set(Math.round((current() + d) * 100) / 100); app.end_gesture(); };
+    const bump = (d) => { set(Math.round((current() + d) * unit) / unit); app.end_gesture(); };
     const stepper = el("div", { class: "stepper" },
       el("button", { type: "button", text: "−", "aria-label": `Decrease ${title.toLowerCase()}`, onclick: () => bump(-step) }),
       input, el("span", { class: "unit", text: "m" }),
@@ -2574,8 +2971,8 @@ async function main() {
         heightGroup,
         measureGroup({
           title: "Thickness", label: "Into the wall", id: "prop-wall-thickness", value: e.thickness,
-          min: 0.05, max: 0.6, step: WALL_THICKNESS_STEP_M,
-          apply: (v) => app.set_wall_thickness(e.id, v), current: () => selectedValue("thickness", 0.2),
+          min: 0.05, max: 0.6, step: WALL_THICKNESS_STEP_M, decimals: WALL_THICKNESS_DECIMALS,
+          apply: (v) => app.set_wall_thickness(e.id, v), current: () => selectedValue("thickness", stats.wall.thickness),
         }),
         el("div", { class: "stat-grid" }, stat("Length", "prop-length", fmtM(e.length)), stat(legacy ? "Windows" : "Openings", "prop-window-count", String(openings))),
         el("div", { class: "group" }, el("div", { class: "group-title", text: legacy ? "Windows" : "Openings" }), el("div", { class: "card", id: "prop-windows" })),
@@ -2766,7 +3163,7 @@ async function main() {
       if ($("prop-wall-top")) guardAssign($("prop-wall-top"), String(e.topPlane));
       const openings = e.legacy ? e.windows.length : e.openings;
       $("prop-height-label").textContent = openings ? `Above level (min ${fmtM(e.minHeight)})` : "Above level";
-      guardAssign($("prop-wall-thickness"), e.thickness.toFixed(2));
+      guardAssign($("prop-wall-thickness"), e.thickness.toFixed(WALL_THICKNESS_DECIMALS));
       guardAssign($("prop-wall-thickness-slider"), String(e.thickness));
       $("prop-length").textContent = fmtM(e.length);
       $("prop-window-count").textContent = String(openings);

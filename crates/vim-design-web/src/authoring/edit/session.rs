@@ -6,7 +6,7 @@
 use std::collections::BTreeSet;
 
 use super::interact::{Hit, SelectMode, Selection};
-use super::{Edit, EditError, FaceKind, PointId, ProfileModel, ProfileView};
+use super::{Edit, EditError, FaceId, FaceKind, PointId, ProfileModel, ProfileView};
 use crate::authoring::geom::P2;
 use vim_design_lib::EntityId;
 
@@ -51,6 +51,9 @@ pub struct EditSession<P: ProfileModel> {
     pub new_thickness: f64,
     pub new_void_depth: f64,
     pub new_void_through: bool,
+    /// The faces just drawn (they are the selection, so the panel's
+    /// values apply to them) — see [`EditSession::is_fresh`].
+    pub fresh: BTreeSet<FaceId>,
 }
 
 impl<P: ProfileModel> EditSession<P> {
@@ -68,7 +71,23 @@ impl<P: ProfileModel> EditSession<P> {
             new_thickness: DEFAULT_SOLID_THICKNESS_M,
             new_void_depth: DEFAULT_VOID_DEPTH_M,
             new_void_through: true,
+            fresh: BTreeSet::new(),
         }
+    }
+
+    /// The selection is exactly the just-drawn faces.
+    pub fn is_fresh(&self) -> bool {
+        let only = self.selection.points.is_empty() && self.selection.edges.is_empty();
+        only && !self.fresh.is_empty() && self.selection.faces == self.fresh
+    }
+
+    /// Select new faces as the just-created item (Faces mode, so the
+    /// panel targets them).
+    pub fn select_fresh(&mut self, faces: BTreeSet<FaceId>) {
+        self.mode = SelectMode::Faces;
+        self.selection = Selection::default();
+        self.selection.faces = faces.clone();
+        self.fresh = faces;
     }
 
     /// The profile to draw: the drag preview when valid.

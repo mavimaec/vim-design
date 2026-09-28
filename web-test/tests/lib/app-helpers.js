@@ -35,6 +35,10 @@ export async function openApp(page, query = "") {
   return errors;
 }
 
+/** New walls' default thickness: a 2x4 stud partition with gypsum
+ *  board on both faces (Rust `walls::PARTITION_THICKNESS_M`). */
+export const PARTITION_M = 0.114;
+
 export const stats = (page) => page.evaluate(() => window.__author.stats());
 export const elements = (page) => page.evaluate(() => window.__author.elements());
 export const walls = async (page) => (await elements(page)).filter((e) => e.kind === "wall");
