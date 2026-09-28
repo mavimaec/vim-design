@@ -307,6 +307,43 @@ the tap anchors to the room edge covering the wall, inside one of its
 persistence, cascades (a level or workplane takes its rooms; a deleted top plane
 disconnects the walls at their height) are the document's.
 
+**View controls.** Alt + middle drag orbits the 3D view in every mode (normal, Edit
+Modes, Openings, an armed paste), so a selection marquee never takes its place; Shift +
+middle drag does the same for window managers that take Alt + drag. A plain middle or
+right drag pans, the wheel zooms; the browser's middle-click autoscroll is off on the
+canvas. Menu → About lists the controls.
+
+**Model tree** (desktop: at the far left, the tool dock to its right; the dock returns to
+the edge when the tree is closed; phones: the Model sheet). Its header adds a level (the
+next one 3 m above the top, as Menu → Levels); the new row is marked and the active plane
+stays. Row actions (pencil, +, ▲ / ▼) show on hover or keyboard focus with a mouse, and
+on the selected / active row on touch; names ellipsize so badges and buttons stay inside
+the row. A level's pencil opens the **Level sheet**: name, color, building story,
+elevation (coalesced drags), its plan span, Draw on it, + Workplane, Delete (the cascade
+prompt only for real contents; a level held only by metadata — its plan span — is deleted
+directly, one undo step).
+
+**Moving a workplane** (its sheet's "In" picker: every level and every workplane except
+itself and its own) is ONE gesture: `UpdateWorkplane { parent, offset_m: world z − new
+parent's z }` keeps it at the same world elevation, and every element drawn on it (or on
+its nested workplanes) is re-associated with the new root level (`UpdateElementLevel`), so
+the tree groups it there; rooms follow by their plane. Contents keep their world
+position. One undo restores all.
+
+**Plan span** (the library's per-level `PlanSpan`, document data: saved, exported,
+undoable). The active plane's root level's span drives both views: the part of any element
+above the span's top is drawn see-through with the level's "above" opacity, the part below
+its bottom with its "below" opacity (per fragment by world height, a second blended pass
+drawn far to near, depth-tested, not depth-written; opacity 0 hides the band); the plan
+view cuts at the span's cut height (a workplane above the cut gets 1.2 m over it). A pick
+passes through a band at or under 30% opacity (the default "above" 25% does), so the work
+inside the span stays pickable. View menu → "Plan span" toggles the bands (session state;
+a dot on the View button when on; the plan still cuts). The Level sheet's Plan span group
+edits Top (Next story | Offset), the cut, the bottom, both opacities, and Reset (the first
+edit creates the level's `PlanSpan`, drags coalesce). Note: floor plates hang below their
+level, so an upper level's slab lies inside the lower story's default span (it reads as
+that story's ceiling); an Offset top below it makes it see-through.
+
 **Attachment.** Sketches and wall runs live on their construction plane, in the space
 of its root level, so a level elevation edit moves everything on it (and on its
 workplanes) as a transform only — except runs whose top follows another plane, which
@@ -736,3 +773,57 @@ Commands:
 were appended at the end of their serialized enums; fixture v4 (wall runs with openings
 and a gable, sketch plates, workplanes, `Wall`s) was saved before this change and, with
 v1 to v3, loads, evaluates, and resaves byte-identically.
+
+## 13. Plan span
+
+A **`PlanSpan`** is a level's view range: which heights around the level show normally,
+and how the rest shows. It is project data, per level: saved with the document,
+exported, and undoable. This is a deliberate exception to §5 (view state stays in the
+session): the user chose the span as part of each level's definition, like the view
+range of a floor plan. The active level, the camera, and the selection stay session
+state.
+
+```rust
+// Params::PlanSpan {
+//     top: SpanTop,            // NextStory | Offset(m) — relative to the level
+//     cut_offset_m: f64,       // plan cut height above the level (default 1.2)
+//     bottom_offset_m: f64,    // default 0.0; negative reaches below the level
+//     above_opacity: f32,      // 0..=1, default 0.25 (0 = invisible, 1 = normal)
+//     below_opacity: f32,      // 0..=1, default 0.35
+// }
+// slot 0 = level (required): Level — at most one PlanSpan per level
+```
+
+- **By height.** Geometry is judged by height, not by element: the part of an element
+  between the span's bottom and top shows normally, the part above the top is
+  see-through at `above_opacity`, the part below the bottom at `below_opacity`. Plan
+  views cut at the cut height. The treatment applies to plan and 3D views.
+- **Resolution.** `plan_span::resolve(doc, level) -> Option<ResolvedSpan { top_z, cut_z,
+  bottom_z, above_opacity, below_opacity, top_raised }>` gives the span in WORLD z from
+  params only (`None` when the id is not a level). A level without a `PlanSpan` uses the
+  defaults (`PlanSpanData::default()`: `NextStory`, 1.2, 0.0, 0.25, 0.35). `NextStory` is
+  the elevation of the next building-story level above (non-story levels do not count),
+  or `DEFAULT_STORY_HEIGHT_M` (3.0 m) above the level when there is none; it follows that
+  level when it moves. When the next story is at or below the cut, the top is raised to
+  the cut and `top_raised` is set. Geometry on a workplane uses its root level's span
+  (`plan_span::resolve_for_plane`).
+- **Validity.** The commands reject (`InvalidPlanSpan`) a non-finite value, an opacity
+  outside 0..=1, a bottom not below the cut, and a cut not below a fixed (`Offset`) top
+  (`plan_span::validate`). A second `PlanSpan` on a level is rejected with
+  `SingletonExists` at the delta gate (the Site rule, per level).
+- **Metadata.** A plan span generates no geometry and has no mesh; it evaluates to its
+  plain data (`Evaluated::PlanSpan`). `EntityKind::is_metadata()` is true for it (and for
+  the Site), so cascade prompts count it apart from elements. The level cascade deletes
+  it with its level; a plain level delete is rejected while it exists.
+  `plan_span::of_level(doc, level)` finds it; `plan_span::data_of_level` gives its data
+  or the defaults.
+
+Commands: `CreatePlanSpan { level, top, cut_offset_m, bottom_offset_m, above_opacity,
+below_opacity }`, `UpdatePlanSpan { id, top, cut_offset_m, bottom_offset_m,
+above_opacity, below_opacity (all Option), coalesce }` (validated like a create; a
+coalesced slider drag is one undo step), `DeletePlanSpan { id }` (the level returns to
+the defaults).
+
+**Compatibility.** `PlanSpan`, its commands, and `InvalidPlanSpan` were appended at the
+end of their enums; fixture v5 (the room project) was saved before this change and, with
+v1 to v4, loads, evaluates, and resaves byte-identically.

@@ -99,6 +99,14 @@ async function drawRoom(page, a, b) {
 }
 
 /** The Model tree: the desktop panel, or the phone's bottom sheet. */
+/** A workplane row's pencil. Touch shows row actions on the active row
+ *  only: tap the row first (it becomes the active plane). */
+async function planeEdit(page, body, id) {
+  const row = body.locator(`[data-tree-plane="${id}"]`);
+  if (mobile() && !(await row.locator("[data-tree-plane-edit]").isVisible())) await row.locator(".tree-name").click();
+  await body.locator(`[data-tree-plane="${id}"] [data-tree-plane-edit]`).click();
+}
+
 async function openTree(page) {
   if (mobile()) {
     const open = (await page.locator("#sheet").isVisible()) && (await page.locator("#sheet-title").textContent()) === "Model";
@@ -329,7 +337,7 @@ test("workplanes: add in the tree, rename, nest, draw a ceiling on one; it follo
 
   // Offset edit in the workplane sheet: one undo step.
   body = await openTree(page);
-  await body.locator(`[data-tree-plane="${ceiling.id}"] [data-tree-plane-edit]`).click();
+  await planeEdit(page, body, ceiling.id);
   await page.locator("#wp-offset").fill("2.6");
   await page.locator("#wp-offset").press("Enter");
   [plate] = (await elements(page)).filter((e) => e.kind === "floor_plate");
@@ -361,7 +369,7 @@ test("workplanes: add in the tree, rename, nest, draw a ceiling on one; it follo
 
   // Delete the ceiling: the honest cascade prompt, one undo restores all.
   body = await openTree(page);
-  await body.locator(`[data-tree-plane="${ceiling.id}"] [data-tree-plane-edit]`).click();
+  await planeEdit(page, body, ceiling.id);
   await page.locator("#wp-delete").click();
   const msg = await page.locator("#dialog-message").textContent();
   expect(msg).toContain("1 element drawn on it");

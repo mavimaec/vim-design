@@ -247,6 +247,9 @@
   <aside id="tree-panel" hidden aria-label="Model">
     <div class="tree-head">
       <h2>Model</h2>
+      <button id="tree-add-level" class="chip-toggle small" type="button" title="Add a level above the top one">
+        <svg class="ico sm" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg><span>Level</span>
+      </button>
       <button id="tree-close" class="icon-btn ghost" type="button" aria-label="Close the model tree">
         <svg class="ico" viewBox="0 0 24 24"><path d="M15 6l-6 6 6 6"/></svg>
       </button>
@@ -294,6 +297,9 @@
     <button id="render-btn" class="cluster-btn" type="button" title="Render mode: shaded or wireframe" aria-haspopup="menu" aria-expanded="false">
       <svg class="ico" viewBox="0 0 24 24"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/><path d="M4 7.5l8 4.5 8-4.5M12 12v9"/></svg>
       <span>View</span>
+      <!-- Plan span on: what lies above / below the active level's span
+           is see-through. -->
+      <i id="span-dot" class="span-dot" aria-hidden="true"></i>
     </button>
     <!-- Snapping is an input aid for every mode (also inside Edit Modes,
          where the tool dock is hidden), so it lives with the view controls. -->
@@ -317,6 +323,9 @@
     <button type="button" role="menuitemradio" data-render="shaded">Shaded</button>
     <button type="button" role="menuitemradio" data-render="shaded-wire">Shaded + wireframe</button>
     <button type="button" role="menuitemradio" data-render="wire">Wireframe</button>
+    <div class="menu-sep" aria-hidden="true"></div>
+    <button type="button" role="menuitemcheckbox" id="plan-span-toggle" aria-checked="true"
+            title="See-through above and below the active level's plan span (Level sheet)">Plan span</button>
   </div>
   <div id="tri-badge" class="tri-badge" hidden aria-live="polite"></div>
 

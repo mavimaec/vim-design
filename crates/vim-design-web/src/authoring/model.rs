@@ -1291,6 +1291,71 @@ mod tests {
     }
 
     #[test]
+    fn a_workplane_moves_to_another_level_at_the_same_world_elevation() {
+        use vim_design_lib::workplane::plane_elevation;
+        let mut doc = Document::new();
+        let ground = ops::seed_new_project(&mut doc).expect("seed");
+        let level2 = ops::levels_sorted(&doc).iter().find(|l| l.id != ground).map(|l| l.id).expect("level 2");
+        let wp = ops::one(
+            &mut doc,
+            vim_design_lib::Command::CreateWorkplane { parent: ground, name: "Ceiling".into(), offset_m: 2.4, color: [0.5, 0.5, 0.5, 0.3], extent_m: 20.0 },
+        )
+        .expect("workplane");
+        let nested = ops::one(
+            &mut doc,
+            vim_design_lib::Command::CreateWorkplane { parent: wp, name: "Shelf".into(), offset_m: 0.3, color: [0.5, 0.5, 0.5, 0.3], extent_m: 20.0 },
+        )
+        .expect("nested");
+        let fixed = ops::WallHeight { height_m: 0.5, top: None, top_offset_m: 0.0 };
+        let run = ops::commit_run(&mut doc, nested, ground, &[[0.0, 0.0], [3.0, 0.0]], false, false, 0.114, fixed).expect("run");
+        let room = vim_design_lib::room::from_rectangle("Room 001", 0, [0.0, 0.0], [2.0, 2.0]).expect("room");
+        let settings = ops::LayoutSettings { thickness_m: 0.114, height_m: 0.5, top: None, top_offset_m: 0.0 };
+        ops::create_room(&mut doc, wp, ground, &room, settings).expect("room");
+        let before = (plane_elevation(&doc, wp), plane_elevation(&doc, nested));
+        let bbox_before = volumes_bbox(&mut doc);
+        // Its own nested workplane is not a candidate parent.
+        assert!(!ops::workplane_parent_candidates(&doc, wp).contains(&nested));
+        assert!(ops::move_workplane(&mut doc, wp, nested).is_err());
+        let moved = ops::move_workplane(&mut doc, wp, level2).expect("move");
+        assert_eq!(moved.len(), 2, "the run and the room walls follow the new level");
+        assert_eq!((plane_elevation(&doc, wp), plane_elevation(&doc, nested)), before, "same world elevations");
+        assert!(derive(&doc).iter().all(|e| e.level() == Some(level2)));
+        assert!(rooms(&doc).iter().all(|r| r.level == Some(level2)));
+        assert!(derive(&doc).iter().any(|e| e.element() == run));
+        let bbox_after = volumes_bbox(&mut doc);
+        for (a, b) in bbox_before.iter().zip(&bbox_after) {
+            assert!((a - b).abs() < 1e-4, "contents keep their world position: {bbox_before:?} vs {bbox_after:?}");
+        }
+    }
+
+    /// World bounds of every evaluated mesh (base transforms applied).
+    fn volumes_bbox(doc: &mut Document) -> Vec<f64> {
+        use vim_design_lib::eval::Engine;
+        let mut engine = Engine::new();
+        engine.evaluate_pending(doc);
+        let up = engine.poll_updates(doc);
+        let mut lo = [f64::INFINITY; 3];
+        let mut hi = [f64::NEG_INFINITY; 3];
+        for m in &up.meshes {
+            // Row-major 3 x 4: [r00 r01 r02 tx, r10 r11 r12 ty, r20 r21 r22 tz].
+            let t = &m.base_transform;
+            for p in &m.mesh.positions {
+                let (x, y, z) = (f64::from(p[0]), f64::from(p[1]), f64::from(p[2]));
+                let w = [
+                    t[0] * x + t[1] * y + t[2] * z + t[3],
+                    t[4] * x + t[5] * y + t[6] * z + t[7],
+                    t[8] * x + t[9] * y + t[10] * z + t[11],
+                ];
+                for k in 0..3 {
+                    lo[k] = lo[k].min(w[k]);
+                    hi[k] = hi[k].max(w[k]);
+                }
+            }
+        }
+        [lo, hi].concat()
+    }
+
+    #[test]
     fn partition_walls_of_the_default_thickness_mesh() {
         let mut doc = Document::new();
         let ground = ops::seed_new_project(&mut doc).expect("seed");

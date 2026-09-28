@@ -130,7 +130,9 @@ impl PickScene {
 
     /// Every owner the ray hits, nearest hit per owner, sorted by world
     /// distance (the caller breaks ties, e.g. wall over plate).
-    pub fn pick_all(&self, origin: Vec3, dir: Vec3) -> Vec<(EntityId, f32)> {
+    /// `keep` filters hit points (world): a see-through band a pick
+    /// passes through.
+    pub fn pick_all(&self, origin: Vec3, dir: Vec3, keep: &dyn Fn(Vec3) -> bool) -> Vec<(EntityId, f32)> {
         let mut hits: Vec<(EntityId, f32)> = Vec::new();
         for (id, mesh) in &self.meshes {
             let mut best: Option<f32> = None;
@@ -153,7 +155,7 @@ impl PickScene {
                         // `t` is in local units; compare in world units.
                         let hit_world = world.transform_point3(o + d * t);
                         let dist = (hit_world - origin).length();
-                        if best.is_none_or(|bd| dist < bd) {
+                        if keep(hit_world) && best.is_none_or(|bd| dist < bd) {
                             best = Some(dist);
                         }
                     }

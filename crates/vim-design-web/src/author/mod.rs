@@ -24,6 +24,7 @@
 
 mod camera;
 mod clipboard;
+mod span;
 mod defaults;
 mod edit;
 mod pick;
@@ -250,6 +251,9 @@ pub struct AuthorApp {
     room_graphs: Vec<rooms::LayoutGraph>,
     room_selection: Option<EntityId>,
     room_edit: Option<EntityId>,
+    /// The see-through bands of the active level's plan span (session
+    /// toggle; see `span`).
+    plan_span_on: bool,
     /// The wall run just drawn (see `walls::fresh_run`).
     fresh_run: Option<EntityId>,
     /// Remembered settings for new items (see `defaults`).
@@ -330,6 +334,7 @@ impl AuthorApp {
             plate_thickness: crate::authoring::edit::session::DEFAULT_SOLID_THICKNESS_M,
             remembered: defaults::Remembered::default(),
             fresh_run: None,
+            plan_span_on: true,
             clipboard: None,
             paste_armed: false,
             rooms: Vec::new(),
@@ -401,6 +406,7 @@ impl AuthorApp {
 
     pub fn render(&mut self) -> Result<(), JsValue> {
         self.camera.plane_z = self.active_elevation as f32;
+        self.apply_span();
         self.update_grid();
         let (eye, fraction) = self.camera.edge_nudge();
         self.renderer.set_edge_nudge(eye, fraction);
@@ -890,7 +896,7 @@ impl AuthorApp {
         let Some((origin, dir)) = self.camera.ray(px, py, w, h) else {
             return -1.0;
         };
-        let hits = self.pick.pick_all(origin, dir);
+        let hits = self.pick.pick_all(origin, dir, &|p| self.pickable_z(p.z));
         let Some(&(nearest, d0)) = hits.first() else {
             return -1.0;
         };
@@ -1184,10 +1190,13 @@ impl AuthorApp {
         self.active_level = Some(level);
         self.active_plane = (id != level).then_some(id);
         self.refresh_session_and_overlays();
+        self.apply_span();
         true
     }
 
-    pub fn add_level(&mut self) {
+    /// Add a level above the top one (3 m up, the next color, "Level N"):
+    /// one undo step. Returns its id, or -1.
+    pub fn add_level(&mut self) -> f64 {
         let levels = ops::levels_sorted(&self.doc);
         let top = levels.last().map_or(0.0, |l| l.elevation_m);
         let elevation = if levels.is_empty() { 0.0 } else { top + 3.0 };
@@ -1198,19 +1207,24 @@ impl AuthorApp {
         };
         let color = ops::APP_LEVEL_COLORS[levels.len() % ops::APP_LEVEL_COLORS.len()];
         let depth = self.doc.undo_depth();
-        match self.doc.submit(Command::CreateLevel {
+        let id = match self.doc.submit(Command::CreateLevel {
             name,
             elevation_m: elevation,
             is_building_story: true,
             color,
             extent_m: ops::LEVEL_EXTENT_M,
         }) {
-            Ok(_) => self.gestures.one_shot(depth),
-            Err(status) => web_sys::console::error_1(&JsValue::from_str(&format!(
-                "CreateLevel rejected: {status:?}"
-            ))),
-        }
+            Ok(out) => {
+                self.gestures.one_shot(depth);
+                out.created_ids.first().map_or(-1.0, |id| id.0 as f64)
+            }
+            Err(status) => {
+                web_sys::console::error_1(&JsValue::from_str(&format!("CreateLevel rejected: {status:?}")));
+                -1.0
+            }
+        };
         self.sync("add level");
+        id
     }
 
     pub fn update_level_name(&mut self, id: f64, name: String) {
@@ -1245,6 +1259,11 @@ impl AuthorApp {
                 self.gestures.one_shot(depth);
                 self.sync("delete level");
                 "deleted".to_owned()
+            }
+            // Held only by metadata (its plan span): nothing to confirm —
+            // delete it with them, one undo step.
+            Err(VimStatus::HasDependents) if self.only_metadata_depends_on(eid(id)) => {
+                if self.delete_level_cascade(id) { "deleted".to_owned() } else { "error: cascade".to_owned() }
             }
             Err(VimStatus::HasDependents) => "has_dependents".to_owned(),
             Err(status) => format!("error: {status:?}"),
@@ -1369,6 +1388,10 @@ impl AuthorApp {
             "wallsOnLevel": self.model.iter().filter(|e| e.is_wall() && e.level() == self.active_level).count(),
             "editing": self.edit.is_some(),
             "rooms": self.rooms.len(),
+            // The see-through bands drawn now (the active level's span).
+            "span": self.renderer.span.map(|b| serde_json::json!({
+                "topZ": b.top_z, "bottomZ": b.bottom_z, "above": b.above_opacity, "below": b.below_opacity,
+            })),
             "roomSelected": self.room_selection.map(|r| r.0 as f64),
             "openings": self.openings.is_some(),
             "wall": {
@@ -1604,6 +1627,13 @@ impl AuthorApp {
     }
 
     /// A wall from before the `Wall` entity (extrusion-based), by element.
+    /// Only metadata (a plan span, the site) depends on `id`.
+    fn only_metadata_depends_on(&self, id: EntityId) -> bool {
+        self.doc
+            .dependents(id)
+            .is_ok_and(|d| d.iter().all(|x| self.doc.entity(*x).is_some_and(|e| e.kind().is_metadata())))
+    }
+
     fn legacy_wall(&self, element: EntityId) -> Option<&LegacyWallModel> {
         self.model.iter().find_map(|e| match e {
             ElementModel::LegacyWall(w) if w.element == element => Some(w),
@@ -2261,6 +2291,8 @@ impl AuthorApp {
         let t0 = now_ms();
         self.engine.evaluate_pending(&mut self.doc);
         let updates = self.engine.poll_updates(&self.doc);
+        // The plan span follows its level (and edits of it).
+        self.apply_span();
         if !updates.params_changed.is_empty() {
             self.model = model::derive(&self.doc);
             self.derive_rooms();

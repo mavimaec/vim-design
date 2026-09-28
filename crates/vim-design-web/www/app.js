@@ -64,6 +64,8 @@ const TOUCH_COMMIT_PX = 12;
 const TOUCH_COMMIT_MAX_PX = 40;
 const TOUCH_DOMINANCE = 1.6;
 const TOUCH_TWIST_WEIGHT = 0.6;
+/** Mouse orbit: this button with Alt (or Shift) held (1 = middle). */
+const ORBIT_BUTTON = 1;
 /** Orbit angle per pointer pixel (the camera's orbit rate). */
 const ORBIT_RAD_PER_PX = 0.0065;
 // Edit Mode stepper increments (meters).
@@ -77,6 +79,9 @@ const OPENING_NICHE_DEPTH_M = 0.1;
 /** Workplane offset stepper step and slider range (meters). */
 const WORKPLANE_OFFSET_STEP_M = 0.05;
 const WORKPLANE_OFFSET_RANGE_M = 6.0;
+/** Level sheet: the elevation stepper step and slider range (meters). */
+const LEVEL_ELEVATION_STEP_M = 0.1;
+const LEVEL_ELEVATION_RANGE_M = 30.0;
 /** Range of the wall top offset slider (meters, either way). */
 const WALL_TOP_OFFSET_RANGE_M = 3.0;
 /** A wall opening whose bottom is below this (m above the base) is a door. */
@@ -287,6 +292,7 @@ async function main() {
           snapStep: snapStep,
           activeLevel: levels.activeId,
           renderMode: app.render_mode(),
+          planSpan: app.plan_span_enabled(),
           thickness: app.plate_thickness_setting(),
           shape: app.shape(),
           wall: JSON.parse(app.wall_settings_json()),
@@ -303,6 +309,8 @@ async function main() {
   // Model tree: open on desktop by default; collapsed rows by key.
   let treeOpen = typeof session.treeOpen === "boolean" ? session.treeOpen : innerWidth >= TREE_DEFAULT_OPEN_MIN_PX;
   const treeCollapsed = new Set(Array.isArray(session.treeCollapsed) ? session.treeCollapsed : []);
+  // The level just added from the tree (its row is marked).
+  let newLevel = null;
   let snapEnabled = session.snapEnabled ?? true;
   let snapStep = SNAP_STEPS.includes(session.snapStep) ? session.snapStep : (COARSE ? 0.5 : 0.25);
   app.set_snap(snapEnabled, snapStep);
@@ -313,6 +321,7 @@ async function main() {
     app.set_wall_settings(Number(w.height), Number(w.thickness), w.flip === true);
   }
   if (typeof session.renderMode === "string") app.set_render_mode(session.renderMode);
+  if (typeof session.planSpan === "boolean") app.set_plan_span_enabled(session.planSpan);
   else if (session.wireframe === true) app.set_wireframe(true); // older sessions
 
   // -- restore the persisted document ------------------------------------------
@@ -531,6 +540,12 @@ async function main() {
   }
 
   canvas.addEventListener("contextmenu", (e) => e.preventDefault());
+  // The middle button is ours (pan / orbit): no browser autoscroll.
+  canvas.addEventListener("mousedown", (e) => { if (e.button === 1) e.preventDefault(); });
+  canvas.addEventListener("auxclick", (e) => { if (e.button === 1) e.preventDefault(); });
+  /** Alt + middle drag orbits the 3D view; Shift + middle is the same for
+   *  window managers that take Alt + drag. In plan it pans. */
+  const orbitDrag = (e) => e.button === ORBIT_BUTTON && (e.altKey || e.shiftKey) && stats.view === "3d";
 
   canvas.addEventListener("pointerdown", (e) => {
     // Suppress compatibility mouse events (focus steals, ghost clicks).
@@ -560,7 +575,9 @@ async function main() {
     const dev = devPoint(e);
     press = { x: e.clientX, y: e.clientY, dev, type: e.pointerType, button: e.button, moved: false, anchored: false };
     if (e.pointerType === "mouse" && (e.button === 1 || e.button === 2)) {
-      mode = "pan";
+      // Middle drag pans; Alt (or Shift) + middle orbits the 3D view — in
+      // every mode, so a selection marquee never takes its place.
+      mode = orbitDrag(e) ? "orbit" : "pan";
       canvas.classList.add("grabbing");
       return;
     }
@@ -652,7 +669,10 @@ async function main() {
       requestRender();
       return;
     }
-    if (mode === "pan") {
+    if (mode === "orbit") {
+      app.orbit(e.clientX - prev.x, e.clientY - prev.y);
+      requestRender();
+    } else if (mode === "pan") {
       app.pan(prevDev[0], prevDev[1], dev[0], dev[1]);
       requestRender();
     } else if ((mode === "press" || mode === "paste-press") && press.moved) {
@@ -722,7 +742,7 @@ async function main() {
       }
       refreshEdit();
     }
-    if (mode === "nav" || mode === "pan") sessionSave();
+    if (mode === "nav" || mode === "pan" || mode === "orbit") sessionSave();
     mode = "none";
     press = null;
     requestRender();
@@ -1585,10 +1605,14 @@ async function main() {
   const RENDER_LABEL = { shaded: "Shaded", "shaded-wire": "Shaded + wireframe", wire: "Wireframe" };
   function renderViewCluster() {
     renderClip();
+    const spanOn = app.plan_span_enabled();
+    document.body.classList.toggle("span-on", spanOn);
+    $("plan-span-toggle").classList.toggle("on", spanOn);
+    $("plan-span-toggle").setAttribute("aria-checked", String(spanOn));
     const mode = app.render_mode();
     $("render-btn").classList.toggle("on", mode !== "shaded");
     $("render-btn").title = `Render mode: ${RENDER_LABEL[mode]}`;
-    for (const b of document.querySelectorAll("#render-menu button")) {
+    for (const b of document.querySelectorAll("#render-menu button[data-render]")) {
       b.classList.toggle("on", b.dataset.render === mode);
       b.setAttribute("aria-checked", String(b.dataset.render === mode));
     }
@@ -1607,6 +1631,14 @@ async function main() {
       badge.textContent = `${name} · ${n.toLocaleString("en-US")} triangle${n === 1 ? "" : "s"}`;
     }
   }
+  $("plan-span-toggle").addEventListener("click", () => {
+    app.set_plan_span_enabled(!app.plan_span_enabled());
+    closeRenderMenu();
+    toast(app.plan_span_enabled() ? "Plan span on: above and below the level are see-through" : "Plan span off: every element drawn normally", { ms: 1800 });
+    renderViewCluster();
+    requestRender();
+    sessionSave();
+  });
   const closeRenderMenu = () => { $("render-menu").hidden = true; $("render-btn").setAttribute("aria-expanded", "false"); };
   $("render-btn").addEventListener("click", (e) => {
     e.stopPropagation();
@@ -1614,7 +1646,7 @@ async function main() {
     menu.hidden = !menu.hidden;
     $("render-btn").setAttribute("aria-expanded", String(!menu.hidden));
   });
-  for (const b of document.querySelectorAll("#render-menu button")) {
+  for (const b of document.querySelectorAll("#render-menu button[data-render]")) {
     b.addEventListener("click", () => {
       app.set_render_mode(b.dataset.render);
       closeRenderMenu();
@@ -2298,7 +2330,7 @@ async function main() {
   let sheetStack = [];
   const PAGE_TITLES = {
     menu: "Menu", levels: "Levels", project: "Project location", about: "About",
-    properties: "Properties", model: "Model", workplane: "Workplane", room: "Room",
+    properties: "Properties", model: "Model", workplane: "Workplane", room: "Room", level: "Level",
   };
   function openSheet(page, { root = false } = {}) {
     if (root) sheetStack = [];
@@ -2358,6 +2390,7 @@ async function main() {
       model: () => renderTree(sheetBody),
       workplane: pageWorkplane,
       room: pageRoom,
+      level: pageLevel,
     };
     (pages[sheetPage] ?? (() => {}))();
   }
@@ -2373,6 +2406,7 @@ async function main() {
     } else if (sheetPage === "levels") updateLevels();
     else if (sheetPage === "project") updateProject();
     else if (sheetPage === "workplane") updateWorkplane();
+    else if (sheetPage === "level") updateLevel();
     else if (sheetPage === "room") {
       if (!selectedRoom()) closeSheet(false);
       else if (!sheetBody.contains(document.activeElement)) pageRoom();
@@ -2433,12 +2467,13 @@ async function main() {
       const collapsed = treeCollapsed.has(key);
       const count = lvl.groups.reduce((n, g) => n + g.items.length, 0);
       const head = el("div", {
-        role: "button", tabindex: "0", class: `tree-row level${lvl.active ? " active" : ""}`, "data-tree-level": String(lvl.id),
-        title: "Make this the active level",
+        role: "button", tabindex: "0", class: `tree-row level${lvl.active ? " active" : ""}${lvl.id === newLevel ? " new" : ""}`,
+        "data-tree-level": String(lvl.id), title: "Make this the active level",
         html: `<span class="twist${collapsed ? " collapsed" : ""}" data-twist>${svg(TREE_ICON.twist, "ico sm")}</span>` +
           `<i class="swatch"></i><span class="tree-name"></span>` +
           (lvl.active ? `<span class="tree-tag">Active</span>` : "") +
           `<span class="tree-meta">${fmtM(lvl.elevation)}</span>` +
+          treeAction("data-tree-level-edit", "Level settings", TREE_ICON.pencil) +
           treeAction("data-tree-add", "Add a workplane in this level", TREE_ICON.add),
       });
       head.querySelector(".swatch").style.background = cssColor(lvl.color);
@@ -2450,6 +2485,7 @@ async function main() {
           return;
         }
         if (e.target.closest("[data-tree-add]")) { addWorkplane(lvl.id); return; }
+        if (e.target.closest("[data-tree-level-edit]")) { openLevel(lvl.id); return; }
         activatePlane(lvl.id);
       });
       const block = el("div", { class: "tree-level" }, head);
@@ -2515,15 +2551,37 @@ async function main() {
       }
       nodes.push(block);
     }
-    if (tree.levels.length === 0) nodes.push(el("div", { class: "tree-empty", text: "No levels — add one in Menu → Levels" }));
+    if (tree.levels.length === 0) nodes.push(el("div", { class: "tree-empty", text: "No levels yet — add one" }));
+    // In the sheet (phones) the panel header is not there: its action is.
+    if (container !== $("tree-body")) {
+      nodes.unshift(el("button", {
+        type: "button", class: "chip-toggle small tree-add-level", id: "sheet-add-level",
+        html: `${icon("plus")}<span>Add level</span>`, onclick: () => addLevelFromTree(),
+      }));
+    }
     container.replaceChildren(...nodes);
+    container.querySelector(".tree-row.level.new")?.scrollIntoView({ block: "nearest" });
     container.scrollTop = scroll;
   }
+  /** Add a level (as Menu → Levels → Add level): the active plane stays;
+   *  the new level's row is marked and scrolled into view. */
+  function addLevelFromTree() {
+    const id = app.add_level();
+    if (id < 0) { toast("Could not add a level", { kind: "error" }); return; }
+    newLevel = id;
+    refresh();
+    renderTreePanel();
+    if (sheetPage === "model") renderTree(sheetBody);
+    const lvl = JSON.parse(app.levels_json()).levels.find((l) => l.id === id);
+    if (lvl) toast(`${lvl.name} added at ${fmtM(lvl.elevation)}`, { kind: "ok", ms: 1800 });
+  }
+  $("tree-add-level").addEventListener("click", () => addLevelFromTree());
   function renderTreePanel() {
     const panel = $("tree-panel");
     // Hidden in the focused flows (Edit Mode, a wall's elevation for windows).
     const show = treeOpen && innerWidth >= TREE_DEFAULT_OPEN_MIN_PX && !inEditChrome();
     panel.hidden = !show;
+    document.body.classList.toggle("tree-open", show);
     $("tree-btn").classList.toggle("on", show || sheetPage === "model");
     $("tree-btn").setAttribute("aria-pressed", String(show || sheetPage === "model"));
     if (show) renderTree($("tree-body"));
@@ -3271,7 +3329,8 @@ async function main() {
       el("div", { class: "group kind-group" }, el("span", { class: "kind-badge", html: `${svg(TREE_ICON.plane)} Workplane` })),
       group(null,
         el("div", { class: "field" }, el("label", { for: "wp-name", text: "Name" }), nameInput),
-        el("div", { class: "field" }, el("span", { class: "field-label", text: "In" }), el("span", { class: "value", id: "wp-parent", text: w.path })),
+        el("div", { class: "field" }, el("label", { for: "wp-parent-picker", text: "In" }), parentPicker(w)),
+        el("div", { class: "field" }, el("span", { class: "field-label", text: "Path" }), el("span", { class: "value", id: "wp-parent", text: w.path })),
         el("div", { class: "field" }, el("span", { class: "field-label", text: "Elevation" }), el("span", { class: "value", id: "wp-elevation", text: fmtM(w.elevation) })),
         el("div", { class: "field" }, el("label", { for: "wp-color", text: "Color" }), color),
       ),
@@ -3297,6 +3356,31 @@ async function main() {
     );
     updateWorkplane();
   }
+  /** Move a workplane under another level or workplane: it stays at its
+   *  world elevation (the offset changes); what is drawn on it follows
+   *  the new level. One undo step. */
+  function parentPicker(w) {
+    const picker = el("select", { class: "plane-picker", id: "wp-parent-picker", "aria-label": "Move to level or workplane" });
+    fillParentPicker(picker, w);
+    picker.addEventListener("change", () => {
+      const reason = app.move_workplane(w.id, Number(picker.value));
+      if (reason) toast(reason, { kind: "error" });
+      else {
+        const now = JSON.parse(app.workplane_json(w.id));
+        toast(`${now.name} moved to ${now.parentName} (${fmtOffset(now.offset)}), still at ${fmtM(now.elevation)}`, { kind: "ok", ms: 2400 });
+      }
+      refresh();
+      pageWorkplane();
+    });
+    return picker;
+  }
+  function fillParentPicker(picker, w) {
+    const key = w.parents.map((p) => `${p.id}:${p.path}`).join("|") + `#${w.parent}`;
+    if (picker.dataset.key === key) return;
+    picker.dataset.key = key;
+    picker.replaceChildren(...w.parents.map((p) => el("option", { value: String(p.id), text: p.path, selected: p.id === w.parent })));
+    picker.value = String(w.parent);
+  }
   function updateWorkplane() {
     const w = JSON.parse(app.workplane_json(workplaneFor ?? -1));
     if (!w) { closeSheet(false); return; }
@@ -3307,6 +3391,7 @@ async function main() {
     guardAssign($("wp-offset"), w.offset.toFixed(2));
     guardAssign($("wp-offset-slider"), String(w.offset));
     $("wp-parent").textContent = w.path;
+    if (document.activeElement !== $("wp-parent-picker")) fillParentPicker($("wp-parent-picker"), w);
     $("wp-elevation").textContent = fmtM(w.elevation);
     $("wp-activate").classList.toggle("on", w.active);
   }
@@ -3349,29 +3434,171 @@ async function main() {
     q(".lvl-elev").addEventListener("change", () => { app.end_gesture(); updateLevels(true); });
     q(".lvl-add-plane").addEventListener("click", () => addWorkplane(lvl.id));
     q(".lvl-story").addEventListener("change", (e) => { app.update_level_story(lvl.id, e.target.checked); app.end_gesture(); refresh(); });
-    q(".lvl-delete").addEventListener("click", async () => {
-      const name = q(".lvl-name").value;
-      const result = app.delete_level(lvl.id);
-      if (result === "deleted") {
-        refresh();
-        toast(`Level "${name}" deleted`);
-      } else if (result === "has_dependents") {
-        const info = JSON.parse(app.levels_json()).levels.find((l) => l.id === lvl.id);
-        const ok = await confirmDialog({
-          title: `Delete level "${name}"?`,
-          message: CASCADE_WORDING(name, info?.elements ?? 0,
-            JSON.parse(app.workplanes_json()).filter((w) => w.root === lvl.id).length),
-          ok: "Delete level and elements", danger: true,
-        });
-        if (ok && app.delete_level_cascade(lvl.id)) {
-          refresh();
-          toast(`Level "${name}" and its elements deleted`);
-        }
-      } else {
-        toast(`Could not delete the level (${result})`, { kind: "error" });
-      }
-    });
+    q(".lvl-delete").addEventListener("click", () => deleteLevel(lvl.id, q(".lvl-name").value));
     return r;
+  }
+  /** Delete a level: plainly when it is empty, else after the cascade
+   *  prompt (one undo step either way). True when deleted. */
+  async function deleteLevel(id, name) {
+    const result = app.delete_level(id);
+    if (result === "deleted") {
+      refresh();
+      toast(`Level "${name}" deleted`);
+      return true;
+    }
+    if (result === "has_dependents") {
+      const info = JSON.parse(app.levels_json()).levels.find((l) => l.id === id);
+      const ok = await confirmDialog({
+        title: `Delete level "${name}"?`,
+        message: CASCADE_WORDING(name, info?.elements ?? 0,
+          JSON.parse(app.workplanes_json()).filter((w) => w.root === id).length),
+        ok: "Delete level and elements", danger: true,
+      });
+      if (ok && app.delete_level_cascade(id)) {
+        refresh();
+        toast(`Level "${name}" and its elements deleted`);
+        return true;
+      }
+      return false;
+    }
+    toast(`Could not delete the level (${result})`, { kind: "error" });
+    return false;
+  }
+
+  // -- Level sheet (the tree's pencil on a level row) ------------------------------------------
+  let levelFor = null;
+  function openLevel(id) {
+    levelFor = id;
+    openSheet("level", { root: true });
+  }
+  const levelInfo = () => JSON.parse(app.levels_json()).levels.find((l) => l.id === levelFor) ?? null;
+  function pageLevel() {
+    const l = levelInfo();
+    if (!l) { closeSheet(false); return; }
+    const id = l.id;
+    $("sheet-title").textContent = l.name;
+    const nameInput = el("input", { type: "text", class: "wide", id: "lvl-name", value: l.name, autocomplete: "off" });
+    nameInput.addEventListener("input", () => { app.update_level_name(id, nameInput.value); refresh(); });
+    nameInput.addEventListener("change", () => app.end_gesture());
+    const color = el("input", { type: "color", id: "lvl-color", "aria-label": "Level color", value: floatToHex(l.color) });
+    color.addEventListener("input", () => { const [r, g, b] = hexToFloat(color.value); app.update_level_color(id, r, g, b); refresh(); });
+    color.addEventListener("change", () => app.end_gesture());
+    const story = el("input", { type: "checkbox", id: "lvl-story" });
+    story.checked = l.isStory;
+    story.addEventListener("change", () => { app.update_level_story(id, story.checked); app.end_gesture(); refresh(); });
+    sheetBody.replaceChildren(
+      el("div", { class: "group kind-group" }, el("span", { class: "kind-badge", html: `${svg(TREE_ICON.plane)} Level` })),
+      group(null,
+        el("div", { class: "field" }, el("label", { for: "lvl-name", text: "Name" }), nameInput),
+        el("div", { class: "field" }, el("label", { for: "lvl-color", text: "Color" }), color),
+        el("div", { class: "field" }, el("label", { for: "lvl-story", text: "Building story" }), el("label", { class: "switch" }, story, el("span"))),
+        el("div", { class: "field" }, el("span", { class: "field-label", text: "Contents" }),
+          el("span", { class: "value", id: "lvl-contents", text: `${l.elements} element${l.elements === 1 ? "" : "s"}` })),
+      ),
+      measureGroup({
+        title: "Elevation", label: "Above the project base", id: "lvl-elevation", value: l.elevation,
+        min: -LEVEL_ELEVATION_RANGE_M, max: LEVEL_ELEVATION_RANGE_M, step: LEVEL_ELEVATION_STEP_M,
+        apply: (v) => app.update_level_elevation(id, v),
+        current: () => levelInfo()?.elevation ?? 0,
+      }),
+      el("div", { id: "lvl-span" }),
+      el("div", { class: "btn-row", style: "margin-bottom:10px" },
+        el("button", {
+          type: "button", class: "btn", id: "lvl-activate", html: `${svg(TREE_ICON.plane)} Draw on it`,
+          onclick: () => { setActiveLevel(id); closeSheet(false); },
+        }),
+        el("button", {
+          type: "button", class: "btn", id: "lvl-add-plane", html: `${icon("plus")} Workplane`,
+          onclick: () => addWorkplane(id),
+        })),
+      el("button", {
+        type: "button", class: "btn subtle-danger block", id: "lvl-delete",
+        html: `${icon("trash")} Delete level`,
+        onclick: async () => { if (await deleteLevel(id, l.name) && sheetPage === "level") closeSheet(false); },
+      }),
+    );
+    updateLevel();
+  }
+  /** The level's plan span: where the normally drawn band ends above
+   *  (the next story, or an offset) and below, the plan cut, and the
+   *  opacity of what lies above and below it. The first change creates
+   *  the level's PlanSpan; drags coalesce; Reset returns to defaults. */
+  function renderSpanGroup(box, levelId) {
+    const sp = JSON.parse(app.plan_span_json(levelId));
+    if (!sp) { box.replaceChildren(); return; }
+    const key = JSON.stringify(sp);
+    if (box.dataset.key === key || box.contains(document.activeElement)) return;
+    box.dataset.key = key;
+    const set = (o) => {
+      const reason = app.set_plan_span(levelId, o.top ?? "", o.topOffset ?? NaN, o.cut ?? NaN, o.bottom ?? NaN, o.above ?? NaN, o.below ?? NaN);
+      if (reason) toast(reason, { kind: "error" });
+      refresh();
+    };
+    const now = () => JSON.parse(app.plan_span_json(levelId));
+    const seg = el("div", { class: "seg small", id: "span-top-mode" });
+    for (const [m, label] of [["next", "Next story"], ["offset", "Offset"]]) {
+      seg.append(el("button", {
+        type: "button", text: label, "data-span-top": m, class: sp.top.mode === m ? "on" : "",
+        onclick: () => { if (m !== sp.top.mode) { set({ top: m }); app.end_gesture(); box.dataset.key = ""; renderSpanGroup(box, levelId); } },
+      }));
+    }
+    const pct = (v) => `${Math.round(v * 100)}%`;
+    const opacity = (id, label, value, field) => {
+      const out = el("span", { class: "value", id: `${id}-value`, text: pct(value) });
+      const slider = el("input", { type: "range", min: "0", max: "1", step: "0.05", id, "aria-label": label, style: "width:100%;accent-color:var(--accent)" });
+      slider.value = String(value);
+      slider.addEventListener("input", () => { set({ [field]: Number(slider.value) }); out.textContent = pct(Number(slider.value)); });
+      slider.addEventListener("change", () => app.end_gesture());
+      return [el("div", { class: "field" }, el("label", { for: id, text: label }), out), el("div", { class: "field" }, slider)];
+    };
+    const children = [
+      group("Plan span",
+        el("div", { class: "field" }, el("span", { class: "field-label", text: "Top" }), seg),
+        el("div", { class: "field" }, el("span", { class: "field-label", text: "Band" }),
+          el("span", { class: "value", id: "span-band", text: `${fmtM(sp.bottomZ)} to ${fmtM(sp.topZ)} · cut ${fmtM(sp.cutZ)}` })),
+        ...opacity("span-above", "Above: opacity", sp.above, "above"),
+        ...opacity("span-below", "Below: opacity", sp.below, "below"),
+      ),
+    ];
+    if (sp.topRaised) children.push(el("div", { class: "span-hint", id: "span-raised", text: "The next story is at or below the cut: the span's top is the cut." }));
+    if (sp.top.mode === "offset") {
+      children.push(measureGroup({
+        title: "Span top", label: "Above the level", id: "span-top", value: sp.top.offset,
+        min: 0, max: 10, step: WALL_HEIGHT_STEP_M,
+        apply: (v) => set({ top: "offset", topOffset: v }), current: () => now()?.top.offset ?? 3,
+      }));
+    }
+    children.push(
+      measureGroup({
+        title: "Plan cut", label: "Above the level", id: "span-cut", value: sp.cut,
+        min: 0, max: 6, step: WALL_HEIGHT_STEP_M,
+        apply: (v) => set({ cut: v }), current: () => now()?.cut ?? 1.2,
+      }),
+      measureGroup({
+        title: "Span bottom", label: "From the level", id: "span-bottom", value: sp.bottom,
+        min: -6, max: 3, step: WALL_HEIGHT_STEP_M,
+        apply: (v) => set({ bottom: v }), current: () => now()?.bottom ?? 0,
+      }),
+      el("button", {
+        type: "button", class: "btn block", id: "span-reset", text: "Reset plan span to defaults", disabled: !sp.custom,
+        onclick: () => { if (app.reset_plan_span(levelId)) { refresh(); box.dataset.key = ""; renderSpanGroup(box, levelId); } },
+      }),
+    );
+    box.replaceChildren(...children);
+  }
+  function updateLevel() {
+    const l = levelInfo();
+    if (!l) { closeSheet(false); return; }
+    if (!$("lvl-name")) return;
+    renderSpanGroup($("lvl-span"), l.id);
+    $("sheet-title").textContent = l.name;
+    guardAssign($("lvl-name"), l.name);
+    guardAssign($("lvl-color"), floatToHex(l.color));
+    guardAssign($("lvl-story"), l.isStory, "checked");
+    guardAssign($("lvl-elevation"), l.elevation.toFixed(2));
+    guardAssign($("lvl-elevation-slider"), String(l.elevation));
+    $("lvl-contents").textContent = `${l.elements} element${l.elements === 1 ? "" : "s"}`;
+    $("lvl-activate").classList.toggle("on", JSON.parse(app.levels_json()).activeId === l.id);
   }
   function pageLevels() {
     const list = el("div", { class: "card", id: "level-list" });
@@ -3496,6 +3723,14 @@ async function main() {
         fieldRow("Renderer", `${stats.backend}${stats.msaa > 1 ? ` · ${stats.msaa}× MSAA` : ""}`, "about-backend"),
         fieldRow("Saved project", `${kb} KB in this browser`, "about-storage"),
       ),
+      // The view controls (mouse, touch, keys), in every mode.
+      group("Controls",
+        fieldRow("Orbit (3D)", "Alt + middle drag · Shift + middle drag · left drag on empty space", "about-orbit"),
+        fieldRow("Pan", "Middle or right drag · left drag in plan"),
+        fieldRow("Zoom", "Wheel · pinch"),
+        fieldRow("Touch", "Two fingers: pan, pinch to zoom, twist to orbit (3D)"),
+        fieldRow("Fit", "Double-click empty space · Fit"),
+      ),
       el("button", {
         type: "button", class: "btn primary block", id: "copy-debug", html: `${icon("copy")} Copy debug info`,
         onclick: async () => {
@@ -3554,6 +3789,8 @@ async function main() {
     saveNow,
     debugInfo,
     refresh,
+    openWorkplane,
+    openLevel,
     // Wall-local (u along the wall from its start, v up from its base)
     // -> world coordinates.
     wallToWorld: (wallId, u, v) => {

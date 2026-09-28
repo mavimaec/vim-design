@@ -42,7 +42,10 @@ const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth24Plus;
 const MODEL_STRIDE: u64 = 256;
 /// Per-draw uniform payload: model matrix + tint + edge color + params.
 const MODEL_SIZE: u64 = 112;
-const GLOBALS_SIZE: u64 = 128;
+const GLOBALS_SIZE: u64 = 160;
+/// Height tolerance of the see-through bands (meters): a face exactly at
+/// a band edge (a floor plate's top on its level) stays in the span.
+const BAND_EPS_M: f32 = 1e-3;
 /// Dihedral angle above which a mesh edge is a feature edge.
 const FEATURE_ANGLE_COS: f32 = 0.866; // 30°
 
@@ -60,7 +63,28 @@ struct Globals {
     // Feature-edge depth nudge: xyz = eye (or a far point behind an
     // orthographic camera), w = relative pull toward it.
     eye: vec4<f32>,
+    // See-through bands (the active level's plan span): x = top z, y =
+    // bottom z, z = opacity above, w = opacity below.
+    span: vec4<f32>,
+    // x: 1 = the bands apply; y: band height tolerance.
+    span_on: vec4<f32>,
 };
+
+// The opacity of geometry at world height z: 1 inside the span, the
+// band's opacity above its top or below its bottom.
+fn band_alpha(z: f32) -> f32 {
+    if (globals.span_on.x < 0.5) {
+        return 1.0;
+    }
+    let eps = globals.span_on.y;
+    if (z > globals.span.x + eps) {
+        return globals.span.z;
+    }
+    if (z < globals.span.y - eps) {
+        return globals.span.w;
+    }
+    return 1.0;
+}
 
 fn encode(c: vec3<f32>) -> vec3<f32> {
     if (globals.light_dir.w > 0.5) {
@@ -87,6 +111,7 @@ struct VsOut {
     @builtin(position) pos: vec4<f32>,
     @location(0) normal: vec3<f32>,
     @location(1) color: vec3<f32>,
+    @location(2) world_z: f32,
 };
 
 fn transform(p: vec3<f32>, n: vec3<f32>, c: vec3<f32>) -> VsOut {
@@ -96,6 +121,7 @@ fn transform(p: vec3<f32>, n: vec3<f32>, c: vec3<f32>) -> VsOut {
     out.pos.z = out.pos.z + model.params.x * out.pos.w;
     out.normal = (model.m * vec4<f32>(n, 0.0)).xyz;
     out.color = c;
+    out.world_z = world.z;
     return out;
 }
 
@@ -149,11 +175,11 @@ fn vs_edge(
     out.pos.z = out.pos.z + model.params.x * out.pos.w;
     out.normal = n;
     out.color = c;
+    out.world_z = world.z;
     return out;
 }
 
-@fragment
-fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+fn shaded(in: VsOut) -> vec3<f32> {
     let n = normalize(in.normal);
     let l = normalize(globals.light_dir.xyz);
     let key = max(dot(n, l), 0.0);
@@ -161,18 +187,45 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let fill = 0.25 * max(dot(n, fill_dir), 0.0);
     let shade = 0.24 + 0.72 * key + fill;
     let base = mix(in.color, model.tint.rgb, model.tint.a);
-    let lit = mix(base * min(shade, 1.15), base, model.params.y);
-    return vec4<f32>(encode(lit), 1.0);
+    return mix(base * min(shade, 1.15), base, model.params.y);
+}
+
+// Opaque pass: what lies inside the span (see-through bands are left to
+// the glass pass).
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    if (band_alpha(in.world_z) < 0.999) {
+        discard;
+    }
+    return vec4<f32>(encode(shaded(in)), 1.0);
+}
+
+// Glass pass: only the see-through bands, blended over the opaque scene.
+@fragment
+fn fs_glass(in: VsOut) -> @location(0) vec4<f32> {
+    let a = band_alpha(in.world_z);
+    if (a >= 0.999 || a <= 0.001) {
+        discard;
+    }
+    return vec4<f32>(encode(shaded(in)), a);
 }
 
 @fragment
 fn fs_wire(in: VsOut) -> @location(0) vec4<f32> {
-    return vec4<f32>(encode(globals.wire_color.rgb), globals.wire_color.a);
+    let a = globals.wire_color.a * band_alpha(in.world_z);
+    if (a <= 0.001) {
+        discard;
+    }
+    return vec4<f32>(encode(globals.wire_color.rgb), a);
 }
 
 @fragment
 fn fs_edge(in: VsOut) -> @location(0) vec4<f32> {
-    return vec4<f32>(encode(model.edge.rgb), model.edge.a);
+    let a = model.edge.a * band_alpha(in.world_z);
+    if (a <= 0.001) {
+        discard;
+    }
+    return vec4<f32>(encode(model.edge.rgb), a);
 }
 
 // Overlay family (level squares, grid, outlines, previews): world
@@ -282,6 +335,7 @@ pub struct Renderer {
     depth_view: wgpu::TextureView,
     msaa_view: Option<wgpu::TextureView>,
     fill_pipeline: wgpu::RenderPipeline,
+    glass_pipeline: wgpu::RenderPipeline,
     wire_pipeline: wgpu::RenderPipeline,
     edge_pipeline: wgpu::RenderPipeline,
     overlay_pipeline: wgpu::RenderPipeline,
@@ -318,6 +372,18 @@ pub struct Renderer {
     pub feature_edges: bool,
     /// Color of the triangle-edge wireframe (alpha-blended).
     pub wire_color: [f32; 4],
+    /// See-through bands by world height (`None`: everything opaque).
+    pub span: Option<SpanBands>,
+}
+
+/// See-through bands: geometry above `top_z` is drawn with
+/// `above_opacity`, below `bottom_z` with `below_opacity` (world z).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SpanBands {
+    pub top_z: f32,
+    pub bottom_z: f32,
+    pub above_opacity: f32,
+    pub below_opacity: f32,
 }
 
 /// Default wireframe color: a dark slate, translucent so dense curved
@@ -640,6 +706,16 @@ impl Renderer {
             true,
             None,
         );
+        // See-through bands: blended over the opaque scene, depth-tested
+        // against it, not depth-written (glass never hides what is behind).
+        let glass_pipeline = make_pipeline(
+            "glass",
+            "vs_main",
+            "fs_glass",
+            wgpu::PrimitiveTopology::TriangleList,
+            false,
+            Some(wgpu::BlendState::ALPHA_BLENDING),
+        );
         // The wireframe is alpha-blended: on densely tessellated curved
         // surfaces (cylinder barrel, cone) opaque lines would cover
         // nearly every pixel and blacken the shading.
@@ -753,6 +829,7 @@ impl Renderer {
             depth_view,
             msaa_view,
             fill_pipeline,
+            glass_pipeline,
             wire_pipeline,
             edge_pipeline,
             overlay_pipeline,
@@ -784,6 +861,7 @@ impl Renderer {
             shaded: true,
             feature_edges: true,
             wire_color: DEFAULT_WIRE_COLOR,
+            span: None,
         })
     }
 
@@ -1099,12 +1177,16 @@ impl Renderer {
         // gamma flag in .w (see the shader comment), wire color, grid
         // fade, edge nudge.
         let gamma_encode = !self.config.format.is_srgb();
-        let mut globals = [0f32; 32];
+        let mut globals = [0f32; 40];
         globals[..16].copy_from_slice(&view_proj.to_cols_array());
         globals[16..20].copy_from_slice(&[0.45, -0.55, 0.72, f32::from(gamma_encode)]);
         globals[20..24].copy_from_slice(&self.wire_color);
         globals[24..28].copy_from_slice(&self.fade);
         globals[28..32].copy_from_slice(&self.edge_eye);
+        if let Some(s) = self.span {
+            globals[32..36].copy_from_slice(&[s.top_z, s.bottom_z, s.above_opacity, s.below_opacity]);
+            globals[36..40].copy_from_slice(&[1.0, BAND_EPS_M, 0.0, 0.0]);
+        }
         self.queue
             .write_buffer(&self.globals_buf, 0, &f32s_to_bytes(&globals));
         let mut any_edges = false;
@@ -1181,6 +1263,29 @@ impl Renderer {
                 pass.set_vertex_buffer(0, mesh.vertices.slice(..));
                 pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+            }
+
+            // See-through bands, far to near (blending order).
+            if self.shaded && self.span.is_some() {
+                let eye = Vec3::from_slice(&self.edge_eye[..3]);
+                let mut order: Vec<(usize, f32)> = draws
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, (id, m))| {
+                        let mesh = self.meshes.get(id)?;
+                        let c = m.transform_point3((Vec3::from(mesh.bbox_min) + Vec3::from(mesh.bbox_max)) * 0.5);
+                        Some((i, (c - eye).length_squared()))
+                    })
+                    .collect();
+                order.sort_by(|a, b| b.1.total_cmp(&a.1));
+                pass.set_pipeline(&self.glass_pipeline);
+                for (i, _) in order {
+                    let Some(mesh) = self.meshes.get(&draws[i].0) else { continue };
+                    pass.set_bind_group(1, &self.model_bind, &[(i as u32) * MODEL_STRIDE as u32]);
+                    pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+                    pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+                }
             }
 
             if self.wireframe {

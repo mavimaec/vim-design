@@ -491,8 +491,8 @@ pub fn workplane_contents(doc: &Document, id: EntityId) -> WorkplaneContents {
             let on_base = || record.inputs.get(slot::WALL_BASE).and_then(|s| s.referenced().next()) == Some(plane);
             match record.kind() {
                 EntityKind::Workplane => stack.push(dep),
-                EntityKind::Wall | EntityKind::WallRun if !on_base() => out.topped_walls.push(dep),
-                EntityKind::Sketch | EntityKind::Wall | EntityKind::WallRun | EntityKind::ControlPoint => {
+                EntityKind::Wall | EntityKind::WallRun | EntityKind::RoomLayout if !on_base() => out.topped_walls.push(dep),
+                EntityKind::Sketch | EntityKind::Wall | EntityKind::WallRun | EntityKind::RoomLayout | EntityKind::ControlPoint => {
                     let owner = if record.kind() == EntityKind::ControlPoint { None } else { element_of(doc, dep) };
                     if let Some(e) = owner.filter(|e| !out.elements.contains(e)) {
                         out.elements.push(e);
@@ -505,6 +505,56 @@ pub fn workplane_contents(doc: &Document, id: EntityId) -> WorkplaneContents {
     // A wall both on and up to the deleted planes is simply deleted.
     out.topped_walls.retain(|w| element_of(doc, *w).is_none_or(|e| !out.elements.contains(&e)));
     out
+}
+
+/// Planes a workplane may move under: every level and every workplane
+/// except itself and its descendants.
+pub fn workplane_parent_candidates(doc: &Document, id: EntityId) -> Vec<EntityId> {
+    let own = workplane_contents(doc, id).workplanes;
+    let mut out: Vec<EntityId> = levels_sorted(doc).iter().map(|l| l.id).collect();
+    out.extend(workplanes(doc).iter().map(|w| w.id).filter(|w| !own.contains(w)));
+    out
+}
+
+/// Move a workplane under another plane, keeping its world elevation:
+/// ONE `UpdateWorkplane { parent, offset_m: world z − new parent's z }`,
+/// then every element drawn on it (or on its nested workplanes) is
+/// associated with the new root level (`UpdateElementLevel`), so the
+/// Model tree groups it there. Its contents keep their world position.
+/// Several commands: the caller makes them one gesture. Returns the
+/// re-associated elements.
+pub fn move_workplane(doc: &mut Document, id: EntityId, parent: EntityId) -> Result<Vec<EntityId>, String> {
+    if !workplane_parent_candidates(doc, id).contains(&parent) {
+        return Err("A workplane cannot move under itself or its own workplanes".to_owned());
+    }
+    let world = vim_design_lib::workplane::plane_elevation(doc, id).ok_or("no such workplane")?;
+    let base = vim_design_lib::workplane::plane_elevation(doc, parent).ok_or("no such plane")?;
+    let root = vim_design_lib::workplane::root_level(doc, parent).ok_or("the plane has no level")?;
+    let elements = workplane_contents(doc, id).elements;
+    ok(
+        doc,
+        Command::UpdateWorkplane {
+            id,
+            parent: Some(parent),
+            name: None,
+            offset_m: Some(world - base),
+            color: None,
+            extent_m: None,
+            coalesce: false,
+        },
+    )?;
+    let mut moved = Vec::new();
+    for element in elements {
+        if first_input(doc, element, slot::ELEMENT_LEVEL) != Some(root) {
+            ok(doc, Command::UpdateElementLevel { element, level: root })?;
+            moved.push(element);
+        }
+    }
+    Ok(moved)
+}
+
+fn first_input(doc: &Document, id: EntityId, index: usize) -> Option<EntityId> {
+    doc.entity(id)?.inputs.get(index)?.referenced().next()
 }
 
 /// Append a window (hole wire from level-frame (u, v, w) points) to a

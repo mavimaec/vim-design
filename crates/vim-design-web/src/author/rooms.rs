@@ -757,7 +757,7 @@ impl AuthorApp {
             (w, self.plane_uv_at(plane, px, py)?)
         } else {
             let (origin, dir) = self.camera.ray(px, py, vw, vh)?;
-            let (element, d) = self.pick.pick_all(origin, dir).into_iter().find(|(id, _)| self.room_walls(*id).is_some())?;
+            let (element, d) = self.pick.pick_all(origin, dir, &|p| self.pickable_z(p.z)).into_iter().find(|(id, _)| self.room_walls(*id).is_some())?;
             let hit = origin + dir * d;
             (self.room_walls(element)?, [f64::from(hit.x), f64::from(hit.y)])
         };

@@ -94,6 +94,10 @@ impl AuthorApp {
                     "toppedWalls": contents.topped_walls.len(),
                 }),
             );
+            // Where it can move: every level and every workplane but its own.
+            let parents: Vec<serde_json::Value> =
+                ops::workplane_parent_candidates(&self.doc, id).into_iter().map(|p| self.plane_json(p)).collect();
+            obj.insert("parents".into(), parents.into());
         }
         v.to_string()
     }
@@ -118,6 +122,31 @@ impl AuthorApp {
             .find(|w| w.id == eid(id))
             .map_or(WORKPLANE_ALPHA, |w| w.color[3]);
         self.submit_workplane_update(id, "workplane color", None, None, Some([r, g, b, alpha]));
+    }
+
+    /// Move a workplane under another level or workplane at the same
+    /// world elevation (its offset becomes the difference); the elements
+    /// drawn on it follow the new root level. One undo step. Returns ""
+    /// or why it was refused.
+    pub fn move_workplane(&mut self, id: f64, parent: f64) -> String {
+        let (id, parent) = (eid(id), eid(parent));
+        if self::parent(&self.doc, id) == Some(parent) {
+            return String::new();
+        }
+        let depth = self.doc.undo_depth();
+        match ops::move_workplane(&mut self.doc, id, parent) {
+            Ok(_) => {
+                self.gestures.one_shot(depth);
+                self.sync("move workplane");
+                String::new()
+            }
+            Err(e) => {
+                ops::rollback_to(&mut self.doc, depth);
+                self.gestures.invalidate_redo();
+                self.sync("move workplane (refused)");
+                e
+            }
+        }
     }
 
     /// Plain delete: "deleted", "has_dependents" (the page shows what the

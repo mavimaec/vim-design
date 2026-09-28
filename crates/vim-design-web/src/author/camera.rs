@@ -25,9 +25,10 @@ impl ViewMode {
 
 /// Vertical field of view of the 3D view.
 const FOV_Y: f32 = 45.0 * std::f32::consts::PI / 180.0;
-/// Plan cut height above the active level (the architectural "cut
-/// plane"): geometry above it is clipped by the near plane, so upper
-/// floors never hide the level being drawn on.
+/// Plan cut height above the active plane when the level's plan span
+/// gives none above it (the architectural "cut plane"): geometry above
+/// it is clipped by the near plane, so upper floors never hide the level
+/// being drawn on.
 pub const PLAN_CUT_M: f32 = 1.2;
 /// Depth range below the plan cut.
 const PLAN_DEPTH_M: f32 = 400.0;
@@ -81,6 +82,10 @@ pub struct Camera {
     pub plan_half_h: f32,
     /// Elevation of the active construction plane.
     pub plane_z: f32,
+    /// The plan cut in world z (the active level's plan span); used when
+    /// above the active plane (a workplane above the cut gets
+    /// `PLAN_CUT_M` over it instead).
+    pub cut_z: Option<f32>,
     /// Elevation view: the faced wall, and half the visible height.
     pub elevation: Option<ElevationFrame>,
     pub elevation_half_h: f32,
@@ -96,6 +101,7 @@ impl Default for Camera {
             distance: 28.0,
             plan_half_h: 9.0,
             plane_z: 0.0,
+            cut_z: None,
             elevation: None,
             elevation_half_h: 3.0,
         }
@@ -140,7 +146,8 @@ impl Camera {
                 glam::camera::rh::proj::directx::perspective(FOV_Y, aspect, near, far) * view
             }
             ViewMode::Plan | ViewMode::Elevation => {
-                let eye = Vec3::new(self.target.x, self.target.y, self.plane_z + PLAN_CUT_M);
+                let cut = self.cut_z.filter(|z| *z > self.plane_z).unwrap_or(self.plane_z + PLAN_CUT_M);
+                let eye = Vec3::new(self.target.x, self.target.y, cut);
                 let view = glam::camera::rh::view::look_at_mat4(eye, eye - Vec3::Z, Vec3::Y);
                 let hh = self.plan_half_h;
                 let hw = hh * aspect;
